@@ -3,7 +3,7 @@ import { DOT_COLOR } from './axisStationOverlay.js';
 
 // ── 「Teddy」「The Catcher in the Rye」クリック時に表示する星座風の画像 ──────
 // 画像ファイルは jsフォルダと並ぶ imgフォルダ に置く想定:
-//   /img/Cat.png        ← Teddy用(準備済み)
+//   /img/Cat.png        ← Teddy用
 //   /img/Catcher1.png   ← The Catcher in the Rye用(画像はあるが、今回はまだ繋がない)
 // このファイルからは相対パス '../img/xxx.png' で参照する。
 //
@@ -12,11 +12,9 @@ import { DOT_COLOR } from './axisStationOverlay.js';
 // (home状態でカメラを動かしながら console.log(camera.position) すると座標の見当がつけやすい)。
 const POSITIONS = {
   Y_END: new THREE.Vector3(10, 10, -70), // Teddy(Cat.png)
-  X_END: new THREE.Vector3(-390, -310, -100),  // The Catcher in the Rye(今回は画像なしのプレースホルダー)
+  X_END: new THREE.Vector3(-390, -310, -100),  // The Catcher in the Rye
 };
 
-// url: null のものは「まだ画像を繋がない」の意味。showしても何も表示されない(エラーにもならない)。
-// Catcher1.pngを繋ぐ準備ができたら、X_END.url を new URL('../img/Catcher1.png', import.meta.url).href に変える。
 const IMAGE_CONFIG = {
   Y_END: {
     url: new URL('../img/Cat.png', import.meta.url).href,
