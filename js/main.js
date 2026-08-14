@@ -323,6 +323,15 @@ if (starHit) {
     }
   }
 
+  if (axisStationOverlay.yOriginDot.visible) {
+    const yOriginHit = raycaster.intersectObject(axisStationOverlay.yOriginDot, true)[0];
+    if (yOriginHit) {
+      const title = AXIS_CONTENT.Y.origin?.title;
+      if (title) dialogue.show(title, axisStationOverlay.yOriginDot);
+      return;
+    }
+  }
+
   // 隠しボタン「i」(Yステーション限定)。他の点(yEndDot等)と同じく、iHit.visibleで判定する。
   // クリック時の挙動はここが仮実装(ダイアログ表示)なので、必要な演出に差し替えてください。
   if (axisStationOverlay.iHit.visible) {
