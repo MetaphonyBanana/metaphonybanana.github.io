@@ -11,8 +11,8 @@ import { DOT_COLOR } from './axisStationOverlay.js';
 // 実際に良さそうな場所は各自お好みで POSITIONS の値を書き換えて探ってください
 // (home状態でカメラを動かしながら console.log(camera.position) すると座標の見当がつけやすい)。
 const POSITIONS = {
-  Y_END: new THREE.Vector3(10, 10, -70), // Teddy(Cat.png)
-  X_END: new THREE.Vector3(-390, -310, 100),  // The Catcher in the Rye
+  Y_END: new THREE.Vector3(-45, 70, -90), // Teddy(Cat.png)
+  X_END: new THREE.Vector3(90, 55, -70),  // The Catcher in the Rye(今回は画像なしのプレースホルダー)
 };
 
 // url: null のものは「まだ画像を繋がない」の意味。showしても何も表示されない(エラーにもならない)。
@@ -31,8 +31,8 @@ const IMAGE_CONFIG = {
     url: new URL('../img/Catcher1.png', import.meta.url).href,
     position: POSITIONS.X_END,
     mode: 'transparentStars', // ← Cat.pngと違い、ティント/強ブラーはせず黒背景だけ透過にする
-    width: 336,   // 元画像は1051×1496(横:縦 ≒ 0.70)。大きく・きれいに見せたいので縦長のまま拡大
-    height: 480,
+    width: 42,   // 元画像は1051×1496(横:縦 ≒ 0.70)。大きく・きれいに見せたいので縦長のまま拡大
+    height: 60,
     blackPoint: 14, // これ以下の明るさは完全透明(黒背景を抜く)
     whitePoint: 55, // これ以上の明るさは完全不透明(明るい星・線をくっきり残す)
     blurPX: 0,      // 星図のディテールを残したいので基本0。縁が硬すぎる場合だけ1〜2を試す
