@@ -17,7 +17,7 @@ import { createPhase3Assets } from './phase3.js';
 
 // ── 星の収束オーケストレーション ──────────────────────
 export const STAR_CONVERGENCE = {
-  psiFinal: { count: 'all', duration: 1 },
+  psiFinal: { count: 'all', duration: 60 },
 };
 
 // starFieldの未割当プールから星を取り出し、symbolKeyの形へ収束させる。
