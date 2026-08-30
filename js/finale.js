@@ -12,7 +12,11 @@ const STAR_HIT_RADIUS = 16;    // hotspots.js の HOTSPOT_HIT_RADIUS と同ス�
 // 文字列のままならQUOTE_INTERVAL(秒)で一定間隔表示(従来通り)。
 // 個別に表示時間を変えたい行だけ captions.js の CONVERGENCE_QUOTES 等と同じ書き方で
 // { text: '...', duration: 秒数 } にする。
-const FINALE_QUOTES = ['poems written all over the finger and pocket and everywhere. In green Ink. he’d have something to read when he was in the field and nobody was up at bat.','Anyway, that’s what I wrote stradlater’s composition about.','It was a very descriptive subject. … Allie had this left-handed fielder’s mitt.','All I had to do was change Allie’s name so that nobody would know it was my brother','I slept in the garage the night he died, and I broke all the goddam windows with my fist,','My hand still hurts me once in a while, when it rains and all, and I can’t make a real fist any more — not a tight one',''
+const FINALE_QUOTES = ['the poems written all over the finger and pocket and everywhere. In green Ink. he’d have something to read when he was in the field and nobody was up at bat.',
+                       'Anyway, that’s what I wrote stradlater’s composition about.','It was a very descriptive subject. … Allie had this left-handed fielder’s mitt.',
+                       'All I had to do was change Allie’s name so that nobody would know it was my brother',
+                       'I slept in the garage the night he died, and I broke all the goddam windows with my fist,',
+                       {text: 'My hand still hurts me once in a while, when it rains and all, and I can’t make a real fist any more — not a tight one', duration: 10},''
 
 ];
 const QUOTE_INTERVAL =5; // 1行あたりのデフォルト表示秒数(仮)
@@ -38,7 +42,7 @@ const KOAN_TEXT = 'We know the sound of two hands clapping.\nBut what is the sou
 const WAIT_BEFORE_GROW = 3.0;       // クリック直後、最寄り点への合流アニメが終わってからの待機
 const SNAP_DURATION = 1.6;          // 星クリック直後、カメラが線A上の最寄り点へ寄っていく時間
 const LINE_GROW_DURATION = 3.0;     // 線Aが星→原点へ伸びる時間
-const FULL_TRAVEL_DURATION = 1.0;  // 星の実位置からのフル距離を移動する場合の合計秒数
+const FULL_TRAVEL_DURATION = 30.0;  // 星の実位置からのフル距離を移動する場合の合計秒数
 const Y_AXIS_TRAVEL_DURATION = 6.0; // 原点 → 次の目的地への移動時間
  
 const ORIGIN = new THREE.Vector3(0, 0, 0);
