@@ -17,7 +17,7 @@ import { createPhase3Assets } from './phase3.js';
 
 // ── 星の収束オーケストレーション ──────────────────────
 export const STAR_CONVERGENCE = {
-  psiFinal: { count: 'all', duration: 1 },
+  psiFinal: { count: 'all', duration: 60 },
 };
 
 // starFieldの未割当プールから星を取り出し、symbolKeyの形へ収束させる。
@@ -53,8 +53,8 @@ function convergeStarsToSymbol(symbolKey, { starField, frame, basePointWorld, on
 // 配置されるため、重なって見える一瞬があっても位置のズレとしては視認され
 // にくいはず(検証済み: 星の位置は基準点から1〜4ユニット程度の、
 // 文字の形として正常な範囲に収まっている)。
-const STAR_FADE_OUT_DURATION = 1.5;
-const PSI_PNG_FADE_IN_DURATION = 1.5;
+const STAR_FADE_OUT_DURATION = 1.0;
+const PSI_PNG_FADE_IN_DURATION = 1.0;
 
 function fadeStarsThenShowPsiPng({ assembly, starField, psiIndices, vertexWorld, frame, onComplete }) {
   if (!psiIndices || psiIndices.length === 0) {
