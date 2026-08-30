@@ -262,9 +262,9 @@ export function createPhase3Assets(scene) {
 // ── 各ステージ遷移の尺(秒)。仮値、見ながら調整してください ──
 const STAGE_TRANSITION = {
   toStage2: {
-    moveLeft: 4.4,   // ⑴ i・hbarが左へ移動(見た目はまだ変化しない) ※元の速度の1/4
+    moveLeft: 2.4,   // ⑴ i・hbarが左へ移動(見た目はまだ変化しない) 
     riseMorph: 4.0,  // ⑵ hbarが上昇しながらhへクロスフェード ※元の速度の1/4
-    barGrow: 3.2,    // ⑵ バーがscale.xで0→実寸に伸びる ※元の速度の1/4
+    barGrow: 2.2,    // ⑵ バーがscale.xで0→実寸に伸びる ※元の速度の1/4
     denomFade: 4.0,  // ⑵ 2πがフェードインする ※元の速度の1/4
   },
   toStage3: { moveDuration: 1.2, spinDuration: 4.8 }, // ⑴bar伸長+2π→分母中心+h→分子中心 → ⑵分母が回転してCarouselへ(順番に発生。回転は1/4速度に減速)
