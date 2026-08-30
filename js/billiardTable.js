@@ -8,10 +8,9 @@ import { createBackButton, createReplayButton } from './iconButton.js';
 // - メインシーンとはWebGLコンテキストを分離した、独立canvas+独立rAFループの
 //   フルスクリーンHTMLオーバーレイとして実装(最も手数が少ない繋ぎ方)
 // - カメラの初期位置だけ変更: 元は卓の奥行き(Z)方向から見る構図だったが、
-//   指定により「ラック側が左・キューボール側が右」に見えるよう、
 //   world +X側から卓を横から見る構図にした(仰角の数値13.5/15.5はそのまま流用)。
-//   ラックは+Z、キューボールは-Zに配置されているため、+X側から見れば
-//   ラックが画面左、キューボールが画面右に来る。
+//   ラックは-Z、キューボールは+Zに配置されており、+X側から見れば
+//   ラックが画面右、キューボールが画面左に来る(指定により左右反転済み)。
 // - 閉じるボタン(← 戻る)を追加し、YZパネル経由でのみ出入りできるようにした
 // - hint/replayのDOM idはメイン側の#hintと衝突するため、オーバーレイ内で
 //   動的に要素を生成する形に変更した(ロジックは元のまま)
@@ -19,9 +18,13 @@ import { createBackButton, createReplayButton } from './iconButton.js';
 // [改修メモ]
 // - 盤上を公転していた太陽系(太陽+6つの発光ガラス玉の惑星)は削除した。
 // - それらが持っていた引用セリフは、盤上のボール(1〜9番)をクリックすると
-//   浮かぶ形に付け替えた。
+//   浮かぶ形に付け替えた。「Pool. I'll have to...」「We shot pool...」の
+//   2つはキューボールに割り当てている。
 // - ボールのテクスチャ(数字ラベルの黒文字・白帯)は削除し、既存の
-//   BALL_COLORS の色だけを使ったシンプルな単色ガラス球にした。
+//   BALL_COLORS の色だけを使ったシンプルな単色ガラス球にした(9番のみ
+//   伝統的な黄+白帯)。
+// - ポケットは黒い穴を持たず、白い光だけで表現している。全ポケット同じ
+//   見た目(特定の1つだけ強調する演出は廃止)。
 
 export function createBilliardTable(opts = {}) {
   const { onClose } = opts;
@@ -269,11 +272,15 @@ export function createBilliardTable(opts = {}) {
     c.width = s; c.height = s;
     const ctx = c.getContext("2d");
     const rg = ctx.createRadialGradient(s/2,s/2,0, s/2,s/2, s/2);
-    rg.addColorStop(0.0, "rgba(255,255,255,1.0)");
-    rg.addColorStop(0.2, "rgba(255,255,255,0.95)");
-    rg.addColorStop(0.5, "rgba(220,235,255,0.55)");
-    rg.addColorStop(0.8, "rgba(180,210,255,0.15)");
-    rg.addColorStop(1.0, "rgba(180,210,255,0.0)");
+    // 闇との境界がくっきり出ないよう、途中の変化を緩やかにして
+    // フェードの尾を長く引かせている
+    rg.addColorStop(0.0,  "rgba(255,255,255,1.0)");
+    rg.addColorStop(0.15, "rgba(255,255,255,0.9)");
+    rg.addColorStop(0.35, "rgba(235,242,255,0.62)");
+    rg.addColorStop(0.55, "rgba(210,225,255,0.36)");
+    rg.addColorStop(0.75, "rgba(190,210,255,0.16)");
+    rg.addColorStop(0.9,  "rgba(190,210,255,0.05)");
+    rg.addColorStop(1.0,  "rgba(190,210,255,0.0)");
     ctx.fillStyle = rg;
     ctx.fillRect(0,0,s,s);
     const tex = new THREE.CanvasTexture(c);
@@ -281,29 +288,48 @@ export function createBilliardTable(opts = {}) {
   }
   const wormholeTex = buildWormholeTexture();
 
+  // ポケットの点から真上に放たれる「光の柱」用のグラデーションテクスチャ。
+  // 下端(ポケット側)が最も明るく、上に向かって透明にフェードする。
+  function buildBeamTexture(){
+    const w = 8, h = 256;
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const ctx = c.getContext("2d");
+    const g = ctx.createLinearGradient(0, h, 0, 0); // 下(明)→上(透明)
+    g.addColorStop(0.0,  "rgba(255,255,255,1.0)");
+    g.addColorStop(0.25, "rgba(230,240,255,0.65)");
+    g.addColorStop(0.55, "rgba(205,222,255,0.28)");
+    g.addColorStop(0.8,  "rgba(195,215,255,0.08)");
+    g.addColorStop(1.0,  "rgba(195,215,255,0.0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,w,h);
+    const tex = new THREE.CanvasTexture(c);
+    tex.wrapS = THREE.RepeatWrapping;
+    return tex;
+  }
+  const beamTex = buildBeamTexture();
+
   const pocketMeshes = [];
   function buildPocket(c, isTarget){
     const group = new THREE.Group();
     group.position.set(c.x, 0, c.y);
     scene.add(group);
 
-    // the pocket itself — a simple dark circle, the mouth of the hole
-    const hole = new THREE.Mesh(
-      new THREE.CircleGeometry(POCKET_R*0.62, 32),
-      new THREE.MeshBasicMaterial({ color:0x000000 })
-    );
-    hole.rotation.x = -Math.PI/2;
-    hole.position.y = 0.01;
-    group.add(hole);
+    // ポケットは黒い穴を描かず、純粋な白い光だけで表現する。
+    // (沈み込み判定は下の `pockets` 配列との距離計算で行っており、
+    //  この見た目のメッシュとは独立しているので、黒い穴を消しても
+    //  ポケット機能そのものは失われない)
+    // 見た目はどのポケットも完全に同一にしている(特定の1つだけを
+    // 強調する演出は廃止した)。
 
     // radiant white light pouring straight up out of the hole's center —
-    // a wide soft halo plus a small blazing core, stacked for real punch
+    // より広角に広がる、柔らかい大きめのハローと、中心の明るいコアの2層
     const glow = new THREE.Mesh(
-      new THREE.CircleGeometry(POCKET_R*1.8, 32),
+      new THREE.CircleGeometry(POCKET_R*3.4, 32),
       new THREE.MeshBasicMaterial({
         map: wormholeTex, color: 0xffffff,
         transparent:true, blending:THREE.AdditiveBlending, depthWrite:false,
-        opacity: isTarget ? 1.0 : 0.75
+        opacity: 0.9
       })
     );
     glow.rotation.x = -Math.PI/2;
@@ -311,18 +337,34 @@ export function createBilliardTable(opts = {}) {
     group.add(glow);
 
     const core = new THREE.Mesh(
-      new THREE.CircleGeometry(POCKET_R*0.55, 24),
+      new THREE.CircleGeometry(POCKET_R*0.9, 24),
       new THREE.MeshBasicMaterial({
         map: wormholeTex, color: 0xffffff,
         transparent:true, blending:THREE.AdditiveBlending, depthWrite:false,
-        opacity: isTarget ? 1.0 : 0.9
+        opacity: 0.95
       })
     );
     core.rotation.x = -Math.PI/2;
     core.position.y = 0.03;
     group.add(core);
 
-    const light = new THREE.PointLight(0xffffff, isTarget ? 9 : 5, isTarget ? 6.5 : 4.5, 2);
+    // 暗い画面の照明代わりに、ポケットの点から真上へ伸びる光の柱を立てる。
+    // 下端(点)が細く強く、上に向かって広がりながら透明に消えていく
+    // 「スポットライトが下から照らしている」ような見え方にする。
+    const beamHeight = 2.4; // 高さは半分ほどに抑える(全ポケット共通)
+    const beam = new THREE.Mesh(
+      new THREE.CylinderGeometry(POCKET_R*3.0, POCKET_R*0.3, beamHeight, 24, 1, true),
+      new THREE.MeshBasicMaterial({
+        map: beamTex, color: 0xffffff,
+        transparent: true, blending: THREE.AdditiveBlending,
+        depthWrite: false, side: THREE.DoubleSide,
+        opacity: 0.7,
+      })
+    );
+    beam.position.y = beamHeight / 2;
+    group.add(beam);
+
+    const light = new THREE.PointLight(0xffffff, 15, 9, 2);
     light.position.y = 0.4;
     group.add(light);
 
@@ -335,7 +377,7 @@ export function createBilliardTable(opts = {}) {
     hitArea.position.y = 0.05;
     group.add(hitArea);
 
-    return { group, glow, core, light, hitArea, isTarget, pos:c };
+    return { group, glow, core, beam, light, hitArea, isTarget, pos:c };
   }
 
   // 各ポケットに対応する作品名(仮テキスト。あとで差し替え可)
@@ -352,23 +394,51 @@ export function createBilliardTable(opts = {}) {
     p.workTitle = POCKET_WORKS[idx] ?? '';
     pocketMeshes.push(p);
   });
-  const targetGlow = pocketMeshes[0].light;
 
   /* ---------------------------------------------------------------
-     BALL COLORS — シンプルな単色ガラス球(数字テクスチャは廃止)
+     BALL COLORS — 指定色(1赤/2ピンク/3オレンジ/4緑/5青/6黄/7茶/8黒/9黄+白帯)
+     数字ラベルは廃止。9番だけは伝統的な「黄色+白帯」を出すため、
+     makeStripeTexture() で単純な帯テクスチャ(黒要素なし)を貼る。
   --------------------------------------------------------------- */
   const BALL_COLORS = {
-    1:"#e8c34a", 2:"#3f7fe0", 3:"#e04b4b", 4:"#8a4fd6",
-    5:"#e0813a", 6:"#39a35c", 7:"#8a3f2a", 8:"#1b1b22", 9:"#e8c34a",
+    1: "#d1382c", // 赤
+    2: "#f07fb0", // ピンク
+    3: "#e2892f", // オレンジ
+    4: "#3f9e52", // 緑
+    5: "#3f7fe0", // 青
+    6: "#f0d23e", // 黄色
+    7: "#7a4a2a", // 茶
+    8: "#1b1b22", // 黒
+    9: "#f0d23e", // 黄色(帯と組み合わせて9番に使用)
   };
 
+  // 9番ボール専用:白地に色帯(黒要素なしのシンプルな帯)
+  function makeStripeTexture(colorHex){
+    const s = 256;
+    const c = document.createElement("canvas");
+    c.width = s; c.height = s;
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0,0,s,s);
+    ctx.fillStyle = colorHex;
+    const bandH = s*0.46;
+    ctx.fillRect(0, s/2 - bandH/2, s, bandH);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
   /* ---------------------------------------------------------------
-     BALL DIALOGUE — 盤上のボール(1〜9番)をクリックするとセリフが浮かぶ
-     (旧・太陽系の惑星が持っていた引用セリフをこちらへ移設)
+     BALL DIALOGUE — キューボール、および1〜9番ボールをクリックすると
+     セリフが浮かぶ(旧・太陽系の惑星が持っていた引用セリフをこちらへ移設)
   --------------------------------------------------------------- */
+  // キューボール専用のセリフ(プールそのものについて語る2つの引用)
+  const CUE_QUOTES = [
+    'Pool. I’ll have to discuss another time. It wasn’t just a game with us, it was almost a Protestant Reformation.\n—Buddy',
+    'We shot pool before or after almost every important crisis of our young manhood.\n—Buddy',
+  ];
+  // 1〜9番ボール用の残り5セット
   const BALL_QUOTES = [
-    ['Pool. I’ll have to discuss another time. It wasn’t just a game with us, it was almost a Protestant Reformation.\n—Buddy',
-     'We shot pool before or after almost every important crisis of our young manhood.\n—Buddy'],
     ['The Ocean Full of Bowling Balls'],
     ['opened a heavy metal door that read:\nTO THE POOL.\n—Teddy',
      'A man walks along the beach and unfortunately gets hit in the head by a cocoanut.\n—Teddy'],
@@ -378,9 +448,9 @@ export function createBilliardTable(opts = {}) {
      'It never appeared to be clear to him whose winning click it was.\n—Buddy'],
     ['One of us will be present at the other chap’s departure for various reasons.\n—Seymour'],
   ];
-  // 1〜9番ボールに、上の6セットを順番に(足りない分は繰り返して)割り当てる
+  // 1〜9番ボールに、上の5セットを順番に(足りない分は繰り返して)割り当てる
   function quotesForBallNumber(num){
-    if(!num) return null; // キューボール(0)にはセリフを付けない
+    if(!num) return null; // ここではキューボール分は扱わない(CUE_QUOTESを別途使う)
     return BALL_QUOTES[(num - 1) % BALL_QUOTES.length];
   }
 
@@ -404,8 +474,10 @@ export function createBilliardTable(opts = {}) {
         envMapIntensity: 1.4,
       });
     } else {
+      const isStripe = num === 9;
       mat = new THREE.MeshPhysicalMaterial({
-        color: new THREE.Color(BALL_COLORS[num]),
+        color: isStripe ? 0xffffff : new THREE.Color(BALL_COLORS[num]),
+        map: isStripe ? makeStripeTexture(BALL_COLORS[num]) : null,
         roughness: 0.05,
         metalness: 0.0,
         transmission: 0.82,
@@ -420,7 +492,7 @@ export function createBilliardTable(opts = {}) {
     }
     const mesh = new THREE.Mesh(ballGeo, mat);
     mesh.position.y = BALL_R;
-    mesh.userData.quotes = quotesForBallNumber(num);
+    mesh.userData.quotes = isCue ? CUE_QUOTES : quotesForBallNumber(num);
     scene.add(mesh);
 
     const b = {
@@ -435,15 +507,16 @@ export function createBilliardTable(opts = {}) {
   }
 
   /* nine-ball diamond rack, apex on the foot spot (accurate standard geometry:
-     apex 1/4 of the table length from the foot rail), centred on x=0 */
+     apex 1/4 of the table length from the foot rail), centred on x=0.
+     指定により左右反転:ラックを-Z側(旧キューボール側)に配置している */
   const rackOrder = [1,2,3,4,9,5,6,7,8]; // 9 goes to the centre slot
   const rackPositions = [];
-  const APEX_Z = HALF_Z * 0.5; // foot spot
+  const APEX_Z = -HALF_Z * 0.5; // foot spot (反転)
   {
     const spacing = BALL_R*2 + 0.01; // balls racked touching, small tolerance
     const rows = [1,2,3,2,1];
     rows.forEach((count,row)=>{
-      const z = APEX_Z + row*spacing*0.8660254; // sqrt(3)/2 row pitch for a tight triangle
+      const z = APEX_Z - row*spacing*0.8660254; // sqrt(3)/2 row pitch for a tight triangle
       const rowWidth = (count-1)*spacing;
       for(let i=0;i<count;i++){
         const x = -rowWidth/2 + i*spacing;
@@ -481,7 +554,7 @@ export function createBilliardTable(opts = {}) {
     ballDialogueEl.style.top = `${(-v.y * 0.5 + 0.5) * innerHeight}px`;
   }
 
-  const HEAD_Z = -HALF_Z * 0.55; // head spot, behind the head string
+  const HEAD_Z = HALF_Z * 0.55; // head spot, behind the head string(反転:+Z側)
 
   /* accurate straight break: cue ball on the centre line at the head spot,
      struck dead-centre into the apex ball — a real, powerful break shot */
@@ -728,10 +801,10 @@ export function createBilliardTable(opts = {}) {
 
     pocketMeshes.forEach(p=>{
       const pulse = Math.sin(t*1.1 + p.pos.x) * 0.5 + 0.5;
-      p.light.intensity = (p.isTarget ? 9 : 5) + pulse * (p.isTarget ? 2.0 : 1.0);
-      const baseOpacity = p.isTarget ? 1.0 : 0.75;
-      p.glow.material.opacity = Math.min(1, baseOpacity + pulse * 0.1);
-      p.core.material.opacity = Math.min(1, (p.isTarget ? 1.0 : 0.9) + pulse * 0.1);
+      p.light.intensity = 15 + pulse * 3.0;
+      p.glow.material.opacity = Math.min(1, 0.9 + pulse * 0.1);
+      p.core.material.opacity = Math.min(1, 0.95 + pulse * 0.1);
+      p.beam.material.opacity = Math.min(1, 0.7 + pulse * 0.12);
     });
 
     controls.update();
