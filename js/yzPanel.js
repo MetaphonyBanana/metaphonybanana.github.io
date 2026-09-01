@@ -21,6 +21,17 @@ const HOVER_OPACITY = 0.42; // ホバー時: はっきり見える反射ガラ�
 // 波紋の速さ(パネル対角線 √(WIDTH²+HEIGHT²) をおよそ1.3秒で走り抜ける速さ)
 const RIPPLE_SPEED = Math.sqrt(WIDTH * WIDTH + HEIGHT * HEIGHT) / 1.3;
 
+// クリック/ホバー判定専用の当たり判定エリア。
+// パネルの下端(local y=0)は概念Y軸(world X軸)、左端(local x=0)は概念Z軸(world Y軸)と
+// 全長にわたって重なっているため、この2辺沿いの帯を判定から除外し、軸から離れた
+// 奥側(遠い角=(WIDTH,HEIGHT)側)にだけ正方形の判定エリアを置く。
+// AXIS_MARGIN_RATIOを大きくするほど軸際を広く除外する(0〜1の比率)。
+const AXIS_MARGIN_RATIO = 0.15;
+const HIT_MARGIN_X = WIDTH  * AXIS_MARGIN_RATIO; // 左端(Z軸)からの除外幅
+const HIT_MARGIN_Y = HEIGHT * AXIS_MARGIN_RATIO; // 下端(Y軸)からの除外幅
+const HIT_WIDTH  = WIDTH  - HIT_MARGIN_X;
+const HIT_HEIGHT = HEIGHT - HIT_MARGIN_Y;
+
 export function createYZPanel(scene) {
   const geo = new THREE.PlaneGeometry(WIDTH, HEIGHT);
   geo.translate(WIDTH / 2, HEIGHT / 2, 0); // 原点を角にして、+X(概念Y)・+Y(概念Z)方向へ広がるようにする
@@ -42,10 +53,26 @@ export function createYZPanel(scene) {
   });
 
   const mesh = new THREE.Mesh(geo, material);
-  mesh.visible = false; // Yステーションに到達している間だけ表示・raycast対象にする
+  mesh.visible = false; // Yステーションに到達している間だけ表示する(見た目用・raycast対象ではない)
   mesh.renderOrder = 1;
-  mesh.userData.isYZPanel = true;
   scene.add(mesh);
+
+  // ── 当たり判定専用メッシュ: Y軸・Z軸が乗る2辺の帯を除いた、パネル奥側の範囲だけをraycast対象にする ──
+  // 完全に透明(opacity 0)で見た目には一切影響しない。
+  const hitGeo = new THREE.PlaneGeometry(HIT_WIDTH, HIT_HEIGHT);
+  // 左端・下端からHIT_MARGIN_X/Yぶん離した位置を起点にして、遠い角(WIDTH,HEIGHT)まで広げる。
+  hitGeo.translate(HIT_MARGIN_X + HIT_WIDTH / 2, HIT_MARGIN_Y + HIT_HEIGHT / 2, 0);
+  const hitMaterial = new THREE.MeshBasicMaterial({
+    transparent: true,
+    opacity: 0,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const hitMesh = new THREE.Mesh(hitGeo, hitMaterial);
+  hitMesh.visible = false; // Yステーションに到達している間だけ表示・raycast対象にする
+  hitMesh.renderOrder = 1;
+  hitMesh.userData.isYZPanel = true; // main.js側のraycast対象はこちらに向ける
+  scene.add(hitMesh);
 
   // ── 波紋レイヤー: 原点側の角(ローカル(0,0))から同心円状に広がる光の輪 ──
   // ベースの反射ガラス(mesh)とは別の薄いオーバーレイとして、加算合成で重ねる。
@@ -117,10 +144,12 @@ export function createYZPanel(scene) {
     if (active) {
       material.opacity = BASE_OPACITY;
       mesh.visible = true;
+      hitMesh.visible = true;
       rippleMesh.visible = true;
     } else {
       material.opacity = BASE_OPACITY;
       mesh.visible = false;
+      hitMesh.visible = false;
       rippleMesh.visible = false;
     }
   }
@@ -144,6 +173,7 @@ export function createYZPanel(scene) {
 
   return {
     mesh,
+    hitMesh,
     setActive,
     setHovered,
     ripple,
