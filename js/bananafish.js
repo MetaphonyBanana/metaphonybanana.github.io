@@ -25,33 +25,8 @@ export function createBananafish(opts = {}) {
   overlay.className = 'bananafish-overlay';
   document.body.appendChild(overlay);
 
-  // billiard-overlay相当のグローバルCSSが無い環境でも単体で動くよう、
-  // 最小限のスタイルをこのモジュール内で自己完結させておく。
-  const style = document.createElement('style');
-  style.textContent = `
-    .bananafish-overlay {
-      position: fixed;
-      inset: 0;
-      z-index: 9000;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.4s ease;
-      background: linear-gradient(to right, #0d2338 0%, #1f4d78 35%, #8a7a56 68%, #cba166 100%);
-    }
-    .bananafish-overlay.show {
-      opacity: 1;
-      pointer-events: auto;
-    }
-    .bananafish-overlay canvas {
-      display: block;
-      width: 100%;
-      height: 100%;
-      cursor: crosshair;
-    }
-  `;
-  document.head.appendChild(style);
-
-  // 既存の#backButtonはやめ、billiardTableと同じ共通の戻るボタンを使う。
+  // 見た目(z-index/transition/背景)はbilliard-overlayと同じ仕様でstyle.cssに定義済み
+  // (.bananafish-overlay / .bananafish-close)。ここでの独自スタイル注入はしない。
   const closeBtn = createBackButton({ className: 'bananafish-close', ariaLabel: '戻る' });
   overlay.appendChild(closeBtn);
 
@@ -161,10 +136,18 @@ export function createBananafish(opts = {}) {
     u_noise_freq_2: { value: 2.0 },
     u_noise_amp_2: { value: 0.3 },
     u_spd_modifier_2: { value: 0.8 },
-    u_colorA: { value: new THREE.Color(0x2b6cb0) },   // blue - window side
-    u_colorB: { value: new THREE.Color(0x30e0c8) },   // turquoise - window side
-    u_colorSkin: { value: new THREE.Color(0xedb894) }, // sand - door side
-    u_sandMode: { value: 0.0 }, // 0 = window side: animated blue/turquoise wave. 1 = door side: flat, static sand
+    u_colorA: { value: new THREE.Color(0x2b6cb0) },   // blue - wave
+    u_colorB: { value: new THREE.Color(0x30e0c8) },   // turquoise - wave
+    u_colorSkin: { value: new THREE.Color(0xedb894) }, // sand
+    // per-point "seen through the window" test, replacing the old whole-floor camera-side toggle:
+    // only the patch of floor whose sightline to the camera actually threads through the window
+    // opening turns into wave; everywhere else (including the rest of the floor when standing at
+    // the window, and the whole floor from the door side) stays flat sand. See the vertex shader.
+    u_windowZ: { value: ROOM_Z_MAX },
+    u_windowCenterX: { value: 0 }, // filled in once PANEL_CENTER_X/Y/WIDTH/HEIGHT are defined, below
+    u_windowCenterY: { value: 0 },
+    u_windowHalfW: { value: 0 },
+    u_windowHalfH: { value: 0 },
     u_fireActive: { value: 0.0 },   // 1 while the on-fire sand sweep/release effect is running
     u_fireFrontX: { value: -999 },  // current x position of the sweep front, in the wave plane's local space
     u_fireEdge: { value: 0.6 },     // softness of the sweep front
@@ -186,7 +169,11 @@ export function createBananafish(opts = {}) {
       uniform float u_noise_amp_2;
       uniform float u_noise_freq_2;
       uniform float u_spd_modifier_2;
-      uniform float u_sandMode;
+      uniform float u_windowZ;
+      uniform float u_windowCenterX;
+      uniform float u_windowCenterY;
+      uniform float u_windowHalfW;
+      uniform float u_windowHalfH;
       uniform float u_fireActive;
       uniform float u_fireFrontX;
       uniform float u_fireEdge;
@@ -218,6 +205,28 @@ export function createBananafish(opts = {}) {
         float h = noise(pos.xy * u_noise_freq_1 + u_time * u_spd_modifier_1) * u_noise_amp_1;
         h += noise(rotate2d(PI / 4.0) * pos.yx * u_noise_freq_2 - u_time * u_spd_modifier_2 * 0.6) * u_noise_amp_2;
 
+        // per-point "seen through the window" test: this patch of floor only turns into wave if the
+        // sightline from the camera to it actually threads through the window opening. Height (h) is
+        // a small perturbation, so using the flat (pre-displacement) position here is an accurate
+        // enough approximation of this point's true world location for the test below.
+        vec4 worldPos4 = modelMatrix * vec4(position, 1.0);
+        vec3 worldPos = worldPos4.xyz;
+        float throughWindow = 0.0;
+        float dz = worldPos.z - cameraPosition.z;
+        if (abs(dz) > 0.000001) {
+          float tt = (u_windowZ - cameraPosition.z) / dz;
+          if (tt > 0.0 && tt < 1.0) {
+            float ix = cameraPosition.x + (worldPos.x - cameraPosition.x) * tt;
+            float iy = cameraPosition.y + (worldPos.y - cameraPosition.y) * tt;
+            float edge = 0.6; // softness of the window-shaped boundary, in world units
+            float wx = smoothstep(u_windowCenterX - u_windowHalfW - edge, u_windowCenterX - u_windowHalfW + edge, ix)
+                     - smoothstep(u_windowCenterX + u_windowHalfW - edge, u_windowCenterX + u_windowHalfW + edge, ix);
+            float wy = smoothstep(u_windowCenterY - u_windowHalfH - edge, u_windowCenterY - u_windowHalfH + edge, iy)
+                     - smoothstep(u_windowCenterY + u_windowHalfH - edge, u_windowCenterY + u_windowHalfH + edge, iy);
+            throughWindow = clamp(wx * wy, 0.0, 1.0);
+          }
+        }
+
         // on fire: a fast wipe turns the wave into sand (front sweeps left to right), then releases
         // the same way but from the other end (front sweeps right to left, so the right side heals first)
         float fireFactor = 0.0;
@@ -225,9 +234,9 @@ export function createBananafish(opts = {}) {
           float wipe = smoothstep(u_fireFrontX - u_fireEdge, u_fireFrontX + u_fireEdge, pos.x);
           fireFactor = 1.0 - wipe;
         }
-        float sandMix = max(u_sandMode, fireFactor);
+        float sandMix = max(1.0 - throughWindow, fireFactor);
 
-        h *= (1.0 - sandMix); // door side (or the fire wipe): flattens out into a plane of sand
+        h *= (1.0 - sandMix); // sand (outside the window's view, or the fire wipe): flattens out into a plane of sand
         pos.z += h;
         vHeight = h;
         vSandMix = sandMix;
@@ -284,6 +293,7 @@ export function createBananafish(opts = {}) {
       uGreen:{ value:new THREE.Color(0x0e9f6e) },
       uBlue:{ value:new THREE.Color(0x2051f0) },
       uReveal:{ value:0.0 },
+      uWindowSeen:{ value:0.0 }, // 1 = the sightline to this text actually threads through the window opening (green); otherwise blue
     },
     vertexShader:`
       varying vec2 vUv;
@@ -297,16 +307,19 @@ export function createBananafish(opts = {}) {
       uniform vec3 uGreen;
       uniform vec3 uBlue;
       uniform float uReveal;
+      uniform float uWindowSeen;
       varying vec2 vUv;
       void main(){
-        // window side sees the plane's front face (unchanged: normal reading, green).
-        // door side sees the back face - un-mirror the UV so the text still reads correctly there,
-        // and switch to blue. This only affects the door-side (back-facing) view.
+        // Reading direction still follows which face we're looking at (front = normal reading,
+        // back = un-mirror the UV so the text reads correctly from the door side too).
+        // Color, however, no longer follows the face: green only when the camera's actual
+        // sightline to this text threads through the window opening; blue in every other case
+        // (including window-side views that aren't lined up with the window itself).
         vec2 uv = gl_FrontFacing ? vUv : vec2(1.0 - vUv.x, vUv.y);
         vec4 tx = texture2D(uTex, uv);
         float coverage = tx.a;
         if (coverage < 0.05 || uReveal < 0.02) discard;
-        vec3 col = gl_FrontFacing ? uGreen : uBlue;
+        vec3 col = mix(uBlue, uGreen, uWindowSeen);
         gl_FragColor = vec4(col, coverage * uReveal);
       }
     `
@@ -419,15 +432,23 @@ export function createBananafish(opts = {}) {
   const roomNumberCanvas = makeTextCanvas('507', { w:512, h:256, font:'600 150px Georgia, serif', color:'#2a2a28', blurPx:0 });
   const roomNumberTex = new THREE.CanvasTexture(roomNumberCanvas);
   roomNumberTex.colorSpace = THREE.SRGBColorSpace;
-  const roomNumberMat = new THREE.MeshBasicMaterial({ map:roomNumberTex, transparent:true, depthWrite:false, side:THREE.DoubleSide });
+  const roomNumberMat = new THREE.MeshBasicMaterial({ map:roomNumberTex, transparent:true, depthWrite:false, side:THREE.BackSide });
   const roomNumberPlane = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.45), roomNumberMat);
   roomNumberPlane.position.set(DOOR_CENTER_X, DOOR_H + 0.35, ROOM_Z_MIN - 0.03); // above the door, outside the room
-  roomNumberPlane.scale.x = -1; // un-mirror: this plaque is only ever seen from the door (outside) side
+  roomNumberPlane.scale.x = -1; // un-mirror so it reads correctly from the door (outside) side
+  // side:BackSide (set above) means the mirrored front face simply isn't drawn - so this plaque
+  // is only ever visible from the door side, never as a backwards "705" from the far side.
   scene.add(roomNumberPlane);
 
   // ---------- glass panel: the room's WINDOW, set into the front wall, carrying "Buddy" / "Seymour" ----------
   const PANEL_WIDTH = 6.4, PANEL_HEIGHT = 2.0; // height extended upward a bit (bottom edge stays put)
   const PANEL_CENTER_X = 0, PANEL_CENTER_Y = 1.65;
+  // now that the window's geometry is known, tell the floor's wave shader where that opening is
+  // (see the "seen through the window" test in waveMat's vertex shader, above)
+  waveUniforms.u_windowCenterX.value = PANEL_CENTER_X;
+  waveUniforms.u_windowCenterY.value = PANEL_CENTER_Y;
+  waveUniforms.u_windowHalfW.value = PANEL_WIDTH / 2;
+  waveUniforms.u_windowHalfH.value = PANEL_HEIGHT / 2;
   // "Buddy" / "Seymour" - visible only from the window side (see uTextVisible, updated each frame)
   const panelCanvas = document.createElement('canvas');
   panelCanvas.width = 2048; panelCanvas.height = 512;
@@ -535,7 +556,7 @@ export function createBananafish(opts = {}) {
     return shape;
   }
   const BED_SILL_Y = PANEL_CENTER_Y - PANEL_HEIGHT/2; // matches the window's bottom frame
-  const BED_EACH_W = 1.4, BED_DEPTH = 2.4, BED_GAP = 0.4, BED_CORNER = 0.18;
+  const BED_EACH_W = 1.9, BED_DEPTH = 3.2, BED_GAP = 0.3, BED_CORNER = 0.22;
   const BED_Z = ROOM_Z_MAX - 2.6; // room center, toward the window side
   const bedMat = new THREE.MeshStandardMaterial({ color:0xf6efe4, roughness:0.85, metalness:0.0, side:THREE.DoubleSide, transparent:true, opacity:0 });
   const bedGeo = new THREE.ShapeGeometry(roundedRectShape(BED_EACH_W, BED_DEPTH, BED_CORNER));
@@ -566,17 +587,40 @@ export function createBananafish(opts = {}) {
     return (inX && inY) ? 1 : 0;
   }
 
-  // window side (camera in front of the room) = animated wave; door side (camera behind it) = flat, static sand
+  // "the young man" only reads green when the camera's sightline to it actually threads through
+  // the window opening (same technique as bedSeenThroughDoor above, mirrored to the front wall/window).
+  function textSeenThroughWindow(camPos){
+    const targetPos = floatingText.position;
+    const dz = targetPos.z - camPos.z;
+    if (Math.abs(dz) < 1e-6) return 0;
+    const t = (ROOM_Z_MAX - camPos.z) / dz;
+    if (t <= 0 || t >= 1) return 0; // window plane isn't between the camera and the text
+    const x = camPos.x + (targetPos.x - camPos.x) * t;
+    const y = camPos.y + (targetPos.y - camPos.y) * t;
+    const inX = x > PANEL_CENTER_X - PANEL_WIDTH/2 && x < PANEL_CENTER_X + PANEL_WIDTH/2;
+    const inY = y > PANEL_CENTER_Y - PANEL_HEIGHT/2 && y < PANEL_CENTER_Y + PANEL_HEIGHT/2;
+    return (inX && inY) ? 1 : 0;
+  }
+
+  // sandModeCurrent still gates the Buddy/Seymour window text (a simple "which side" toggle);
+  // the floor's wave-vs-sand look is now computed per-point inside the shader itself (see waveMat).
   let sandModeCurrent = 0;
   let bedVisCurrent = 0;
+  let windowSeenCurrent = 0;
   function updateWaveLines(t){
     waveUniforms.u_time.value = t;
     const sandTarget = (camera.position.z < ROOM_CENTER_Z) ? 1 : 0;
     sandModeCurrent += (sandTarget - sandModeCurrent) * 0.08;
-    waveUniforms.u_sandMode.value = sandModeCurrent;
     panelMat.uniforms.uTextVisible.value = 1 - sandModeCurrent; // Buddy/Seymour: window side only
+    const windowSeenTarget = textSeenThroughWindow(camera.position);
+    windowSeenCurrent += (windowSeenTarget - windowSeenCurrent) * 0.15; // green only when actually seen through the window
+    floatingTextMat.uniforms.uWindowSeen.value = windowSeenCurrent;
     const bedTarget = bedSeenThroughDoor(camera.position);       // beds: only when the sightline actually passes through the door opening
-    bedVisCurrent += (bedTarget - bedVisCurrent) * 0.08;
+    if (bedTarget > bedVisCurrent) {
+      bedVisCurrent += (bedTarget - bedVisCurrent) * 0.12; // fade in gently once the door lines up
+    } else {
+      bedVisCurrent = bedTarget; // snap off immediately the moment the sightline leaves the door - no lingering/lag
+    }
     bedMat.opacity = bedVisCurrent;
     bedLeft.visible = bedVisCurrent > 0.02;
     bedRight.visible = bedVisCurrent > 0.02;
@@ -636,6 +680,12 @@ export function createBananafish(opts = {}) {
       y += lineHeight;
     }
   }
+  // Text is drawn top-down from a fixed startY, so a short quote (fewer lines) would otherwise sit
+  // near the top of the canvas with a lot of empty space below it - off-center on the wall. This
+  // computes a startY that centers the whole block of `numLines` vertically in the canvas instead.
+  function centeredQuoteStartY(canvasHeight, numLines, lineHeight){
+    return (canvasHeight - numLines * lineHeight) / 2;
+  }
 
   const QUOTE_W = 7.2, QUOTE_H = 4.0;
   const QUOTE_SHOW_MS = 15000;
@@ -648,7 +698,7 @@ export function createBananafish(opts = {}) {
     ctx.font = 'italic 52px Georgia, serif';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    drawGrayQuoteLines(ctx, [
+    const lines = [
       '\u201cthe young man, the \u2018Seymour,\u2019 who did the',
       'walking and talking in that early story, not',
       'to mention the shooting, was not Seymour at',
@@ -657,7 +707,9 @@ export function createBananafish(opts = {}) {
       'myself.\u201d',
       '',
       '\u2014Seymour: an Introduction',
-    ], 60, 60, 76);
+    ];
+    const lineHeight = 76;
+    drawGrayQuoteLines(ctx, lines, 60, centeredQuoteStartY(h, lines.length, lineHeight), lineHeight);
     return cv;
   }
   const quoteTex = new THREE.CanvasTexture(makeQuoteCanvas());
@@ -690,13 +742,15 @@ export function createBananafish(opts = {}) {
     ctx.font = 'italic 52px Georgia, serif';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    drawGrayQuoteLines(ctx, [
+    const lines = [
       '\u201cI also give you my word of honor that one',
       'of us will be present at the other chap\u2019s',
       'departure for various reasons.\u201d',
       '',
       '\u2014Hapworth 16, 1924',
-    ], 60, 60, 76);
+    ];
+    const lineHeight = 76;
+    drawGrayQuoteLines(ctx, lines, 60, centeredQuoteStartY(h, lines.length, lineHeight), lineHeight);
     return cv;
   }
   const seymourQuoteTex = new THREE.CanvasTexture(makeSeymourQuoteCanvas());
@@ -1036,8 +1090,9 @@ export function createBananafish(opts = {}) {
 
     sandModeCurrent = 0;
     bedVisCurrent = 0;
-    waveUniforms.u_sandMode.value = 0;
+    windowSeenCurrent = 0;
     panelMat.uniforms.uTextVisible.value = 1;
+    floatingTextMat.uniforms.uWindowSeen.value = 0;
     bedMat.opacity = 0;
     bedLeft.visible = false;
     bedRight.visible = false;
