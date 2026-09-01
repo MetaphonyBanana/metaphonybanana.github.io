@@ -96,3 +96,21 @@ canvas { display: block; }
   transform: translate(-50%, -130%);
 }
 .billiard-pocket-tooltip.show { opacity: 1; }
+
+/* ── バナナフィッシュ・オーバーレイ(Y軸原点から出現) ───────────────── */
+/* billiard-overlayと同じ仕様(z-index/transition/表示切り替え)に揃えている。
+   背景のグラデーションだけはbananafish固有(窓側=海、扉側=砂を思わせる色)。 */
+.bananafish-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.6s ease;
+  background: linear-gradient(to right, #0d2338 0%, #1f4d78 35%, #8a7a56 68%, #cba166 100%);
+}
+.bananafish-overlay.show { opacity: 1; pointer-events: auto; }
+.bananafish-overlay canvas { cursor: crosshair; }
+
+/* 見た目(枠なし・矢印・発光hover)はcommon/iconButton.jsの.icon-btnが担う。
+   billiard-closeと同じ位置(左上)。 */
+.bananafish-close {
+  position: fixed; left: 22px; top: 22px;
+}
