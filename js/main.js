@@ -518,7 +518,7 @@ renderer.domElement.addEventListener('click', (e) => {
   pointer.x = (e.clientX / innerWidth) * 2 - 1;
   pointer.y = -(e.clientY / innerHeight) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
-const panelHit = yzPanel.isActive() ? raycaster.intersectObject(yzPanel.mesh)[0] : null;
+const panelHit = yzPanel.isActive() ? raycaster.intersectObject(yzPanel.hitMesh)[0] : null;
 if (panelHit) {
   onYZPanelClick();
   return;
@@ -679,7 +679,7 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   pointer.y = -(e.clientY / innerHeight) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
 
-  const panelHit = yzPanel.isActive() ? raycaster.intersectObject(yzPanel.mesh)[0] : null;
+  const panelHit = yzPanel.isActive() ? raycaster.intersectObject(yzPanel.hitMesh)[0] : null;
   if (yzPanel.isActive()) yzPanel.setHovered(!!panelHit);
 
   // 隠しiボタン(Yステーション限定)。iHit.visible(=showY/hideYで切り替え)のときだけ判定する。
