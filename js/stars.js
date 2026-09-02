@@ -104,7 +104,11 @@ export function createStars(scene, count = 3000) {
                 vec4 mvPosition = modelViewMatrix * vec4(morphed, 1.0);
                 // 収束が進むほど点を小さく締める(=重なりによる巨大なブラー塊を防ぎ、ドット状にする)
                 float shrink = mix(0.9, 0.2, vFormed);
-                gl_PointSize = (1.2 + vTwinkle * 1.3) * shrink * (300.0 / -mvPosition.z);
+                float rawSize = (1.2 + vTwinkle * 1.3) * shrink * (300.0 / -mvPosition.z);
+                // 遠い星やformed後の縮小サイズがあまりに小さい(1〜2px程度)と、
+                // フラグメント側のdiscardで作っている円形マスクを描くだけの解像度が無く
+                // 「ただの正方形の1ピクセル」に見えてしまう。最小サイズを底上げして防ぐ。
+                gl_PointSize = max(rawSize, 3.0);
                 gl_Position = projectionMatrix * mvPosition;
             }
         `,
@@ -118,7 +122,9 @@ export function createStars(scene, count = 3000) {
                 float d = length(c);
                 if (d > 0.5) discard;
                 // 収束済みほど輪郭をシャープに(smoothstepの幅を狭めてにじみを減らす)
-                float edge = mix(0.5, 0.15, vFormed);
+                // vFormed=0のときedgeが0.5ちょうどになりsmoothstep(0.5,0.5,d)が
+                // edge0==edge1の未定義動作になるため、わずかに差をつけておく。
+                float edge = mix(0.499, 0.15, vFormed);
                 // 収束済みほど瞬きを抑えて明るさを安定させる(文字として読みやすくする)
                 float brightness = mix(0.35 + vTwinkle * 0.65, 0.9, vFormed);
                 float alpha = smoothstep(0.5, edge, d) * brightness * (1.0 - vHide);
