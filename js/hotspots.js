@@ -17,14 +17,14 @@ const HOTSPOTS = [
   //Y
   { pos: [120, -200, -150], text: [{ text:'That was a secret bugle only Admirals to hear.\n—Boo Boo Glass', work: 'Down at the Dinghy'},
                                    ] },
-  { pos: [200, -100, -260], text: [{ text:'gift horse\n─Teddy', work: 'Teddy',},
-                                   { text:'triumvirate\n─Teddy', work: 'Teddy'},
+  { pos: [200, -100, -260], text: [{ text: 'What did one wall say to the other wall?\n—Charles', work: 'For Esmé—with Love and Squalor'},
+                                   { text: 'The door banged open without having been wrapped on. X raised his head, turned it, and corporal Z standing in the door.', work: 'For Esmé—with Love and Squalor'},
                                    ] },
   { pos: [-50, -30, -100],  text: [{ text: 'Did the tigers run all around that tree?\n─Sybil Carpenter', work: 'A Perfect Day for Bananafish'},
                                     { text: 'Here comes a wave.\n─Sybil Carpenter', work: 'A Perfect Day for Bananafish'},
                                    ] },
-  { pos: [-30, -100, -60],  text: [{ text: 'What did one wall say to the other wall?\n—Charles', work: 'For Esmé—with Love and Squalor'},
-                                   { text: 'The door banged open without having been wrapped on. X raised his head, turned it, and corporal Z standing in the door.', work: 'For Esmé—with Love and Squalor'},
+  { pos: [-30, -100, -60],  text: [{ text:'gift horse\n─Teddy', work: 'Teddy',},
+                                   { text:'triumvirate\n─Teddy', work: 'Teddy'},
                                    ] },
   //Z
   { pos: [-200,10, -150],   text: [{ text: 'I want to talk to Seymour.\n─Franny Glass', work: 'Zooey'},
