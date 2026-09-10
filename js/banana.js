@@ -2,31 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { TUNE } from './config.js';
 
-function makePlaceholderBanana() {
-  const m = new THREE.Mesh(
-    new THREE.TorusGeometry(1.1, 0.28, 20, 40, Math.PI * 1.15),
-    new THREE.MeshPhysicalMaterial({
-      color: 0xeaffef, transmission: 0.9, roughness: 0.05,
-      thickness: 0.6, ior: 1.4, transparent: true,
-    })
-  );
-  m.rotation.z = Math.PI * 0.35;
-  return m;
-}
-
-function makePlaceholderShards(count = 14) {
-  const geo = new THREE.TetrahedronGeometry(0.22);
-  const arr = [];
-  for (let i = 0; i < count; i++) {
-    const mat = new THREE.MeshBasicMaterial({ color: 0xd8fff0, transparent: true, opacity: 0 });
-    const s = new THREE.Mesh(geo, mat);
-    s.visible = false;
-    arr.push(s);
-  }
-  return arr;
-}
-
-// banana.glb を試みに読み込む。存在しない/失敗した場合はプレースホルダーのまま。
+// banana.glb を読み込む。
 // Blender側の命名規則: 全体メッシュ = "Banana_Whole", 破片群 = "Shard", "Shard.001", "Shard.002"...(Blenderの重複命名はドット区切り)
 const SHARD_NAME_RE = /^Shard\d*$/;
 
@@ -48,16 +24,14 @@ function upgradeToGlass(material) {
   });
 }
 
-// ── ガラスのバナナ(Blender製 banana.glb を優先、無ければプレースホルダー) ──
-// 戻り値の `state.mesh` / `state.shards` はglb読み込み完了時に差し替わるため、
+// ── ガラスのバナナ(Blender製 banana.glb) ──
+// 読み込みは非同期のため、`state.mesh` / `state.shards` はglb読み込み完了時に差し替わる。
 // 呼び出し側は必ず state 経由(state.mesh.xxx)で参照すること。
 export function createBanana(scene) {
   const state = {
-    mesh: makePlaceholderBanana(),
-    shards: makePlaceholderShards(),
+    mesh: new THREE.Group(), // glb読み込み完了までの空プレースホルダー(見た目には何も出ない)
+    shards: [],
   };
-  scene.add(state.mesh);
-  state.shards.forEach(s => scene.add(s));
 
   new GLTFLoader().load(
     './banana.glb',
@@ -83,7 +57,6 @@ export function createBanana(scene) {
             .sort(() => Math.random() - 0.5)
             .slice(0, TUNE.maxActiveShards);
         }
-        state.shards.forEach(s => scene.remove(s));
         state.shards = loadedShards;
         state.shards.forEach(s => {
           s.material = upgradeToGlass(s.material);
@@ -95,7 +68,7 @@ export function createBanana(scene) {
       console.log(`banana.glb 読み込み成功: whole=${!!whole}, 使用する破片数=${state.shards.length}(元は${loadedShards.length}個検出)`);
     },
     undefined,
-    () => console.log('banana.glb が見つからないためプレースホルダーを使用します')
+    () => console.error('banana.glb の読み込みに失敗しました')
   );
 
   function triggerShatter() {
@@ -106,15 +79,38 @@ export function createBanana(scene) {
       s.scale.setScalar(1);
       if (s.material) s.material.opacity = 1;
       s.visible = true;
-      const dir = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
-      const dist = 1.5 + Math.random() * 2.5;
+
+      // -Z方向への指向性爆散(宇宙の運動法則):
+      // xy方向には広がるが、zは常に負方向。円錐状に-Zへ吹き飛ばす
+      const dir = new THREE.Vector3(
+        (Math.random() - 0.5) * 0.9,
+        (Math.random() - 0.5) * 0.9,
+        -(0.6 + Math.random() * 0.5) // 常に負、かつ支配的な成分
+      ).normalize();
+      const dist = 4 + Math.random() * 7; // 飛距離を大幅アップ(旧:1.5〜4.0 → 新:4〜11)
+      const dur = 0.8 + Math.random() * 0.6; // 個体差を出して同時着地感を消す
+
       gsap.to(s.position, {
-        x: home.x + dir.x * dist, y: home.y + dir.y * dist, z: home.z + dir.z * dist,
-        duration: 0.9, ease: 'power2.out'
+        x: home.x + dir.x * dist,
+        y: home.y + dir.y * dist,
+        z: home.z + dir.z * dist,
+        duration: dur,
+        ease: 'power2.out'
       });
-      gsap.to(s.rotation, { x: Math.random() * 6, y: Math.random() * 6, duration: 0.9 });
+      gsap.to(s.rotation, {
+        x: Math.random() * 12 - 6,
+        y: Math.random() * 12 - 6,
+        z: Math.random() * 12 - 6,
+        duration: dur,
+        ease: 'power1.out'
+      });
       // opacityではなくscaleで消す(透過破片が重なるとソート崩れが出やすいため)
-      gsap.to(s.scale, { x: 0, y: 0, z: 0, duration: 0.6, delay: 0.35, onComplete: () => { s.visible = false; } });
+      gsap.to(s.scale, {
+        x: 0, y: 0, z: 0,
+        duration: 0.5,
+        delay: dur * 0.55,
+        onComplete: () => { s.visible = false; }
+      });
     });
   }
 
