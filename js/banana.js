@@ -87,7 +87,7 @@ export function createBanana(scene) {
         (Math.random() - 0.5) * 0.9,
         -(0.6 + Math.random() * 0.5) // 常に負、かつ支配的な成分
       ).normalize();
-      const dist = 4 + Math.random() * 7; // 飛距離を大幅アップ(旧:1.5〜4.0 → 新:4〜11)
+      const dist = 100 + Math.random() * 70; // 飛距離を大幅アップ(旧:1.5〜4.0 → 新:4〜11)
       const dur = 0.8 + Math.random() * 0.6; // 個体差を出して同時着地感を消す
 
       gsap.to(s.position, {
