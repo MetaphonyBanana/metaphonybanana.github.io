@@ -6,7 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { TUNE, HOME_CAMERA_POS } from './config.js';
+import { TUNE, HOME_CAMERA_POS, HOME_CAMERA_TARGET } from './config.js';
 
 // ── 最終合成シェーダー: 通常レンダリング結果(baseTexture)に
 //    Bloom専用パスの結果(bloomTexture)を加算するだけのシンプルなシェーダー ──
@@ -32,13 +32,68 @@ const mixShader = {
   `,
 };
 
+// ── 疑似的な正射影(pseudo-orthographic) ────────────────────
+// ご指示「宇宙ページではあらかじめ正射影にしておき、右ドラッグで透視図モードに切り替える」の
+// 反映。ただし three.js の単一カメラは PerspectiveCamera ⇔ OrthographicCamera を
+// 直接切り替えられない(別カメラを2台用意してレンダリングを丸ごと差し替える必要がある)ため、
+// 今回は「極端に狭いFOV + 十分に遠い距離」で見た目上ほぼ平行投影に近づける近似(=よくある
+// dolly zoomの応用)で代用している。厳密な正射影(完全な平行投影)ではない点に注意。
+// もし見た目の違いが気になる場合は、OrthographicCameraを別途用意し、
+// composer/bloomComposer両方のRenderPass.cameraを丸ごと差し替える実装に変更してください。
+//
+// ★ 「以前(universeページより前の段階)はカメラをひっくり返した状態で正射影だった」との
+//   ご説明があったが、その向き(camera.upの反転など)を今回そのまま踏襲すべきか不明なため、
+//   ここではcamera.upは変更していない(通常のWORLD_UP=(0,1,0)のまま)。もし反転が必要な
+//   場合は、setProjectionMix呼び出し側(main.js)でcamera.up.set(0,-1,0)等を
+//   mix===0の間だけ適用する形で対応してください。
+const PSEUDO_ORTHO_FOV = 2;   // 仮値。0に近づけるほど平行投影に近づくが、精度問題が出やすくなるため程々の値に
+const HOME_FOV = 50;          // 通常時(透視図)のFOV。下のPerspectiveCamera初期化値と合わせてある
+
+// mix=0: 疑似正射影(HOME_CAMERA_TARGETから見て極端に遠い位置+極小FOV)
+// mix=1: 通常の透視図(HOME_CAMERA_POS+HOME_FOV、従来通りの見た目)
+// 「被写体(HOME_CAMERA_TARGET付近)の画面上の大きさがなるべく変わらないように」、
+// FOVと距離を同時に変化させるdolly zoomの要領で補間する。
+function makeProjectionMixer(camera) {
+  const viewDir = HOME_CAMERA_POS.clone().sub(HOME_CAMERA_TARGET).normalize();
+  const homeDistance = HOME_CAMERA_POS.distanceTo(HOME_CAMERA_TARGET);
+  const orthoDistance =
+    (homeDistance * Math.tan(THREE.MathUtils.degToRad(HOME_FOV / 2))) /
+    Math.tan(THREE.MathUtils.degToRad(PSEUDO_ORTHO_FOV / 2));
+  const orthoPos = HOME_CAMERA_TARGET.clone().addScaledVector(viewDir, orthoDistance);
+
+  // ★ 修正: 疑似正射影(mix=0)ではカメラをorthoDistanceぶん(HOME_CAMERA_POSよりずっと)
+  //   遠くまで下げる。camera.farが元の値(500)のままだと、カメラがfar平面より遠くへ
+  //   下がってしまったり、シーン全体がカメラからfar距離より遠くに位置することになり、
+  //   何も描画されず画面が真っ暗になっていた(実際に発生した不具合)。
+  //   orthoDistance(+シーンの奥行き分の余裕)までcamera.farを引き上げておく。
+  camera.far = Math.max(camera.far, orthoDistance + homeDistance + 100);
+  camera.updateProjectionMatrix();
+
+  // mix: 0〜1。呼び出し側(main.js)が右ドラッグの量に応じて毎フレーム/毎イベント呼ぶ想定。
+  return function setProjectionMix(mix) {
+    const m = THREE.MathUtils.clamp(mix, 0, 1);
+    camera.fov = THREE.MathUtils.lerp(PSEUDO_ORTHO_FOV, HOME_FOV, m);
+    camera.position.lerpVectors(orthoPos, HOME_CAMERA_POS, m);
+    camera.updateProjectionMatrix();
+    return m;
+  };
+}
+
 // ── 基本セットアップ ───────────────────────────
 export function createSceneSetup() {
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 500);
+  const camera = new THREE.PerspectiveCamera(HOME_FOV, innerWidth / innerHeight, 0.1, 500);
   camera.position.copy(HOME_CAMERA_POS); // 演出開始時からホームポジションに据え置く(以前はStep6で別途移動していた)
   scene.add(camera); // ← 追加: camera.add(sprite)した子を描画するのに必要
   const lookTarget = new THREE.Vector3(0, 0, 0);
+
+  // ★ ご指示反映: 宇宙ページ(record.js側のtripod/mirror演出)ではあらかじめ疑似正射影
+  //   (mix=0)にしておく。それより前のページ(carousel等)は従来通りHOME_CAMERA_POS基準の
+  //   通常の透視図のままにしたいので、main.js側で「carouselから切り替わるタイミング」に
+  //   なったらsetProjectionMix(0)を呼んで疑似正射影へ切り替え、右ドラッグでsetProjectionMix(t)を
+  //   1へ近づけていく想定(このファイル単体では切り替えタイミングを判断しないため、
+  //   ここではまだ呼ばない=通常の透視図のまま初期化する)。
+  const setProjectionMix = makeProjectionMixer(camera);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setSize(innerWidth, innerHeight);
@@ -67,13 +122,25 @@ export function createSceneSetup() {
   }
   function dimNoBloomObjects() {
     noBloomObjects.forEach((intensity, obj) => {
-      obj.userData.__prevOpacity = obj.material.opacity;
-      obj.material.opacity = obj.material.opacity * intensity;
+      if (intensity <= 0) {
+        // 完全除外: visibleを直接トグルする。opacityを弄る方式だと、stars.jsのような
+        // 独自ShaderMaterial(シェーダー内でopacityを一切参照していないもの)には
+        // 効かないため、intensity=0のときは確実に効く方式に倒す。
+        obj.userData.__prevVisible = obj.visible;
+        obj.visible = false;
+      } else {
+        obj.userData.__prevOpacity = obj.material.opacity;
+        obj.material.opacity = obj.material.opacity * intensity;
+      }
     });
   }
   function restoreNoBloomObjects() {
     noBloomObjects.forEach((intensity, obj) => {
-      obj.material.opacity = obj.userData.__prevOpacity;
+      if (intensity <= 0) {
+        obj.visible = obj.userData.__prevVisible;
+      } else {
+        obj.material.opacity = obj.userData.__prevOpacity;
+      }
     });
   }
 
@@ -87,6 +154,12 @@ export function createSceneSetup() {
     new THREE.Vector2(innerWidth, innerHeight),
     TUNE.bloomStrength, TUNE.bloomRadius, TUNE.bloomThreshold
   );
+  // UnrealBloomPassは内部でまず閾値以下を切り捨てる(LuminosityHighPassShader)。
+  // これがほぼハードエッジ(既定のsmoothWidthが極小)なので、星のように数ピクセル
+  // しかない丸いグラデーションだと、閾値を超えた一部のピクセルだけが荒い格子状に
+  // 生き残り、それがそのままブラーの"種"になって四角っぽく見える。
+  // smoothWidthを上げてカットオフ自体をなだらかにし、種の丸みを保つ。
+  bloomPass.highPassUniforms.smoothWidth.value = 0.1;
   bloomComposer.addPass(bloomPass);
 
   // ── ② 最終コンポーザー: 通常のシーン(除外オブジェクトも含め全部見える状態)を
@@ -107,6 +180,19 @@ export function createSceneSetup() {
   composer.addPass(new RenderPass(scene, camera));
   composer.addPass(mixPass);
   composer.addPass(new OutputPass());
+
+  // ★ 修正: UnrealBloomPassはコンストラクタに渡したVector2の解像度で内部の
+  // ミップ用レンダーターゲットを作成するが、これはdevicePixelRatioを考慮
+  // していない(CSSピクセルのinnerWidth/innerHeightのまま)。EffectComposer側は
+  // setSize()が呼ばれて初めて各パスにpixelRatio込みの解像度を伝えるため、
+  // ユーザーが一度もウィンドウをリサイズしないとbloomPassはCSSピクセル解像度
+  // (devicePixelRatioが2の環境では実質1/4のピクセル数)のまま動き続けてしまう。
+  // 数pxしかない星の点スプライトにとってこの解像度不足は致命的で、
+  // bloomThresholdやbloomRadiusをどう調整しても粗いドット状にしかならない
+  // 原因になっていた。ここで明示的に一度setSize()を呼び、初期化直後から
+  // 正しい解像度でBloom用バッファを作り直させる。
+  bloomComposer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
 
   // main.js の animate() 内、これまでの composer.render() の代わりに呼ぶ関数。
   // ①除外オブジェクトを隠す→②Bloom専用パスを描く→③元に戻す→④通常合成、の順。
@@ -139,5 +225,5 @@ export function createSceneSetup() {
     bloomComposer.setSize(innerWidth, innerHeight); // ← Bloom専用コンポーザーも一緒にリサイズする
   });
 
-  return { scene, camera, renderer, controls, composer, lookTarget, excludeFromBloom, render };
+  return { scene, camera, renderer, controls, composer, lookTarget, excludeFromBloom, render, setProjectionMix };
 }
