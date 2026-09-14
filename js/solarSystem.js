@@ -1,30 +1,32 @@
 import * as THREE from 'three';
-import { TRIPOD_RADIUS } from './universe.js';
+import { TRIPOD_RADIUS, RECORD_ANCHOR } from './universe.js';
 
 // ══════════════════════════════════════════════════════════════
-// ── 宇宙ページ最終装飾: バナナ惑星 + tripod直下を公転する太陽系(将来カルーセルの一部) ──
+// ── 宇宙ページ最終装飾: tripod直下を公転する太陽系(将来カルーセルの一部) ──
 // ══════════════════════════════════════════════════════════════
 //
-// ★ 方針変更: バナナ惑星はもう「公転の中心」ではない。位置は従来どおり(anchor引数)
-//   そのまま据え置き、太陽の公転軌道(sunGroupが辿るorbitCurve)はバナナとは無関係に、
-//   tripod(universe.js)の真下・tripodの回転軌道(TRIPOD_RADIUS)と同じ半径の円として
-//   独立に配置する。tripod=カルーセルの屋根 / この太陽系の軌道=カルーセルのステージ、
-//   という構成にするため、tripod足元(y=0)とステージ面の間に高さ方向のスペース
-//   (STAGE_HEIGHT_BELOW_TRIPOD)を確保してある。
+// ★ 方針変更: バナナ惑星はgalaxy.js側へ移動した(銀河の中心に置く演出のため)。
+//   このファイルはもうバナナを持たない。太陽の公転軌道(sunGroupが辿るorbitCurve)は
+//   tripod(universe.js)の頂点からさらに上、以前は方程式画像が浮かんでいた場所
+//   (universe.jsのRECORD_ANCHOR)を中心にした円として配置する(★2024年改訂: 以前は
+//   tripod足元より下に置いていたが、「三軸=レコードプレーヤー、リング(→主軌道)は
+//   その上に乗る」という構成に変更したため、上下が入れ替わっている)。
+// ★ ORBIT_CENTER(=RECORD_ANCHOR)はexportしてある。galaxy.js側が「銀河とその中心の
+//   バナナ」を同じ点に置くのに使う想定。
 //
 // 全体サイズはSOLAR_SYSTEM_SCALEで半分に縮小(太陽・惑星本体と、惑星ごとの太陽からの
-// 距離)。ただし主軌道半径(ORBIT_RADIUS)だけはtripodの回転軌道と揃える必要があるため、
-// スケールの対象外でTRIPOD_RADIUSをそのまま採用している。
+// 距離)。ただし主軌道半径(ORBIT_RADIUS_BASE)だけはtripodの回転軌道より一回り大きくする方針のため、
+// スケールの対象外でTRIPOD_RADIUSを倍率(1.6倍、仮値)して採用している。
 //
 // 階層構造(入れ子の公転):
 //   group (このシステム全体)
-//     ├─ bananaMesh (固定。位置はanchor引数のまま変更なし。クリックで個人ページへ)
-//     ├─ sunGroup   (軌道(tripod直下・tripodと同半径の正円)上を移動)
-//     │     ├─ sunMesh (クリックで8惑星の軌跡の記録を開始)
+//     ├─ sunGroup   (軌道(tripod直下・ORBIT_RADIUS_BASE半径の正円)上を移動)
+//     │     ├─ sunMesh (クリックしても現在は何も起きない。8惑星の軌跡は最初から表示済みのため)
 //     │     └─ planetPivot[i] (ローカルY軸回りに回転) → planetMesh[i] (太陽からの距離=軌道半径)
-//     ├─ trailLines[i] (太陽クリック後、各惑星につき1本生成される黄色い細線。実際に通った位置を随時追記していく)
-//     └─ ihSprite (カルーセルの馬。太陽と同じ軌道・同じ角速度で、位相を少し遅らせて追従しつつ上下にバウンスする。
-//                  太陽系が最初の1周を終えたタイミングでフェードイン出現する)
+//     ├─ trailLines[i] (8惑星それぞれの黄色い軌跡。作成時点(=宇宙ページ到達と同時)から実際に
+//     │                 通った位置を随時追記していく。バナナクリックで非表示になる)
+//     └─ sunTrail.line (太陽自身の軌道。バナナクリックまでは記録開始前で何も描かれず、
+//                       クリック後はtrailLinesと同じ仕組みで太陽の実際の移動から線が伸びていく)
 //
 // ── 公転面を直交させる仕組み ────────────────────────────
 // 太陽グループ(sunGroup)を「軌道上の現在位置」に置くだけでなく、
@@ -35,23 +37,15 @@ import { TRIPOD_RADIUS } from './universe.js';
 // 軌道自体が正円の間はまっすぐな円筒らせん、将来バナナ型へ変形すればバナナ状のらせんになる。
 
 // ── クリックで飛ぶ個人ページ。まだURLが無いのでプレースホルダー ──
+// ★ 元々バナナ惑星クリックで遷移していたが、リンクは今後作成する「月」オブジェクト側へ
+//   移す方針になったため、この定数はここに残しておき、月モジュール実装時にそちらから
+//   importして使ってもらう想定(このファイル自体はもう参照していない)。
 export const PERSONAL_PAGE_URL = 'https://example.com/moon-base'; // ← 実際のURLが決まったら差し替え
 
 // ── 太陽系全体を半分サイズにする ────────────────────────────
 // 太陽・惑星本体の大きさ、および各惑星の太陽からの距離(orbit)に適用する。
-// 主軌道半径(ORBIT_RADIUS。tripodと揃える方)は対象外 ── 詳細はORBIT_RADIUSの定義を参照。
+// 主軌道半径(ORBIT_RADIUS_BASE)は対象外 ── 詳細はORBIT_RADIUS_BASEの定義を参照。
 const SOLAR_SYSTEM_SCALE = 0.5;
-
-// ── バナナ惑星(クリック対象) ──────────────────────────
-// 既存のbanana.js(オープニングで割れるバナナ)の資産を流用できるなら、そちらの
-// ジオメトリ/マテリアルに差し替えると見た目の一貫性が出ます。ここでは依存を増やさないよう、
-// TorusGeometryを部分的な弧(アーク)にして「三日月/バナナ」らしい曲がった塊に見せる
-// プレースホルダーにしてあります。
-const BANANA_RADIUS = 1.4;          // 曲率半径(仮値)
-const BANANA_TUBE = 0.42;           // 太さ(仮値)
-const BANANA_ARC = Math.PI * 0.78;  // 弧の角度(仮値。大きいほど曲がりが強い)
-const BANANA_COLOR = 0xf4e04d;
-const BANANA_HIT_RADIUS = 2.6;      // クリック判定用の当たり判定半径(見た目より広め。他の隠しボタンと同じ考え方)
 
 function makeHitAreaMesh(radius) {
   // このプロジェクトの他の隠しボタンと同じ方式: visible=trueのままほぼ完全に透明にする。
@@ -62,40 +56,43 @@ function makeHitAreaMesh(radius) {
   );
 }
 
-function makeBananaMesh() {
-  const geo = new THREE.TorusGeometry(BANANA_RADIUS, BANANA_TUBE, 12, 32, BANANA_ARC);
-  const mat = new THREE.MeshBasicMaterial({ color: BANANA_COLOR });
-  const mesh = new THREE.Mesh(geo, mat);
-  // Torusは既定でXY平面上に弧を描くので、正面から見やすい向きへ少し傾けておく(仮値)
-  mesh.rotation.set(0.3, 0.5, 0);
-  mesh.add(makeHitAreaMesh(BANANA_HIT_RADIUS));
-  mesh.userData.isBananaPlanet = true;
-  return mesh;
-}
-
 // ── 太陽が辿る軌道 ────────────────────────────────
 // 現状は正円(ORBIT_BEND=0, ORBIT_HEIGHT_WOBBLE=0)。
 // 将来「黄色いリング(=このモジュールで生成する軌跡)をクリックしたら、正円→バナナ型へ
 // 変形させて巨大バナナの絵を描く」という構想があるため、バナナ側の目標パラメータ
 // (BANANA_TARGET_BEND / BANANA_TARGET_HEIGHT_WOBBLE)は変形先の参考値として残してある。
 // 今回はこの2つをまだ使っていない(実装は正円のみ)。
-// r(θ) = ORBIT_RADIUS + ORBIT_BEND * sin(θ)^2 という式を使っており、ORBIT_BENDを0以外に
+// r(θ) = radius + ORBIT_BEND * sin(θ)^2 という式を使っており、ORBIT_BENDを0以外に
 // すると片側だけが外側に張り出したバナナ/三日月状の非対称カーブになる(将来の変形先の式)。
-// 基準半径: tripod(universe.js)の回転軌道(終端3点が描く円)とサイズを揃える。
-// ここは「太陽系を半分に」のSOLAR_SYSTEM_SCALEの対象外(tripod=屋根と直径を一致させる必要があるため)。
-const ORBIT_RADIUS = TRIPOD_RADIUS;
+// 基準半径: 以前はtripod(universe.js)の回転軌道(終端3点が描く円)とぴったり揃えていたが、
+// 「太陽系の軌道も大きくしてほしい」とのご指示で、tripodより一回り大きくしてある(仮値・倍率)。
+// もうtripodの直径と一致させる制約は外れたので、SOLAR_SYSTEM_SCALEの対象外という位置づけだけ
+// (太陽本体・惑星本体・惑星軌道半径には掛からない)は変わらず維持している。
+export const ORBIT_RADIUS_BASE = TRIPOD_RADIUS * 2.4;      // createSolarSystem時点の初期主軌道半径(仮値)
+// ↑ recordAssembly.js側の針が銀河に触れた瞬間、setOrbitRadius()でこれよりもっと大きい値
+//   (針が触れた位置=銀河上の接触点の半径)に即座に置き換えられる。あくまで生成直後の初期値。
+// ── 「規定軌道」: バナナクリック後、軌道が最終的に縮み切る先の固定半径 ───────────
+// ご指示により「tripodの半径より少し小さくした値」を採用(以前は「現在の半径×比率」で
+// 相対的に決めていたが、針(recordAssembly.js)が触れた位置次第で開始半径が変わるようになった
+// ため、縮小先は絶対値の固定半径にした)。
+export const FINAL_ORBIT_RADIUS = TRIPOD_RADIUS * 0.9; // 仮値。「少し小さく」の度合いは見ながら調整
+const ORBIT_SHRINK_DURATION = 4.8;     // 縮小にかける秒数(銀河の収束(COLLAPSE_DURATION)と歩調を揃えたいので近い値。仮値)
 const ORBIT_BEND = 0;                  // 0=正円。バナナへ変形するときはここをBANANA_TARGET_BENDへ近づけていく想定
 const ORBIT_HEIGHT_WOBBLE = 0;         // 0=完全に平面的な正円。バナナ変形時はBANANA_TARGET_HEIGHT_WOBBLEへ
 const BANANA_TARGET_BEND = 5;          // (未使用・将来用)バナナ変形時の膨らみの強さ目標値
 const BANANA_TARGET_HEIGHT_WOBBLE = 1.2; // (未使用・将来用)バナナ変形時の上下うねり目標値
 const ORBIT_CURVE_POINTS = 64;         // 曲線を近似する制御点の数
-const SUN_ORBIT_PERIOD = 40;           // 太陽が軌道を1周するのにかかる秒数(仮値)
+// ↓ galaxy.js側が「銀河の自転速度を太陽系の公転速度と揃える」「太陽系が軌道を一周したら
+//   銀河を縮小する」の両方の基準時間として参照するためexportした。
+export const SUN_ORBIT_PERIOD = 40;    // 太陽が軌道を1周するのにかかる秒数(仮値)
 
-function makeOrbitCurve(center) {
+// radius: 呼び出し時点の主軌道半径。バナナクリック後の縮小アニメーション中は、
+// この関数を毎フレーム呼び直して軌道形状を再計算する(rebuildOrbitCurve参照)。
+function makeOrbitCurve(center, radius) {
   const pts = [];
   for (let i = 0; i < ORBIT_CURVE_POINTS; i++) {
     const theta = (i / ORBIT_CURVE_POINTS) * Math.PI * 2;
-    const r = ORBIT_RADIUS + ORBIT_BEND * Math.sin(theta) * Math.sin(theta);
+    const r = radius + ORBIT_BEND * Math.sin(theta) * Math.sin(theta);
     const x = center.x + r * Math.cos(theta);
     const z = center.z + r * Math.sin(theta);
     const y = center.y + ORBIT_HEIGHT_WOBBLE * Math.sin(theta * 2);
@@ -160,6 +157,21 @@ function makePlanets(sunGroup) {
   return pivots;
 }
 
+// solarSystem.orbitCurveを、solarSystem.orbitRadius・solarSystem.orbitCenterの現在値に合わせて
+// 再計算する。shrinkOrbitOnBananaClickのtween中、毎フレーム呼ばれる想定。太陽の軌道の見た目
+// (sunTrail、後述)はこのカーブ上の実際の移動から動的に生成されるので、ここでは
+// カーブそのものの再計算だけでよい(静的なラインジオメトリの描き直しは不要)。
+function rebuildOrbitCurve(solarSystem) {
+  solarSystem.orbitCurve = makeOrbitCurve(solarSystem.orbitCenter, solarSystem.orbitRadius);
+}
+
+// 主軌道の中心そのものを動かす(record.js側で「銀河=バナナの位置」に太陽系を合わせるために使う)。
+// 既定値はORBIT_CENTER(createSolarSystem参照)。
+export function setOrbitCenter(solarSystem, center) {
+  solarSystem.orbitCenter.copy(center);
+  rebuildOrbitCurve(solarSystem);
+}
+
 // ── 黄色い軌跡(trail) ────────────────────────────────
 // 「実際にその瞬間その瞬間で惑星がどこにいたか」を毎フレーム(一定間隔)記録して線を伸ばす方式。
 // 事前に1周分をまとめて計算する旧方式だと、惑星の周期と太陽の公転周期が揃っていないため
@@ -171,55 +183,11 @@ const TRAIL_COLOR = 0xffee66;    // 黄色、細い(LineBasicMaterialは基本1p
 const TRAIL_MAX_POINTS = 720;    // 保持する点の数(仮値。多いほど滑らかで長く残るが重くなる)
 const TRAIL_RECORD_INTERVAL = SUN_ORBIT_PERIOD / TRAIL_MAX_POINTS; // 何秒おきに1点記録するか
 
-// ── カルーセルの馬(ih): tripodの屋根の下を、太陽と同じ軌道・同じ角速度で回る飾り ──────
-// 見た目はih.png(白背景→透過、黒インク→白不透明への変換を済ませた完成品テクスチャ)を使う。
-// 【注意】ih.pngはすでに変換済みなので、universe.jsのloadInkTexture(luminanceからalphaを
-// 作り直す関数)には絶対に通さないこと。すでに透過済みの画像を再度通すと、透明ピクセルの
-// RGBがdrawImage時に0,0,0へ丸め込まれる(premultiplied alphaの都合)ことがあり、その結果
-// 白と透過が入れ替わって見える不具合になる。ここではただのTextureLoaderで読み込むだけでいい。
-// 太陽とまったく同じ軌道パラメータtをそのまま使う(=同じ角速度で回転)が、
-// IH_PHASE_OFFSETぶん位相を遅らせて、太陽の少し後ろをついてくるように配置する。
-// カルーセルの馬らしく、進みながら上下にもバウンスさせる(IH_BOB_*)。
-// 出現トリガー: 太陽系が動き出してから最初の1周(SUN_ORBIT_PERIOD秒)を終えたタイミングで
-// フェードイン表示する。
-// 太陽系よりかなり大きく見せたいので、STAGE_HEIGHT_BELOW_TRIPOD(下記)を広げて、
-// tripodの屋根に頭がぶつからないよう軌道全体をさらに下げてある。
-const IH_IMAGE_URL = new URL('./data/ih.png', import.meta.url).href;
-const IH_WORLD_HEIGHT = 12;        // 表示の高さ(ワールド単位、仮値。かなり大きめ。幅はimg比率から自動計算)
-const IH_PHASE_OFFSET = 0.07;      // 太陽より軌道上でどれだけ遅れて追従するか(1周=1.0のうちの割合、仮値)
-const IH_BOB_AMPLITUDE = 1.4;      // 上下バウンスの振幅(仮値)
-const IH_BOB_SPEED = 1.6;          // 上下バウンスの速さ(ラジアン/秒、仮値)
-const IH_FADE_IN_DURATION = 1.2;   // 出現時のフェードイン秒数
-
-function makeIhSprite() {
-  const material = new THREE.SpriteMaterial({
-    map: null, // テクスチャ読み込み完了後に差し込む
-    color: 0xffffff,
-    transparent: true,
-    depthWrite: false,
-    opacity: 0,
-  });
-  const sprite = new THREE.Sprite(material);
-  sprite.visible = false; // 出現トリガー(太陽系が1周)まで隠しておく
-  return sprite;
-}
-
-// 出現トリガー: フェードインして見せる。
-function revealIh(solarSystem) {
-  solarSystem.ihSprite.visible = true;
-  gsap.to(solarSystem.ihSprite.material, {
-    opacity: 1,
-    duration: IH_FADE_IN_DURATION,
-    ease: 'power1.out',
-  });
-}
-
 const _UP = new THREE.Vector3(0, 1, 0);
 const _curvePoint = new THREE.Vector3();
 const _tangent = new THREE.Vector3();
 const _sunQuat = new THREE.Quaternion();
 const _planetWorld = new THREE.Vector3();
-const _ihPoint = new THREE.Vector3();
 
 // 太陽グループの「向き」を、軌道曲線上のtパラメータでの接線方向に合わせるための共通処理。
 function computeSunPose(orbitCurve, t, outPos, outQuat) {
@@ -228,7 +196,7 @@ function computeSunPose(orbitCurve, t, outPos, outQuat) {
   outQuat.setFromUnitVectors(_UP, _tangent);
 }
 
-// 惑星1体ぶんのリングバッファ状態を作る。
+// 惑星(または太陽)1本ぶんのリングバッファ状態を作る。
 // buffer: リングバッファ本体(書き込み順)。ordered: 描画用に時系列順へ並べ替えたもの
 // (Three.jsのLineは頂点配列の並び順そのまま線を引くので、リングのラップ地点で
 //  最新点→最古点へ一直線に飛ぶ線が出ないよう、描画前に必ず時系列順へ整列させる)。
@@ -239,6 +207,22 @@ function makeTrailState() {
     writeIndex: 0, // 次に書き込む位置
     count: 0,      // 埋まっている点数(TRAIL_MAX_POINTSで頭打ち)
   };
+}
+
+// makeTrailState()の状態に、実際に描画するThree.jsのLine一式(geometry/material/line)を
+// 足したものを作る。record開始前は点数0(setDrawRange(0,0))なので、何も描かれない
+// 状態からスタートする ── 「実際の移動によって線が生成されていく」見た目はこれで実現している。
+function makeTrailLine(color) {
+  const state = makeTrailState();
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(state.ordered, 3));
+  geometry.setDrawRange(0, 0);
+  // ご指示「星の軌道はかなり細くして」の反映: WebGLではLineBasicMaterialのlinewidthは
+  // ほとんどの環境で1px固定(値を上げても無視される)ため、これ以上「太さ」を直接変える
+  // 手段がない。代わりに半透明にすることで視覚的に細く・淡く見えるようにしている(仮値)。
+  const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.45 });
+  const line = new THREE.Line(geometry, material);
+  return { ...state, geometry, line };
 }
 
 // worldPosを1点、リングバッファに追記して、描画用ジオメトリを更新する。
@@ -264,28 +248,24 @@ function recordTrailPoint(trail, worldPos) {
   trail.geometry.setDrawRange(0, trail.count);
 }
 
-// ── 公転軌道の中心(=カルーセルのステージ面) ──────────────────
-// tripod(universe.js)の回転軸(world Y、x=0/z=0)上、tripodの足元(y=0)よりさらに
-// 下にSTAGE_HEIGHT_BELOW_TRIPODぶん離して置く。
-// ih(かなり大きく表示する)がtripodの屋根に頭をぶつけず、かつ軌道自体に埋もれて
-// 見えなくならないよう、この値は広めに取ってある(仮値)。
-const STAGE_HEIGHT_BELOW_TRIPOD = 18; // 仮値
-const ORBIT_CENTER = new THREE.Vector3(0, -STAGE_HEIGHT_BELOW_TRIPOD, 0);
+// ── 公転軌道の中心(=カルーセルのステージ/「レコード」の乗る場所) ──────────
+// ★ 構成変更: 以前はtripod(universe.js)の回転軸(world Y)上、tripod足元よりさらに
+//   下(STAGE_HEIGHT_BELOW_TRIPOD)に置いていたが、「三軸は前半ではレコードプレーヤーであり、
+//   リング(→太陽系の主軌道)はその上に乗る」という新しい構成に伴い、以前は方程式画像を
+//   掲げていた場所(universe.jsのRECORD_ANCHOR、tripod頂点からさらに高さ軸方向)と
+//   同じ点に変更した。galaxy.js側が「銀河とその中心のバナナ」を置く場所としても
+//   このORBIT_CENTERをそのまま再利用する(export)。
+export const ORBIT_CENTER = RECORD_ANCHOR.clone();
 
 // scene: universe.js と同じシーンに追加する想定。
-// anchor: バナナ惑星を置くワールド座標(もう公転の中心ではないので、単にバナナの位置)。
-//         見た目の構図として好きな場所を呼び出し側(main.js)で決めて渡してください。
-// 太陽の公転軌道自体はanchorとは無関係に、tripod直下・ORBIT_CENTERに固定される。
-export function createSolarSystem(scene, anchor) {
+// (バナナ惑星はgalaxy.js側へ移動したため、ここでは太陽系本体だけを作る)
+export function createSolarSystem(scene) {
   const group = new THREE.Group();
   group.visible = false; // enterUniverse等のフェードインに合わせて、呼び出し側でtrueにする想定
   scene.add(group);
 
-  const bananaMesh = makeBananaMesh();
-  bananaMesh.position.copy(anchor); // ← バナナは中心に置かないことにしたので、指定位置にそのまま据え置く
-  group.add(bananaMesh);
-
-  const orbitCurve = makeOrbitCurve(ORBIT_CENTER); // ← tripod直下・tripodと同半径の軌道
+  const orbitRadius = ORBIT_RADIUS_BASE;
+  const orbitCurve = makeOrbitCurve(ORBIT_CENTER, orbitRadius); // ← tripod直下・tripodより一回り大きい軌道
 
   const sunGroup = new THREE.Group();
   const sunMesh = makeSunMesh();
@@ -294,39 +274,36 @@ export function createSolarSystem(scene, anchor) {
 
   const planetPivots = makePlanets(sunGroup);
 
-  const ihSprite = makeIhSprite();
-  group.add(ihSprite);
-  new THREE.TextureLoader().load(
-    IH_IMAGE_URL,
-    (texture) => {
-      texture.colorSpace = THREE.SRGBColorSpace;
-      const aspect = texture.image.width / texture.image.height;
-      ihSprite.material.map = texture;
-      ihSprite.material.needsUpdate = true;
-      ihSprite.scale.set(IH_WORLD_HEIGHT * aspect, IH_WORLD_HEIGHT, 1);
-    },
-    undefined,
-    (err) => console.error('createSolarSystem: ih.pngの読み込みに失敗', err)
-  );
+  // 太陽自身の軌道(sunTrail): 8惑星のtrailとまったく同じ仕組みで、太陽の実際の移動位置を
+  // 記録して線を伸ばしていく。バナナクリックまでは記録を開始しない(=count0本のまま何も
+  // 描かれない)ので、バナナクリックした瞬間から「太陽の移動によって」線が生成され始める。
+  // 色は8惑星のtrailと同じTRAIL_COLORでよいとのことなので共通の色を使う。
+  const sunTrail = makeTrailLine(TRAIL_COLOR);
+  group.add(sunTrail.line);
 
-  return {
-    group, bananaMesh, sunGroup, sunMesh, orbitCurve, planetPivots,
-    trailLines: [],          // ← 太陽クリック後、{ geometry, line, buffer, ordered, writeIndex, count } を8個ぶん保持
+  const solarSystem = {
+    group, sunGroup, sunMesh, orbitCurve, orbitRadius, planetPivots,
+    orbitCenter: ORBIT_CENTER.clone(), // ← 主軌道の中心(既定値ORBIT_CENTER。setOrbitCenterで動かせる)
+    sunTrail,                 // ← 太陽自身の軌道(初期は記録なし)。バナナクリックで記録開始
+    sunTrailRecording: false, // ← バナナクリックまでfalse
+    sunTrailLastRecorded: -Infinity,
+    orbitShrunk: false,       // ← 二重発火防止
+    trailLines: [],          // ← { geometry, line, buffer, ordered, writeIndex, count } を8個ぶん保持
     trailsGenerated: false,  // ← 二重生成防止
     trailLastRecorded: -Infinity, // ← 直近に記録したelapsedSeconds
-    ihSprite,
-    ihRevealed: false,            // ← 出現済みフラグ(二重フェードイン防止)
-    orbitStartElapsedSeconds: null, // ← 最初にupdateSolarSystemが呼ばれたelapsedSeconds(1周判定の基準)
   };
+
+  // 「クリックで出現」ではなく、最初(宇宙ページ到達と同時)から8惑星のらせん軌道を
+  // 記録・表示しておく(既存のgeneratePlanetTrailsの仕組みをそのまま使い、呼ぶタイミングだけ
+  // 「太陽クリック時」から「作成時」に変更した)。
+  generatePlanetTrails(solarSystem);
+
+  return solarSystem;
 }
 
 // ── 毎フレーム呼ぶ ──────────────────────────────────
 export function updateSolarSystem(solarSystem, elapsedSeconds) {
   if (!solarSystem.group.visible) return;
-
-  if (solarSystem.orbitStartElapsedSeconds === null) {
-    solarSystem.orbitStartElapsedSeconds = elapsedSeconds;
-  }
 
   const t = (elapsedSeconds / SUN_ORBIT_PERIOD) % 1;
   computeSunPose(solarSystem.orbitCurve, t, _curvePoint, _sunQuat);
@@ -349,74 +326,123 @@ export function updateSolarSystem(solarSystem, elapsedSeconds) {
     });
   }
 
-  // ih(カルーセルの馬): 太陽と同じ軌道を同じ角速度でなぞりつつ、位相をIH_PHASE_OFFSETぶん
-  // 遅らせて太陽の後ろをついてくるように配置する。カルーセルの馬らしく上下にもバウンスさせる。
-  const ihT = (t - IH_PHASE_OFFSET + 1) % 1;
-  solarSystem.orbitCurve.getPointAt(ihT, _ihPoint);
-  _ihPoint.y += IH_BOB_AMPLITUDE * Math.sin(elapsedSeconds * IH_BOB_SPEED);
-  solarSystem.ihSprite.position.copy(_ihPoint);
-
-  // 太陽系が動き出してから最初の1周を終えたら、ihをフェードインで出現させる。
+  // 太陽自身の軌道(sunTrail): バナナクリック後(sunTrailRecording===true)のみ、
+  // 8惑星のtrailと同じ間隔で「太陽の今の実際の位置」(=_curvePoint)を記録していく。
+  // 主軌道半径が縮小中でもcomputeSunPoseが毎フレーム現在のorbitCurveを参照するため、
+  // 記録される軌跡は自然に「大きい円→小さい円」への移り変わりを描く。
   if (
-    !solarSystem.ihRevealed &&
-    elapsedSeconds - solarSystem.orbitStartElapsedSeconds >= SUN_ORBIT_PERIOD
+    solarSystem.sunTrailRecording &&
+    elapsedSeconds - solarSystem.sunTrailLastRecorded >= TRAIL_RECORD_INTERVAL
   ) {
-    solarSystem.ihRevealed = true;
-    revealIh(solarSystem);
+    solarSystem.sunTrailLastRecorded = elapsedSeconds;
+    recordTrailPoint(solarSystem.sunTrail, _curvePoint);
   }
 }
 
-// ── 太陽クリックで呼ぶ: 8惑星ぶんの軌跡の「記録」を開始する ──────────────
+// ── 呼ぶと8惑星ぶんの軌跡の「記録」を開始する ──────────────
 // 一括計算はせず、以後updateSolarSystem側で実際の位置を随時記録していく方式。
+// createSolarSystem内で作成時に自動的に呼ばれるので、宇宙ページ到達と同時に
+// 記録・表示が始まる(以前は太陽クリックが必要だったが、そちらは撤廃した)。
 export function generatePlanetTrails(solarSystem) {
   if (solarSystem.trailsGenerated) return;
   solarSystem.trailsGenerated = true;
   solarSystem.trailLastRecorded = -Infinity;
 
   solarSystem.trailLines = solarSystem.planetPivots.map(() => {
-    const state = makeTrailState();
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(state.ordered, 3));
-    geometry.setDrawRange(0, 0);
-    const material = new THREE.LineBasicMaterial({ color: TRAIL_COLOR });
-    const line = new THREE.Line(geometry, material);
-    solarSystem.group.add(line);
-    return { ...state, geometry, line };
+    const trail = makeTrailLine(TRAIL_COLOR);
+    solarSystem.group.add(trail.line);
+    return trail;
+  });
+}
+
+// ── バナナクリックで呼ぶ: 8惑星の軌道(trailLines)を消し、太陽自身の軌道(sunTrail)の
+//    記録を開始し、主軌道半径を少し小さく変化させる ─────────────────
+// 太陽の軌道はもう静的な線ではなく、8惑星のtrailとまったく同じ「実際の移動を記録して
+// 線を伸ばす」方式(sunTrail)。ここで記録を開始するだけで、以後updateSolarSystem側が
+// 毎フレーム勝手に線を伸ばしていく(=太陽の移動によって生成される)。
+// onUpdate(radius): 毎フレーム、縮小中の現在の軌道半径を呼び出し側へ知らせるための追加コールバック。
+// recordAssembly.jsの針を軌道の縮小に追従させる(updateNeedleToRadius)のに使う想定。
+export function shrinkOrbitOnBananaClick(solarSystem, { duration = ORBIT_SHRINK_DURATION, onUpdate, onComplete } = {}) {
+  if (solarSystem.orbitShrunk) return;
+  solarSystem.orbitShrunk = true;
+
+  solarSystem.trailLines.forEach((t) => { t.line.visible = false; });
+  solarSystem.sunTrailRecording = true;
+  solarSystem.sunTrailLastRecorded = -Infinity;
+
+  const tweenState = { radius: solarSystem.orbitRadius };
+  gsap.to(tweenState, {
+    radius: FINAL_ORBIT_RADIUS, // 「規定軌道」= tripodの半径より少し小さめの固定値まで縮める
+    duration,
+    ease: 'power2.inOut',
+    onUpdate: () => {
+      solarSystem.orbitRadius = tweenState.radius;
+      rebuildOrbitCurve(solarSystem);
+      if (onUpdate) onUpdate(solarSystem.orbitRadius);
+    },
+    onComplete: () => { if (onComplete) onComplete(); },
+  });
+}
+
+// ── レコード演出(recordAssembly.js)専用: 主軌道半径を即座に書き換える ──────────
+// ドッキング直後、「リングと同じ小さな半径」から膨張を始めるための初期値セットに使う。
+export function setOrbitRadius(solarSystem, radius) {
+  solarSystem.orbitRadius = radius;
+  rebuildOrbitCurve(solarSystem);
+}
+
+// ── レコード演出専用: 主軌道半径を(小さい状態から)ORBIT_RADIUS_BASEまで膨張させる ──
+// shrinkOrbitOnBananaClickの「縮小版」の逆再生にあたる処理。呼び出し前にsetOrbitRadiusで
+// 小さい初期半径(=リングの初期サイズ)にしておき、solarSystem.group.visible=trueにしてから
+// 呼ぶ想定(視認開始と同時にらせん軌道が記録され始める)。
+export function growOrbitToFull(solarSystem, { duration = 3.2, ease = 'power2.out', onComplete } = {}) {
+  const tweenState = { radius: solarSystem.orbitRadius };
+  return gsap.to(tweenState, {
+    radius: ORBIT_RADIUS_BASE,
+    duration,
+    ease,
+    onUpdate: () => {
+      solarSystem.orbitRadius = tweenState.radius;
+      rebuildOrbitCurve(solarSystem);
+    },
+    onComplete: () => { if (onComplete) onComplete(); },
   });
 }
 
 // ── main.js側の統合ポイント(想定) ──────────────────────
 //   1) createUniverse(scene)の近くで1回:
-//        // anchorはバナナ惑星の位置のみを指定する(公転軌道はtripod直下に自動配置される)
-//        const solarSystem = createSolarSystem(scene, new THREE.Vector3(anchorX, anchorY, anchorZ));
+//        const solarSystem = createSolarSystem(scene);
 //   2) enterUniverse()完了時など、宇宙ページに入ったタイミングで:
 //        solarSystem.group.visible = true;
 //   3) レンダーループ内(animate)で毎フレーム:
 //        updateSolarSystem(solarSystem, clock.getElapsedTime());
 //   4) クリック処理内(宇宙ページがアクティブな時のみ判定すればOK):
-//        - バナナ: raycaster.intersectObject(solarSystem.bananaMesh, true)[0] → PERSONAL_PAGE_URLへ遷移
-//        - 太陽:   raycaster.intersectObject(solarSystem.sunMesh, true)[0] → generatePlanetTrails(solarSystem)
+//        - 太陽: raycaster.intersectObject(solarSystem.sunMesh, true)[0] → generatePlanetTrails(solarSystem)
+//        - バナナ(record.js側のオブジェクト)のクリック判定・以降の召喚シーケンスはrecord.js
+//          (playNeedleSequence/onRingContact)を参照。銀河自体の拡大・縮小は廃止済みなので、
+//          ここでshrinkOrbitOnBananaClickを呼ぶ想定は現在は使っていない
+//          (8惑星軌道=trailLinesが消え、太陽自身の軌道=sunTrailの記録が始まり、主軌道が広がるのは
+//          growOrbitToFullが担っている)。
 //
 // TODO:
-//   - PERSONAL_PAGE_URL: 個人ページのURLが決まり次第差し替え。
-//   - anchor(バナナの位置): もう公転の中心ではないので、既存シーンの構図を見ながら
-//     好きな場所を決めてください(tripod・太陽系の軌道・ihと重ならない位置が無難)。
-//   - STAGE_HEIGHT_BELOW_TRIPOD: tripodの足元(y=0)から太陽系の公転面までの距離(仮値)。
-//     ihの上端がtripodの屋根を突き抜けないよう、IH_WORLD_HEIGHT/IH_BOB_AMPLITUDEと
-//     見比べながら調整してください。
-//   - ORBIT_RADIUS: 現在はtripodのTRIPOD_RADIUSと同じ値(universe.jsからimport)。
+//   - PERSONAL_PAGE_URL: 個人ページのURLが決まり次第差し替え(現在はgalaxy.jsも未使用。
+//     今後作成予定の「月」オブジェクト側からimportして使う想定)。
+//   - ORBIT_RADIUS_BASE: createSolarSystem時点の初期主軌道半径(仮値。recordAssembly.jsの針が
+//     触れた瞬間にsetOrbitRadius()でもっと大きい値に置き換わるので、実際に見える大きさは
+//     このORBIT_RADIUS_BASEではなく針の接触位置で決まる)。FINAL_ORBIT_RADIUS(バナナクリック後の
+//     縮小先の固定半径、tripodの半径より少し小さめ)・ORBIT_SHRINK_DURATIONも仮値。
 //     ORBIT_BEND/ORBIT_HEIGHT_WOBBLEは現状0(正円)。将来「クリックで正円→バナナ型へ変形」
 //     させたい場合、この2つをBANANA_TARGET_BEND/BANANA_TARGET_HEIGHT_WOBBLEへ向けて
-//     gsapなどで補間し、毎フレームmakeOrbitCurve()を作り直す実装が必要になります。
+//     gsapなどで補間し、毎フレームrebuildOrbitCurve()する実装が必要になります
+//     (仕組み自体はshrinkOrbitOnBananaClickで既に用意済みなので流用できます)。
 //   - SOLAR_SYSTEM_SCALE: 太陽・惑星本体の大きさと、惑星ごとの太陽からの距離をまとめて
-//     半分にしている倍率。ORBIT_RADIUS(tripodと揃える主軌道)には掛かっていない点に注意。
-//   - SUN_ORBIT_PERIOD: 太陽が軌道を1周する速さ。TRAIL_RECORD_INTERVAL・ihの出現タイミングにも影響する。
-//   - TRAIL_MAX_POINTS / TRAIL_COLOR: 軌跡の保持点数(=見える長さ)・色。
-//   - IH_WORLD_HEIGHT / IH_PHASE_OFFSET / IH_BOB_AMPLITUDE / IH_BOB_SPEED / IH_FADE_IN_DURATION:
-//     すべて仮値。大きさ・太陽との距離感・バウンスの揺れ方・出現の速さは見ながら調整してください。
+//     半分にしている倍率。ORBIT_RADIUS_BASE(主軌道)には掛かっていない点に注意。
+//   - SUN_ORBIT_PERIOD: 太陽が軌道を1周する速さ。TRAIL_RECORD_INTERVALにも影響する。
+//   - TRAIL_MAX_POINTS / TRAIL_COLOR: 軌跡の保持点数(=見える長さ)・色。8惑星のtrailLinesと
+//     太陽自身のsunTrailの両方がこの色・点数を共有している。
 //   - PLANETS: 各惑星の色・速度は仮値(速度が速いほど、軌跡のらせんの巻き数が増える)。
-//   - バナナ本体の見た目: 既存banana.jsの資産を流用したい場合は、makeBananaMesh()を
-//     そのモデルのgeometry/materialに差し替える形になります。
+//   - バナナ本体の見た目(既存banana.jsの資産を流用するかどうか)は、今はgalaxy.js側の
+//     makeBananaMesh()を参照してください。
 //   - (見送り) 惑星自身の公転軌道の形を太陽のorbitCurve(将来のバナナ変形含む)に合わせる件:
 //     現状はpivotの単純な円運動なので、各惑星ごとにカーブを持たせて補間する実装に
 //     組み替える必要があり複雑になるため未着手。必要になったら別途相談してください。
