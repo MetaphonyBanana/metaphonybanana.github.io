@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
 import { AXIS_LENGTH, AXIS_COLOR, UNIVERSE_CAMERA_POS, UNIVERSE_CAMERA_TARGET, UNIVERSE_CAMERA_DIR, UNIVERSE_CAMERA_DISTANCE } from './config.js';
 import { makeTextSprite } from './axisLabels.js';
 
@@ -90,7 +91,7 @@ export function createUniverseProjectionMixer(camera) {
 //   // クリック処理内(宇宙ページがアクティブな時のみ判定すればOK):
 //   //   raycaster.intersectObject(universe.tripodHitMesh, true)[0] がヒットしたら、
 //   //   revealTripodRing / liftTripod / startTripodRoofPulse をまとめて呼ぶ
-//   //   (金のリング→円錐状の粒子、の順で出現する一連の演出)。ih.pngはこの後、
+//   //   (金のリング→円錐状の粒子、の順で出現する一連の演出)。ihはこの後、
 //   //   tripodRingSwap.js側がリングの位置(下限にいるか)を見て自動的に出し入れする
 //   //   (setIhFade。詳細はtripodRingSwap.js参照)。
 //
@@ -99,10 +100,19 @@ export function createUniverseProjectionMixer(camera) {
 
 // ── 方程式画像(白背景・黒インクのフラット1枚絵)を、
 //    黒背景シーンに映えるテクスチャへ変換する ────────────────────
-// 元画像はアルファチャンネルを持たない(RGB)ため、明度からアルファを合成し直す:
-// 黒(インク部分)→不透明、白(背景)→透明。RGBは白に塗り替えておくことで、
-// SpriteMaterial.color(トーン)で好きな色に染められるようにする。
-// 8000px幅の元画像をそのまま処理すると重いので、表示に十分な解像度まで縮小してから処理する。
+// ★ 2026-09-14 変更(ご指示反映): 元はS_equation.png/righthand.pngという巨大な
+//   ラスター画像(前者は8000px幅)だったが、ih.svgと同じ要領で輪郭をトレースし、
+//   S_equation.svg/righthand.svgに置き換えた。ベクターなのでファイル自体は数KBまで
+//   軽くなったが、下記の処理はcanvasに一度ラスタライズしてから明度→アルファ変換する
+//   方式のままにしてある(SVGもPNGと同様、<img>のsrcに指定すればブラウザが自動で
+//   ラスタライズしてくれるため、この関数自体は無改造でそのまま動く)。
+// 明度からアルファを合成し直す: 黒(インク部分)→不透明、白(背景)→透明。
+// RGBは白に塗り替えておくことで、SpriteMaterial.color(トーン)で好きな色に染められる
+// ようにする。
+// ★ CANVAS_MAX_WIDTHは「元画像が重いから縮小する」という意味はもう無い
+//   (ベクターなので好きな解像度で描き直せる)が、canvasへのラスタライズ・
+//   getImageData自体のコストは解像度に比例するため、テクスチャとして必要十分な
+//   解像度に留める目的で引き続き残してある。
 const CANVAS_MAX_WIDTH = 2400;
 
 export function loadInkTexture(url) {
@@ -150,8 +160,8 @@ export function loadInkTexture(url) {
 
 // ── 表示する2枚の方程式画像。クリックのたびにこの順で交互に切り替わる ──────
 const EQUATION_IMAGES = [
-  { key: 'standard', url: new URL('./data/S_equation.png', import.meta.url).href },      // iħ∂ψ/∂t = Ĥψ
-  { key: 'carousel', url: new URL('./data/righthand.png', import.meta.url).href },   // i(h/Carousel)∂ψ/∂t = Ĥψ
+  { key: 'standard', url: new URL('./data/S_equation.svg', import.meta.url).href },      // iħ∂ψ/∂t = Ĥψ
+  { key: 'carousel', url: new URL('./data/righthand.svg', import.meta.url).href },   // i(h/Carousel)∂ψ/∂t = Ĥψ
 ];
 
 const EQUATION_WORLD_WIDTH = 7;      // 画像の表示幅(ワールド単位、仮値)
@@ -217,7 +227,7 @@ function makeAxisLine(tip) {
   return new THREE.Line(geo, mat);
 }
 
-// ── 金のリング(tripodクリックで、ih.pngと一緒にフェードイン) ─────────────
+// ── 金のリング(tripodクリックで、ihと一緒にフェードイン) ─────────────
 // tripodの終端3点が描く円(=カルーセルの外周、高さ0・半径TRIPOD_RADIUS)をなぞる、
 // 金色の細いリング。実際の軸線は回転で位置が変わるが、このリングは終端が通る円周上に
 // 固定して置くだけなので、tripodの自転(updateUniverseの回転)に合わせて動かす必要はない
@@ -373,33 +383,28 @@ function spawnRoofParticle(universe, worldOrigin, worldTip, color) {
   universe.roofSpawnElapsed[slot] = 0; // フェードインをここから開始
 }
 
-// ── ih.png(tripodクリックのシーケンス最後に出現) ────────────────────
+// ── ih(tripodクリックのシーケンス最後に出現) ────────────────────
 // 金のリング(半径TRIPOD_RADIUS。高さはtripodRingSwap.js側で動く)のすこし内側・かつ
 // リングより高い位置(IH_ABOVE_RING_MARGIN)を、回転木馬の馬車のように上下にバウンス
 // しながら周回させる。
 //
-// ★ ご指示反映(2回目の修正):
-//   1) 前回、front/backの割り当てが逆(180°反転して見える)だった。原因はThree.jsの仕様で、
-//      Object3D.lookAt(target)はカメラ/ライト以外(Mesh等)の場合、ローカル「+Z」軸をtargetへ
-//      向ける(カメラの場合の-Zとは逆)。これに合わせてfront/backの割り当てを直した
-//      (下記のmakeIhObject参照)。
-//   2) 「画像そのもの(四角いカード)に厚みが付いているのではなく、画像内の文字自体に厚みを
-//      付けたい」とのご指示のため、単純な直方体(Box)をやめ、「同じ絵をごくわずかにずらして
-//      何枚も重ねる」印刷レリーフ的な手法に変更した。各層はalphaTestで透明部分を描画しないため、
-//      四角いカードの外形は見えず、インクの形(文字部分)だけが厚みを持って見える
-//      (=浮世絵の版画を何層も重ねたような「盛り上がり」の質感)。
-//   3) 側面(厚み部分)専用の金色(IH_EDGE_COLOR)は廃止。ih自体は元々白(0xffffff)で
-//      使われているとのことなので、front/backとも白のみを使う(黄色いブラーの原因だった側面
-//      マテリアル自体をなくした)。
+// ★ ご指示反映(2026-09-14、3回目の修正):
+//   以前は「同じ絵(ih)をごくわずかにずらして何枚も重ねる」印刷レリーフ的な手法で
+//   厚みを表現していたが、これは中身が「厚みゼロの板を何枚も並べただけ」だったため、
+//   真横から見ると各板の見える面積が実質ゼロになり、「横から見ると消える」という
+//   欠陥があった。ご用意いただいたih.svg(文字の輪郭そのものをベクターパスで持つ
+//   ファイル)をSVGLoaderで読み込み、THREE.ExtrudeGeometryで実際にZ方向へ押し出した
+//   本物の立体にする方式に変更した。側面にも実ポリゴンがあるので、真横からでも
+//   ちゃんと厚みのある物体として見える。
 //   向きはカメラを追わず、「円の外側(=惑星でいう遠心力方向)」へ固定する
-//   (updateIhOrbitPosition内でlookAtにより毎フレーム計算)。
+//   (updateIhOrbitPosition内でlookAtにより毎フレーム計算)。lookAtで常に「前面」が
+//   外側(=カメラにほぼ正対する側)を向くため、押し出しの「裏面」が見える機会は
+//   実質無く、前後で見た目を変える処理は不要。
 // ★ プロパティ名はuniverse.ihSpriteのまま(main.js側の参照を変えずに済むように)残してあるが、
 //   実体はもうTHREE.Spriteではない点に注意。
-const IH_IMAGE_URL = new URL('./data/ih.png', import.meta.url).href;
-const IH_WORLD_HEIGHT = 8.4;        // 表示の高さ(ワールド単位、仮値。以前の70%に縮小。幅はimg比率から自動計算)
-const IH_THICKNESS = IH_WORLD_HEIGHT * 0.1; // 「文字自体の厚み」の総厚さ(ワールド単位、仮値。見ながら調整)
-const IH_EXTRUDE_LAYERS = 10;       // 前面・背面それぞれに重ねる薄い層の枚数(仮値。多いほど厚みが滑らかに見えるが重くなる)
-const IH_LAYER_ALPHA_TEST = 0.4;    // これ未満のアルファ(=絵の透明な背景部分)は描画しない、が反映される閾値(仮値)
+const IH_SVG_URL = new URL('./data/ih.svg', import.meta.url).href;
+const IH_WORLD_HEIGHT = 8.4;        // 表示の高さ(ワールド単位、仮値。以前の70%に縮小。幅はSVGの比率から自動計算)
+const IH_THICKNESS = IH_WORLD_HEIGHT * 0.3; // 押し出しの厚み(ExtrudeGeometryのdepth。ワールド単位、仮値。見ながら調整)
 const IH_ORBIT_RADIUS = TRIPOD_RADIUS * 0.85; // リングより「すこし内側」を周回する半径(仮値)
 // ★ 2026-09-12 修正(ご指示反映):「ihの高さがおかしいのでリングの上に配置して。ただし
 //   下振れの時にリングより低くならないよう少し高めに」への対応。以前はIH_ORBIT_HEIGHTが
@@ -417,47 +422,12 @@ const IH_ORBIT_SPEED = 0.35;        // 周回の角速度(ラジアン/秒、仮
 const IH_BOB_AMPLITUDE = AXIS_LENGTH * 0.12; // 上下バウンスの振幅(仮値。IH_ABOVE_RING_MARGINより必ず小さくすること)
 const IH_BOB_SPEED = 1.6;           // 上下バウンスの速さ(ラジアン/秒、仮値)
 
-// Groupの直下に、front(表)用・back(裏)用それぞれIH_EXTRUDE_LAYERS枚の薄いPlaneを重ねて置く。
-// front(表)は無加工のih.pngをそのままz=0〜+halfThicknessへ、back(裏)は左右反転した
-// テクスチャをz=0〜-halfThicknessへ(-Z方向を向くようrotation.y=πした状態で)配置する。
-// 「front=+Z寄り・無加工テクスチャ」を採用しているのは、Object3D.lookAt(target)が
-// Mesh/Group(カメラ・ライト以外)の場合はローカル「+Z」軸をtargetへ向ける仕様のため
-// ── updateIhOrbitPositionで「円の外側」をlookAtするだけで、自然にfrontが外側
-// (遠心力方向)を向くようになる。
+// Groupの直下は最初は空のまま(setIhFadeで表示に切り替わるまで隠しておく)。実体の
+// メッシュ(ExtrudeGeometryで押し出したih.svg由来のポリゴン)は非同期読み込み完了後に
+// 子として追加する(下記のSVGLoader.load参照)。
 function makeIhObject() {
   const group = new THREE.Group();
-  const frontMaterials = [];
-  const backMaterials = [];
-  const halfThickness = IH_THICKNESS / 2;
-  const planeGeometry = new THREE.PlaneGeometry(1, 1); // 全層で共有(幅・高さはgroup.scaleで一括調整)
-
-  for (let i = 0; i < IH_EXTRUDE_LAYERS; i++) {
-    const t = IH_EXTRUDE_LAYERS === 1 ? 0 : i / (IH_EXTRUDE_LAYERS - 1); // 0(中央)→1(最も外側)
-    const zOffset = t * halfThickness;
-
-    const frontMat = new THREE.MeshBasicMaterial({
-      map: null, color: 0xffffff, transparent: true, opacity: 0,
-      alphaTest: IH_LAYER_ALPHA_TEST, depthWrite: true, side: THREE.FrontSide,
-    });
-    const frontPlane = new THREE.Mesh(planeGeometry, frontMat);
-    frontPlane.position.z = zOffset; // +Z側(front)
-    group.add(frontPlane);
-    frontMaterials.push(frontMat);
-
-    const backMat = new THREE.MeshBasicMaterial({
-      map: null, color: 0xffffff, transparent: true, opacity: 0,
-      alphaTest: IH_LAYER_ALPHA_TEST, depthWrite: true, side: THREE.FrontSide,
-    });
-    const backPlane = new THREE.Mesh(planeGeometry, backMat);
-    backPlane.position.z = -zOffset; // -Z側(back)
-    backPlane.rotation.y = Math.PI;  // 法線を-Z方向へ向ける(裏側から見える面にする)
-    group.add(backPlane);
-    backMaterials.push(backMat);
-  }
-
-  group.userData.frontMaterials = frontMaterials;
-  group.userData.backMaterials = backMaterials;
-  group.visible = false; // setIhFadeで表示に切り替わるまで隠しておく
+  group.visible = false;
   return group;
 }
 
@@ -596,29 +566,51 @@ export function createUniverse(scene) {
 
   const ihSprite = makeIhObject();
   scene.add(ihSprite);
-  new THREE.TextureLoader().load(
-    IH_IMAGE_URL,
-    (texture) => {
-      texture.colorSpace = THREE.SRGBColorSpace;
-      const aspect = texture.image.width / texture.image.height;
+  new SVGLoader().load(
+    IH_SVG_URL,
+    (data) => {
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xffffff, transparent: true, opacity: 0, side: THREE.DoubleSide,
+      });
 
-      // 裏面(back)用に、左右反転したテクスチャを別途用意する。
-      // BoxGeometryの-Z面(front)と+Z面(back)は互いに逆向きなので、同じUVのまま貼ると
-      // 裏面の絵が鏡文字になってしまう。repeat.x=-1 + offset.x=1で水平反転し、
-      // 裏側から見ても正しく読める「裏返し表示」にする。
-      const backTexture = texture.clone();
-      backTexture.wrapS = THREE.RepeatWrapping;
-      backTexture.repeat.x = -1;
-      backTexture.offset.x = 1;
-      backTexture.needsUpdate = true;
+      const meshes = [];
+      for (const path of data.paths) {
+        const shapes = SVGLoader.createShapes(path);
+        for (const shape of shapes) {
+          const geometry = new THREE.ExtrudeGeometry(shape, {
+            depth: IH_THICKNESS,
+            bevelEnabled: false,
+            curveSegments: 12,
+          });
+          geometry.translate(0, 0, -IH_THICKNESS / 2); // Z方向の中心を0に揃える(前後に半分ずつ)
+          meshes.push(new THREE.Mesh(geometry, material));
+        }
+      }
+      if (meshes.length === 0) {
+        console.error('createUniverse: ih.svgからパスを読み取れませんでした');
+        return;
+      }
 
-      ihSprite.userData.frontMaterials.forEach((m) => { m.map = texture; m.needsUpdate = true; });
-      ihSprite.userData.backMaterials.forEach((m) => { m.map = backTexture; m.needsUpdate = true; });
-      // 厚み(Z)はジオメトリ側に焼き込み済みなので、ここではX/Y(幅・高さ)だけをscaleで合わせる。
-      ihSprite.scale.set(IH_WORLD_HEIGHT * aspect, IH_WORLD_HEIGHT, 1);
+      const combined = new THREE.Group();
+      meshes.forEach((m) => combined.add(m));
+
+      // SVGは左上原点・Y下向きの座標系なので、bboxを使って中心を原点に据え、
+      // 高さがIH_WORLD_HEIGHTになるようスケール(Yはこの時点で反転もかねる)する。
+      const box = new THREE.Box3().setFromObject(combined);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      meshes.forEach((m) => {
+        m.position.x -= center.x;
+        m.position.y -= center.y;
+      });
+      const scale = size.y === 0 ? 1 : IH_WORLD_HEIGHT / size.y;
+      combined.scale.set(scale, -scale, scale); // Y方向だけ符号を反転(SVGのY下向き→ワールドのY上向き)
+
+      ihSprite.userData.material = material;
+      ihSprite.add(combined);
     },
     undefined,
-    (err) => console.error('createUniverse: ih.pngの読み込みに失敗', err)
+    (err) => console.error('createUniverse: ih.svgの読み込みに失敗', err)
   );
 
   // 2枚とも同じワールド位置に重ねて置き、クリック時はopacityのクロスフェードだけで切り替える。
@@ -657,7 +649,7 @@ export function createUniverse(scene) {
     roofSpawnElapsed: new Float32Array(ROOF_RING_CAPACITY).fill(-1), // ← 各slotの生成からの経過秒数。-1=未生成
     roofLegSpawnAngle: [0, 0, 0], // ← 各脚ごとの「前回生成からの累積回転角」
     roofColorAngle: 0,             // ← 色帯切り替え用の累積回転角(2πで折り返す)
-    ihSprite,           // ← tripodクリックで出現するih.png
+    ihSprite,           // ← tripodクリックで出現するih
     ihRevealed: false,  // ← 出現済みフラグ(二重フェードイン防止)
     // ★ 2026-09-12 追加: 「左右同時ドラッグ(疑似正射影⇄透視図の切り替え)を
     //   完了するまでは、ihを出現させたくない」とのご指示。tripodRingSwap.js側は
@@ -692,6 +684,39 @@ export function revealTripodRing(universe, { duration = RING_FADE_DURATION, onCo
   });
 }
 
+// ── record.js側の戴冠演出専用: 金のリングを「太陽系のらせん軌道(=ORBIT_RADIUS_BASE)」の
+//    サイズまで拡大する ────────────────────────────────
+// リングの見た目上の半径は mesh.scale(均一倍率)で決める。ジオメトリ自体の半径は常に
+// TRIPOD_RADIUS(生成時の値)のままなので、targetRadius/TRIPOD_RADIUSの倍率をtweenする。
+// ★ 均一スケールなので、リングの太さ(RING_TUBE_RADIUS)も同じ倍率で太くなる(仮値。
+//   太さを変えたくない場合はgeometryを作り直す方式に変更してください)。
+const RING_GROW_DURATION_DEFAULT = 3.0; // 仮値
+export function growGoldenRing(universe, { targetRadius, duration = RING_GROW_DURATION_DEFAULT, ease = 'power2.inOut', onComplete } = {}) {
+  const targetScale = targetRadius / TRIPOD_RADIUS;
+  gsap.to(universe.goldenRing.scale, {
+    x: targetScale,
+    y: targetScale,
+    z: targetScale,
+    duration,
+    ease,
+    onComplete: () => { if (onComplete) onComplete(); },
+  });
+}
+
+// ── record.js側の戴冠演出専用: 太陽がリングに到達したら、リングを消す ──────
+const RING_HIDE_DURATION_DEFAULT = 0.8; // 仮値
+export function hideGoldenRing(universe, { duration = RING_HIDE_DURATION_DEFAULT, onComplete } = {}) {
+  gsap.to(universe.goldenRing.material, {
+    opacity: 0,
+    duration,
+    ease: 'power1.in',
+    onComplete: () => {
+      universe.goldenRing.visible = false;
+      if (onComplete) onComplete();
+    },
+  });
+}
+
 // ── tripodクリックで呼ぶ: tripod自体を持ち上げる ────────────────────
 const TRIPOD_LIFT_HEIGHT = APEX_HEIGHT * 0.9; // 浮上後の高さ(仮値)
 const TRIPOD_LIFT_DURATION = 2.4;             // 浮上にかける秒数(仮値)
@@ -716,7 +741,7 @@ export function startTripodRoofPulse(universe) {
   universe.roofParticles.visible = true;
 }
 
-// ── ih.pngの出現/消滅 ─────────────────────────────────────
+// ── ihの出現/消滅 ─────────────────────────────────────
 // ★ 2026-09-12 再変更(ご指示反映):「単純にゴールドリングが下限にあるときだけihが
 //   存在するようにしてほしい。中間位置のリングでもihが見えているのが気になる(屋根の
 //   粒子と視覚的にぶつかる)」への対応。
@@ -732,7 +757,7 @@ export function startTripodRoofPulse(universe) {
 //   別途フェード用のtweenを持たなくても見た目は滑らかになる。
 
 // tripodRingSwap.js側から毎フレーム呼ぶ: fade(0〜1、下限にどれだけ近いか)をそのまま
-// ih.pngの不透明度として反映する。fade<=0ならその場で非表示にする(存在しない扱い)。
+// ihの不透明度として反映する。fade<=0ならその場で非表示にする(存在しない扱い)。
 export function setIhFade(universe, fade) {
   // ★ 2026-09-12 追加: 左右同時ドラッグ(疑似正射影⇄透視図の切り替え)が完了するまでは、
   // fadeの値に関わらず常に非表示にする。
@@ -814,16 +839,15 @@ export function updateUniverse(universe, deltaSeconds, camera) {
     alphaAttr.needsUpdate = true;
   }
 
-  // ih.pngの周回・上下バウンス+フェードのopacity反映(表示中の間、続ける)。
+  // ih(押し出しメッシュ)の周回・上下バウンス+フェードのopacity反映(表示中の間、続ける)。
   // ★ 2026-09-12 変更(ご指示反映): tripodRingSwap.js側のsetIhFadeが毎フレーム更新する
   //   universe.ihBaseOpacity(=リング下限からの近さ)をそのままここで書き込む。
   if (universe.ihRevealed) {
     universe.ihElapsed += deltaSeconds;
     updateIhOrbitPosition(universe);
-    const ihMats = universe.ihSprite.userData.frontMaterials.length
-      ? [...universe.ihSprite.userData.frontMaterials, ...universe.ihSprite.userData.backMaterials]
-      : [];
-    for (const m of ihMats) m.opacity = universe.ihBaseOpacity;
+    if (universe.ihSprite.userData.material) {
+      universe.ihSprite.userData.material.opacity = universe.ihBaseOpacity;
+    }
   }
 
   // 平衡感覚の防御的な保険: 万一どこか別の処理がcamera.upを書き換えても、
@@ -942,7 +966,7 @@ export function toggleUniverseEquation(universe) {
 //     生成間隔・色帯の周期(1/6周)はANGULAR_SPEEDと連動しているので、ANGULAR_SPEEDを
 //     変えると自動的に一緒に変わる。
 //   - IH_WORLD_HEIGHT / IH_ORBIT_RADIUS / IH_ABOVE_RING_MARGIN / IH_ORBIT_SPEED /
-//     IH_BOB_AMPLITUDE / IH_BOB_SPEED(ih.png)も仮値。IH_ORBIT_RADIUSは
+//     IH_BOB_AMPLITUDE / IH_BOB_SPEED(ih)も仮値。IH_ORBIT_RADIUSは
 //     「リングより少し内側」、IH_ABOVE_RING_MARGINは「リング(現在の高さ)からどれだけ
 //     上に浮かせるか」のつもりでそれぞれ仮の値にしてあります(IH_BOB_AMPLITUDEより
 //     大きい値にしておかないと、バウンスの下振れでリングを下回ってしまうので注意)。
