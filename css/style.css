@@ -6,14 +6,17 @@ canvas { display: block; }
   top: 62%;
   left: 50%;
   transform: translate(-50%, -50%);
-  color: #cfeeff;
-  font-family: 'Cormorant Garamond', 'Times New Roman', serif;
+  color: #ffffff;
+  /* ★ 'Cormorant Garamond'を外し、フォールバックのTimes New Romanだけを使うようにした。
+     Webフォントの読み込み待ちによる「太字(フォールバック)→細字(Cormorant Garamond)」の
+     ちらつきは、そもそもこのフォントへ切り替わらなくなったことで発生しなくなる。 */
+  font-family: 'Times New Roman', serif;
   font-size: clamp(23px, 3vw, 50px);
   font-weight: 400;
   font-style: normal;
   letter-spacing: 0.08em;
   white-space: nowrap;
-  opacity: 0.35;
+  opacity: 0.8;
   pointer-events: none;
   transition: opacity 0.6s;
   z-index: 10;
