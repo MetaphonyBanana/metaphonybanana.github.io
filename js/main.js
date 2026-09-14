@@ -19,15 +19,21 @@ import { createBananafish } from './bananafish.js';
 import { createHotspots } from './hotspots.js';
 import { createDialogue } from './dialogue.js';
 import { createIntroSequence } from './introSequence.js';
-import { getAxisStationView, flyToAxisStation } from './config.js';
+import { getAxisStationView, flyToAxisStation, UNIVERSE_CAMERA_TARGET } from './config.js';
 import { createAxisStationOverlay } from './axisStationOverlay.js';
 import { createAxisConstellationOverlay } from './axisConstellationOverlay.js';
 import { AXIS_CONTENT } from './data/axisContent.js';
 import { createFinale, runFinale, handleIconClick } from './finale.js';
 import { createEquationAssembly, startPhase1, zoomToEquation, startPhase3, cyclePhase3Stage } from './equationAssembly.js';
 import { playOriginBurst } from './originBurst.js';
-import { createUniverse, enterUniverse, toggleUniverseEquation, updateUniverse, updateEquationHoverByPointer } from './universe.js';
-import { createSolarSystem, updateSolarSystem, generatePlanetTrails, PERSONAL_PAGE_URL } from './solarSystem.js';
+import { createUniverse, enterUniverse, toggleUniverseEquation, updateUniverse, updateEquationHoverByPointer, revealTripodRing, liftTripod, startTripodRoofPulse, createUniverseProjectionMixer, unlockIh } from './universe.js';
+import { createSolarSystem, updateSolarSystem, generatePlanetTrails } from './solarSystem.js';
+import { createGalaxy, updateGalaxy, revealGalaxy, ANGULAR_SPEED as GALAXY_ANGULAR_SPEED, ROTATION_DIRECTION as GALAXY_ROTATION_DIRECTION } from './galaxy.js';
+import { createTripodRingSwap, updateTripodRingSwap } from './tripodRingSwap.js';
+import {
+  createRecordDisplay, startRecordDisplay, tryRecordClick, updateRecordDisplay,
+  applyScroll, SCROLL_MAX,
+} from './record.js';
 
 // YZパネルクリック時、メインカメラをビリヤード専用ページと同じ構図にする。
 const BILLIARD_CAMERA_POS = new THREE.Vector3(AXIS_LENGTH / 2, -AXIS_LENGTH / 2, AXIS_LENGTH / 2);
@@ -80,9 +86,23 @@ function flyCameraLinear(camera, controls, targetPos, targetLookAt, duration, on
 }
 
 // ── シーン一式のセットアップ ─────────────────────
-const { scene, camera, renderer, controls, composer, lookTarget, excludeFromBloom, render } = createSceneSetup();
+const { scene, camera, renderer, controls, composer, lookTarget, excludeFromBloom, render, setProjectionMix } = createSceneSetup();
+// ★ 2026-09-12 追加: OrbitControlsは既定で「右ボタンドラッグ=パン」を持っているが、
+//   右ボタンは全面的にこちらの独自の右ドラッグ処理(疑似正射影⇄透視図の切り替え。
+//   universe.isActive中のみ有効)専用にしたいので、OrbitControls側の右ボタン機能は
+//   完全に無効化する(=universe以前は右ボタンに一切何も起きなくなる)。
+if (controls) controls.mouseButtons.RIGHT = null;
+// 宇宙ページの右ドラッグ切り替え専用(UNIVERSE_CAMERA_POSの角度を維持したまま距離・fovだけ変える)。
+// setProjectionMix(ホーム画面用)とは別物なので混同しないこと。
+const setUniverseProjectionMix = createUniverseProjectionMixer(camera);
 
 const starField = createStars(scene, 3000);
+// originBurst.jsのフラッシュと同じ考え方: Bloomに頼らず、テクスチャ自体の
+// 光暈(halo)だけで発光して見えるように点を十分大きく作る。Bloomは点が
+// 小さいと(UnrealBloomPassのミップ縮小アルゴリズムの弱点で)必ず四角さが
+// ぶり返すため、完全除外して"Bloomの土俵"に一切乗らないようにする。
+excludeFromBloom(starField.mesh);
+
 const clock = new THREE.Clock();
 
 const hotspotMeshes = createHotspots(scene);
@@ -126,9 +146,103 @@ const EQUATION_BLOOM_INTENSITY = 0.8;
 Object.values(equationAssembly.sprites).forEach((sprite) => excludeFromBloom(sprite, EQUATION_BLOOM_INTENSITY));
 const axes = createAxes(scene);
 const universe = createUniverse(scene); // ← Phase3以降、画面クリックで遷移する「宇宙ページ」(星なし・回転する三軸+方程式画像)
-// バナナ惑星+それを中心にバナナ型軌道で回る太陽系(8惑星入れ子)。宇宙ページ限定の装飾。
-// anchorはuniverse.jsの三脚(tripod)と重ならない位置に仮置き(座標は見た目を見ながら調整してください)。
-const solarSystem = createSolarSystem(scene, new THREE.Vector3(AXIS_LENGTH * 1.4, AXIS_LENGTH * 0.25, 0));
+// tripodクリックで「金のリング→円錐状の粒子→ih.png」が出現する演出(universe.js側で完結)に加えて、
+// 太陽系(solarSystem.js)・銀河(galaxy.js)・レコードプレーヤー操作パネル(record.js)も
+// 同じ宇宙ページ内に共存させる。
+// tripod直下を公転する太陽系(8惑星入れ子)。宇宙ページ限定の装飾。
+const solarSystem = createSolarSystem(scene);
+// ★ 銀河は他の何にも依存させず、単純にワールド原点(0,0,0)に固定配置する。
+//   (以前試していた「バナナの実座標に追従させる」ロジックは、初期化タイミングの
+//   問題で座標が不安定になる不具合があったため撤去した。)
+const galaxy = createGalaxy(scene, new THREE.Vector3(0, 13, 0));
+// 「レコードプレーヤー(操作パネル)」: カメラ背後の鏡三脚+バナナ→銀河出現→銀河クリックで
+// 針+太陽系召喚、という一連の流れを管理する(詳細はrecord.js冒頭のコメント参照)。
+// 銀河・太陽系はここで新規作成せず、上で作った既存のgalaxy/solarSystemをそのまま使う。
+const record = createRecordDisplay(scene, renderer, { camera, galaxy, solarSystem, universe });
+// 「二つのtripod・二つの円環」の対応関係クロスフェード+移動演出(tripodRingSwap.js)。
+// universe/recordの両方が揃った後でないと作れないので、ここで呼ぶ。
+const tripodRingSwap = createTripodRingSwap(scene, universe, record);
+
+// ── スクロールによる画面切り替え(下=鏡、上=carousel)・銀河のscrub ──────────
+// 累積スクロール量を0〜SCROLL_MAXにクランプして保持し、そのままrecord.js側に渡す
+// (画面の向き・銀河の出現度合いの計算はrecord.js側で完結させている)。
+let recordScrollY = 0;
+renderer.domElement.addEventListener('wheel', (e) => {
+  if (!universe.isActive) return; // 宇宙ページ内でのみ有効
+  e.preventDefault();
+  recordScrollY = THREE.MathUtils.clamp(recordScrollY + e.deltaY, 0, SCROLL_MAX);
+  applyScroll(record, recordScrollY);
+}, { passive: false });
+
+// ── 疑似正射影 ⇄ 透視図の右ドラッグ切り替え ─────────────────────
+// ご指示「carouselから切り替え、右ドラッグで透視図モードに切り替える」の反映。
+// record.phase!=='inactive'(=startRecordDisplay後。「carouselから切り替え」た後)になって
+// 初めて有効にする。一定量ドラッグしたら透視図側へ「確定」させ、以後record.perspectiveActiveを
+// trueにする(この結果、ihがunlockIhで出現できるようになる)。
+// ★ 以前はこの確定後にスクロールで銀河を縮小させる仕組みと連動していたが、銀河自体の
+//   拡大・縮小は廃止されたため、現在record.perspectiveActiveは「右ドラッグ確定済みか」を
+//   示すだけのフラグになっている。
+// 確定する前にドラッグを止めた(ボタンを離した)場合は、疑似正射影側へ戻す(仮の挙動)。
+let projectionDragActive = false;
+let projectionDragStartX = 0;
+let projectionMixValue = 0;
+const PROJECTION_DRAG_DISTANCE = 400; // このぶん(px)ドラッグしたら透視図へ完全移行する(仮値)
+
+// ★ 2026-09-12 再修正: 「pointerdownがちょうど左右同時押しの瞬間(buttons===3)に発火する」
+//   ことに依存していたが、これがブラウザ・OSによっては安定して発火しないことがあった
+//   (両クリックしても反応しない、との報告)。pointermove側でe.buttonsを毎回直接見る形に
+//   まとめ、pointerdownには依存しないようにする(マウスが動いた瞬間に判定するので、
+//   同時押しした後に少しでもカーソルが動けば確実に拾える)。
+renderer.domElement.addEventListener('pointermove', (e) => {
+  const bothDown = e.buttons === 3; // 左(1)+右(2)の同時押し
+
+  if (!projectionDragActive) {
+    if (!bothDown) return;
+    if (!universe.isActive || record.perspectiveActive) return; // universe開始前 or 切り替え済みなら無視
+    projectionDragActive = true;
+    projectionDragStartX = e.clientX;
+    return; // 開始位置を記録するだけ。動かすのは次のmoveから
+  }
+
+  if (!bothDown || !universe.isActive) {
+    // 途中でどちらかのボタンを離した(またはuniverse.isActiveでなくなった)→中断して疑似正射影側へ戻す。
+    projectionDragActive = false;
+    if (!record.perspectiveActive) {
+      projectionMixValue = 0;
+      setUniverseProjectionMix(0);
+    }
+    return;
+  }
+
+  const dragged = e.clientX - projectionDragStartX; // 右方向ドラッグで透視図へ進める(仮の向き)
+  projectionMixValue = THREE.MathUtils.clamp(dragged / PROJECTION_DRAG_DISTANCE, 0, 1);
+  setUniverseProjectionMix(projectionMixValue); // ★ UNIVERSE_CAMERA_POSの角度を維持したまま距離・fovだけ変える専用ミキサー
+  if (projectionMixValue >= 1 && !record.perspectiveActive) {
+    record.perspectiveActive = true; // ★ 右ドラッグでの透視図切り替えが確定した
+    unlockIh(universe); // ★ 左右同時ドラッグ完了後にだけihが出現できるようにする
+  }
+});
+
+renderer.domElement.addEventListener('contextmenu', (e) => {
+  // ★ 2026-09-12 再修正: record.phaseとの連動が不安定だったため条件から外し、
+  //   universe.isActiveだけで判定するようにした(universe開始前は右ボタンに
+  //   一切機能を持たせない。ブラウザ既定の右クリックメニューも抑止しない)。
+  if (universe.isActive) e.preventDefault();
+});
+
+// pointermove側で継続判定しているので、pointerupは「マウスを動かさずにボタンだけ離した」
+// 場合の保険として残す(通常はpointermove側で先に中断処理される)。
+window.addEventListener('pointerup', () => {
+  if (!projectionDragActive) return;
+  projectionDragActive = false;
+  if (!record.perspectiveActive) {
+    // 確定(1)に達しないまま離した場合は、疑似正射影側へ戻す(仮の挙動。
+    // 「一定量ドラッグし切らないと切り替わらない」という中断可能な操作感にしている)。
+    projectionMixValue = 0;
+    setUniverseProjectionMix(0);
+  }
+});
+
 const zWave = createZAxisWave(scene); // Z軸:ガウス波束のらせん(軸到達後にreveal、その後ゆっくり位相回転)
 const axisLabels = createAxisLabels(scene); // 三軸(X/Y/Z)のラベル(home状態になったら表示)
 const axisStationOverlay = createAxisStationOverlay(scene); // X/Y軸ステーション限定の追加表示(終端・原点の点+タイトル)
@@ -378,24 +492,36 @@ renderer.domElement.addEventListener('click', (e) => {
           return;
         }
 
-        // 宇宙ページ用hotspot(セリフ星)。既存hotspots.jsと同じ判定パターン。
-        const uniHotspotHit = raycaster.intersectObjects(universe.hotspotMeshes)[0];
-        if (uniHotspotHit) {
-          const starMesh = uniHotspotHit.object.userData.texts ? uniHotspotHit.object : uniHotspotHit.object.parent;
-          const texts = starMesh.userData.texts;
-          dialogue.show(texts[Math.floor(Math.random() * texts.length)], starMesh);
+        // tripodクリック → 金のリングが地面に形成され、tripod自体が浮上し、
+        // tripodが回転しながら粒子の軌跡(円錐)を永久に残し始める。
+        // ★ 2026-09-12 変更(ご指示反映): ih.pngの出現/消滅は、ここでのクリック+タイマーでは
+        //   なく、tripodRingSwap.js側が毎フレーム「ゴールドリングが下限にいるかどうか」を
+        //   見て自動的に呼び分けるように変更した(詳細はtripodRingSwap.js参照)。そのため
+        //   ここではrevealTripodRing/liftTripod/startTripodRoofPulseのみ呼ぶ。
+        // ★ 2026-09-11 修正: three.jsのRaycasterはvisible=falseでも判定してしまうため、
+        //   鏡側表示中(=tripodHitMesh.visible=false)でも当たり判定だけ残ってしまい、
+        //   鏡tripodをクリックしたつもりのクリックがここで先に食われて(revealTripodRing/
+        //   liftTripodは既発火済みで実質no-opのため「何も起きない」ように見えつつ)
+        //   tryRecordClickまで到達できていなかった。tripodRingSwap.jsのTODOコメントで
+        //   指摘されていた不具合そのもの。明示的にvisibleを見て判定自体をスキップする。
+        const tripodHit = universe.tripodHitMesh.visible
+          ? raycaster.intersectObject(universe.tripodHitMesh, true)[0]
+          : null;
+        if (tripodHit) {
+          revealTripodRing(universe);
+          liftTripod(universe);
+          startTripodRoofPulse(universe);
           return;
         }
 
-        // バナナ惑星クリック → 個人ページへ(月面基地ページ、URLは仮のプレースホルダー)
-        if (solarSystem.group.visible) {
-          const bananaHit = raycaster.intersectObject(solarSystem.bananaMesh, true)[0];
-          if (bananaHit) {
-            window.location.href = PERSONAL_PAGE_URL;
-            return;
-          }
+        // 「レコードプレーヤー(操作パネル)」: 鏡(→別ページ)/バナナ(→銀河出現)/銀河(→針+太陽系召喚)
+        // のいずれかへのクリックをまとめて判定する(詳細はrecord.js参照)。
+        if (tryRecordClick(record, raycaster)) {
+          return;
+        }
 
-          // 太陽クリック → 8惑星ぶんの黄色い軌跡を一括生成(一度生成したら永続。二度目以降は何もしない)
+        // 太陽クリック → 8惑星ぶんの黄色い軌跡を一括生成(一度生成したら永続。二度目以降は何もしない)
+        if (solarSystem.group.visible) {
           const sunHit = raycaster.intersectObject(solarSystem.sunMesh, true)[0];
           if (sunHit) {
             generatePlanetTrails(solarSystem);
@@ -444,12 +570,57 @@ renderer.domElement.addEventListener('click', (e) => {
                 s.material.opacity = 0;
                 s.visible = false;
               });
-
+              // ★ 修正: 以前はここでhotspotMeshes(ホーム側のセリフ用hotspot)を隠していなかったため、
+              //   同じシーンを共有している宇宙ページ側からも見えてしまっていた。他の旧要素と同様、
+              //   ここで非表示にする。
+              hotspotMeshes.forEach((m) => { m.visible = false; });
+              archer.visible = false;
+              // ★ 2026-09-11 追加(バグ調査): 「カメラの設定を変えても最終的な視点が変わらない」
+              //   という報告への対応。Phase3(zoomToEquation/startPhase3)がcamera.position/
+              //   quaternionをGSAPのtweenで動かしているが、universeページへ遷移する際にその
+              //   tweenを明示的に止めていなかった。もしこのtweenが(ループ演出などで)動き
+              //   続けたままだと、毎フレームcamera.position/向きを強制的に上書きし続け、
+              //   enterUniverse側で何を設定してもそちらへ引き戻されてしまう。
+              //   該当tweenが無ければ何も起きない安全な処置なので、防御的にここで確実に止める。
+              gsap.killTweensOf(camera.position);
+              gsap.killTweensOf(camera.rotation);
+              gsap.killTweensOf(camera.quaternion);
+              gsap.killTweensOf(camera);
+              dumpCamera('onMid, before enterUniverse'); // ← デバッグ: killTweensOf直後の状態を記録
+              // ★ 2026-09-11 バグ修正: 以前はsetProjectionMix(0)をenterUniverseのonComplete
+              //   (約1秒後、黒オーバーレイが晴れてコンテンツが見え始めた後)で呼んでいたため、
+              //   Phase3までの通常の透視図から疑似正射影へ切り替わる瞬間の見た目の変化(視野角の
+              //   急な変化)がユーザーに丸見えになってしまっていた。このブロック(onMid。まだ
+              //   画面が黒オーバーレイの下に隠れている)でカメラのジャンプと同時に呼ぶことで、
+              //   他の要素(旧シーンの消灯・カメラのジャンプ)と同様、切り替わりの瞬間自体を
+              //   オーバーレイの下に隠す。
+              setProjectionMix(0);
+              projectionMixValue = 0;
+              record.perspectiveActive = false;
               enterUniverse(universe, {
                 camera, controls,
                 duration: 1.0, // オーバーレイが晴れた後の新シーンのフェードイン
                 onComplete: () => {
-                  solarSystem.group.visible = true; // 宇宙ページ到達と同時にバナナ+太陽系も出す
+                  // ご指示「カメラは位置のみ固定」「ホイールはuniverse専用」の反映:
+                  // 宇宙ページに入った瞬間だけpan/zoomを無効化する(それ以外のページでは
+                  // 従来通りホイール=ズームとして使えるよう、ここでのみ切り替える)。
+                  if (controls) {
+                    controls.enablePan = false;
+                    controls.enableZoom = false;
+                  }
+                  // 太陽系はまだ出さない。代わりに「レコードプレーヤー(操作パネル)」
+                  // ── カメラ背後の鏡三脚+バナナ ── を表示する(record.js参照)。
+                  startRecordDisplay(record);
+                  // ★ ご指示反映(方針転換):「銀河は先に実寸大で表示しておく」── フェードや
+                  //   拡大の演出なしに、いきなりフルサイズで空間に配置する(galaxy.js側に
+                  //   ちょうどこの用途のrevealGalaxyが用意されていたのでそれを使う)。
+                  //   銀河本体には(内部バナナも含め)クリック対象は無く、以後この銀河
+                  //   自体を拡大・縮小する操作はない(常にこのフルサイズのまま)。
+                  revealGalaxy(galaxy);
+                  // universe開始時点のセリフ差し替え。
+                  const axisHint2 = document.getElementById('axisHint');
+                  if (axisHint2) axisHint2.textContent = 'What is the sound of two hands clapping?';
+                  dumpCamera('enterUniverse onComplete'); // ← デバッグ: この時点の実際のカメラ状態を記録
                   console.log('宇宙ページへ遷移完了');
                 },
               });
@@ -461,6 +632,11 @@ renderer.domElement.addEventListener('click', (e) => {
     }
 
     if (finaleIconHit) {
+      // 宇宙ページ用のセリフへ差し替える(index.html側の#axisHintは
+      // "What is the sound of the universe?"のまま固定表示されているだけなので、
+      // ここでtextContentを書き換えて切り替える)。
+      const axisHint = document.getElementById('axisHint');
+      if (axisHint) axisHint.textContent = 'Beauty says nothing at all.';
       handleIconClick({
         finale,
         onNextPhase: () => {
@@ -691,15 +867,49 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   renderer.domElement.style.cursor = (panelHit || iHit) ? 'pointer' : 'default';
 });
 
+// ── デバッグ用: 現在のカメラ状態をコンソールに出力する ────────────────
+// config.js側のUNIVERSE_CAMERA_POS/TARGETなど、カメラ関連の定数をその場の見た目から
+// 数値としてキャプチャしたいとき用(以前ここにあった「dumpCamera()デバッグ関数」の
+// 再設置。config.js内のUNIVERSE_CAMERA_POSのコメント参照)。
+// ★ 2026-09-11 修正: 「Dキーを押しても反応しない」との報告への対応。原因はおそらく
+//   DevToolsのコンソールにフォーカスがある状態(直前にコンソールへ何か入力した直後など)
+//   だと、キー入力がページ(window)ではなくコンソール側に飛んでしまうこと(コード側の
+//   バグではなくブラウザの一般的な挙動)。キー入力に依存しなくて済むよう、コンソールから
+//   直接呼べる window.dumpCamera() をグローバルに公開した(「D」キーの方も残してあるので、
+//   ページ側にフォーカスがあればそちらでも動く)。本番に残しても実害はないが、あくまで
+//   デバッグ用の使い捨てなので、不要になったらこのブロックごと削除してよい。
+function dumpCamera(label = '') {
+  const p = camera.position;
+  const t = controls ? controls.target : null;
+  console.log(`── dumpCamera${label ? ' (' + label + ')' : ''} ──`);
+  console.log(`camera.position = new THREE.Vector3(${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)});`);
+  if (t) console.log(`controls.target = new THREE.Vector3(${t.x.toFixed(2)}, ${t.y.toFixed(2)}, ${t.z.toFixed(2)});`);
+  console.log('camera.fov =', camera.fov, '/ camera.zoom =', camera.zoom);
+  console.log('projectionMixValue =', projectionMixValue, '/ record.perspectiveActive =', record.perspectiveActive);
+  console.log('intro.getState() =', intro.getState(), '/ universe.isActive =', universe.isActive, '/ record.phase =', record.phase);
+  console.log('GSAP tweens targeting camera:', gsap.getTweensOf(camera).length, '/ camera.position:', gsap.getTweensOf(camera.position).length);
+}
+window.dumpCamera = dumpCamera; // ← コンソールに直接 dumpCamera() と打てば呼べる(キー操作に依存しない)
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'd' && e.key !== 'D') return;
+  dumpCamera('keydown');
+});
+
 // ── レンダーループ ─────────────────────────────
 let labelsShown = false;
+let debugDumpElapsed = 0; // ← デバッグ用: universe.isActive中、一定間隔で自動的にdumpCameraする
 function animate() {
   requestAnimationFrame(animate);
   const delta = clock.getDelta(); // ← 宇宙ページの回転(updateUniverse)用。フレームの最初に1回だけ呼ぶこと
   const state = intro.getState();
-  // home状態になったら、カメラの向きは controls(自由視点)か
-  // 軸ステーションへの遷移アニメーション自身が管理するので、lookTargetへの追従は止める
-  if (state !== 'home') camera.lookAt(lookTarget);
+  // ★ 2026-09-11 バグ修正: intro.getState()はuniverseページに入っても'home'には
+  //   ならないため、この行はuniverse突入後もそのまま動き続けていた。その結果、
+  //   enterUniverse完了直後の一瞬(record.phase==='inactive'でcontrols.update()が
+  //   まだ一度も呼ばれていない間)だけ、Phase3時代のlookTarget(数式ズームの注視点)へ
+  //   カメラの向きが引っ張られ、「一瞬だけ小さく・水平っぽい視点が見えてから、
+  //   極端に視点が切り替わる」ように見えていた。universe.isActiveの間はこの行を
+  //   完全にスキップし、向きの制御をOrbitControls(controls.target)に一元化する。
+  if (state !== 'home' && !universe.isActive) camera.lookAt(lookTarget);
   if (state === 'home' && !cameraBusy && !finaleActive) controls.update();
   if (state === 'home' && !labelsShown) { labelsShown = true; axisLabels.show(); }
   dialogue.updatePosition();
@@ -709,7 +919,68 @@ function animate() {
   try { zWave.update(clock.getElapsedTime()); } catch (err) { console.error('zWave.update failed:', err); }
   try { axes.update(clock.getElapsedTime()); } catch (err) { console.error('axes.update failed:', err); } // 軸ラインの「原点方向へ流れる光」アニメーション
   updateUniverse(universe, delta, camera); // 宇宙ページの三軸回転(固定軸まわりのカルーセル回転。isActiveがfalseの間は内部で即returnするので無害)
-  updateSolarSystem(solarSystem, clock.getElapsedTime()); // バナナ惑星+太陽系(group.visible=falseの間は内部で即returnするので無害)
+  updateSolarSystem(solarSystem, clock.getElapsedTime()); // 太陽系(group.visible=falseの間は内部で即returnするので無害)
+  updateGalaxy(galaxy, delta); // tripod直下の巨大な銀河の自転(state==='hidden'の間は内部で即returnするので無害)
+  // ★ 2026-09-12 追加: 「カメラも銀河と同じ速度で回転させたい」とのご指示の反映。
+  //   galaxy.js側のupdateGalaxy()は、通常状態(record.js側のneedleSpinActive以外)では
+  //   direction(=GALAXY_ROTATION_DIRECTION) × GALAXY_ANGULAR_SPEED × deltaSecondsぶん
+  //   starsGroupをworld Y軸まわりに毎フレーム回している。ここではまったく同じ角度・
+  //   同じ軸・同じ向きで、cameraをUNIVERSE_CAMERA_TARGETまわりに回す
+  //   (=カメラと銀河が同じ速さ・同じ向きで一緒に回るので、両者の相対角度は変わらない
+  //   ==銀河から見るとカメラは静止して見える形になる)。
+  //   universe.isActiveの間だけ動かす(それ以外のページのカメラには影響させない)。
+  //   OrbitControls.update()はuniverse.isActive中は呼ばれていない(state!=='home'のため)
+  //   ので、ここでcamera.positionを直接動かしてもcontrols側と競合しない。
+  //   ★ 2026-09-12 追加: 右ドラッグ中(projectionDragActive)・右ドラッグ確定後
+  //   (record.perspectiveActive)は、この自動回転を止める。ドラッグ中はカメラ位置を
+  //   setUniverseProjectionMix側が直接制御しているため競合するし、確定後(通常の
+  //   透視図に切り替わった状態)は「銀河を背景として固定する」演出自体が終わっている
+  //   フェーズなので、回転を続ける意味がない。
+  // ★ 2026-09-12 追加: この銀河同期回転ブロックで過去に実際に発生したバグ(変数宣言の
+  //   消失によるReferenceError)が、animate()全体を毎フレーム静かにクラッシュさせ、
+  //   render()が二度と呼ばれず「画面が固まる」という気づきにくい形の不具合になっていた
+  //   (エラーはconsoleには出るが、画面上は「PHASE3の視点で止まって見える」だけなので
+  //   気づきにくい)。再発した場合に画面全体を巻き込まないよう、try/catchで隔離する。
+  try {
+    if (universe.isActive && !projectionDragActive && !record.perspectiveActive) {
+      const relative = camera.position.clone().sub(UNIVERSE_CAMERA_TARGET);
+      relative.applyAxisAngle(
+        new THREE.Vector3(0, 1, 0),
+        GALAXY_ROTATION_DIRECTION * GALAXY_ANGULAR_SPEED * delta
+      );
+      camera.position.copy(UNIVERSE_CAMERA_TARGET).add(relative);
+      camera.lookAt(UNIVERSE_CAMERA_TARGET);
+    }
+  } catch (err) {
+    console.error('universe camera auto-rotate failed:', err);
+  }
+  updateRecordDisplay(record, delta, controls); // 鏡の反射撮影+スクロールに応じた画面切り替え+三角錐の自転(メインのrender()より前)
+  updateTripodRingSwap(tripodRingSwap); // 「二つのtripod・二つの円環」のクロスフェード+移動(record.viewMixCurrentに連動)
+  // ご指示「carouselとrecordは可視、不可視の関係」の反映: 画面がどちら向きかに応じて、
+  // 互いの見た目(carousel側の粒子/ih、record側のbanana搭載mirrorGroup)を排他的に切り替える。
+  // ★ tripod本体(axesGroup)・金のリング(goldenRing)は、以前はここで0.5をしきい値に
+  //   visible/invisibleを瞬時に切り替えていたが、tripodRingSwap.js側でrecord.viewMixCurrentに
+  //   連動した連続的なopacityクロスフェード+移動を行うようになったため、ここでの強制トグルは
+  //   外してある(残すと、そちらの演出が瞬時に隠れてしまい台無しになるため)。
+  // 銀河・太陽系は元々「鏡側を向いてから」しか出現しない作りなので、ここでは強制していない。
+  if (universe.isActive) {
+    const showRecordSide = record.viewMixCurrent >= 0.5;
+    universe.roofParticles.visible = !showRecordSide;
+    universe.tripodHitMesh.visible = !showRecordSide;
+    universe.ihSprite.visible = !showRecordSide && universe.ihRevealed;
+    if (record.phase !== 'inactive') record.mirrorGroup.visible = showRecordSide;
+  }
+  // ★ 2026-09-11 追加(バグ調査用): 「カメラ設定を変えても最終的な視点が変わらない」の
+  //   原因調査のため、universe.isActive中は1秒おきに自動でdumpCameraする(キー操作不要)。
+  //   値が毎回変わり続けている場合、どこかにまだ生きているtween/毎フレーム上書きがある
+  //   ということなので、切り分けの決め手になる。原因が特定できたら削除してよい。
+  if (universe.isActive) {
+    debugDumpElapsed += delta;
+    if (debugDumpElapsed >= 1) {
+      debugDumpElapsed = 0;
+      dumpCamera('periodic');
+    }
+  }
   yzPanel.update(clock.getElapsedTime());
   bananaState.mesh.rotation.y += state === 'idle' ? 0.004 : 0;
   render();
