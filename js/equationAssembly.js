@@ -50,5 +50,4 @@ export {
   phase3SymbolWorldSize,
   createPhase3Assets,
   startPhase3,
-  cyclePhase3Stage,
 } from './phase3.js';
