@@ -24,7 +24,7 @@ import { createAxisStationOverlay } from './axisStationOverlay.js';
 import { createAxisConstellationOverlay } from './axisConstellationOverlay.js';
 import { AXIS_CONTENT } from './data/axisContent.js';
 import { createFinale, runFinale, handleIconClick } from './finale.js';
-import { createEquationAssembly, startPhase1, zoomToEquation, startPhase3, cyclePhase3Stage } from './equationAssembly.js';
+import { createEquationAssembly, startPhase1, zoomToEquation, startPhase3 } from './equationAssembly.js';
 import { playOriginBurst } from './originBurst.js';
 import { createUniverse, enterUniverse, toggleUniverseEquation, updateUniverse, updateEquationHoverByPointer, revealTripodRing, liftTripod, startTripodRoofPulse, createUniverseProjectionMixer, unlockIh } from './universe.js';
 import { createSolarSystem, updateSolarSystem, generatePlanetTrails } from './solarSystem.js';
@@ -158,7 +158,7 @@ const galaxy = createGalaxy(scene, new THREE.Vector3(0, 13, 0));
 // 「レコードプレーヤー(操作パネル)」: カメラ背後の鏡三脚+バナナ→銀河出現→銀河クリックで
 // 針+太陽系召喚、という一連の流れを管理する(詳細はrecord.js冒頭のコメント参照)。
 // 銀河・太陽系はここで新規作成せず、上で作った既存のgalaxy/solarSystemをそのまま使う。
-const record = createRecordDisplay(scene, renderer, { camera, galaxy, solarSystem, universe });
+const record = createRecordDisplay(scene, renderer, { camera, galaxy, solarSystem, universe, excludeFromBloom });
 // 「二つのtripod・二つの円環」の対応関係クロスフェード+移動演出(tripodRingSwap.js)。
 // universe/recordの両方が揃った後でないと作れないので、ここで呼ぶ。
 const tripodRingSwap = createTripodRingSwap(scene, universe, record);
