@@ -84,7 +84,7 @@ function loadGLTFScene(path) {
 const CORONATION_TEXT = 'I wanted to speak between any two points by way of a foolish circle!\n― Metaphony';
 const CORONATION_DURATION = 10.0;             // ①戴冠にかける秒数
 const CROWN_DROP_START_HEIGHT = AXIS_LENGTH * 0.6; // バナナの上、どれだけ高い位置から降ってくるか(仮値)
-const CROWN_SCALE = 0.6; // 仮値。実際のcrown.glbのサイズを見て調整してください
+const CROWN_SCALE = 0.2; // 仮値。実際のcrown.glbのサイズを見て調整してください
 let coronationCaption = null; // 遅延生成(#axisHint等とは別の、画面下75%専用の要素)
 
 function getCoronationCaption() {
