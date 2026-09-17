@@ -57,6 +57,26 @@ const GALAXY_OUTSIDE_COLOR = new THREE.Color(0x3a6fd8); // 外側の腕。寒色
 
 const GALAXY_POINT_SIZE = 68;       // Pointsの基準サイズ(以前の2倍。仮値。uSizeとして渡す)
 
+// ── 2026-09-17 追加: 円盤の境界フェード ────────────────────
+// 外周(および中心に穴をあけたときの内周)を、粒子ごとのalphaで滑らかに減衰させて
+// 「縁がぷつりと切れる」のを防ぐ。値はGALAXY_RADIUSに対する比率(仮値)。
+const GALAXY_OUTER_FADE = 0.30;     // 外周側: 半径のこの割合ぶんの幅をかけて0へ
+const GALAXY_INNER_FADE = 0.35;     // 内周側: innerRadiusのこの割合ぶんの幅をかけて0へ(穴があるときのみ)
+const GALAXY_EDGE_SIZE_FALLOFF = 0.55; // 縁で粒を小さくする度合い(0=変えない、1=完全に消える手前まで細る)
+
+// ── 2026-09-17 追加: 「腕の強調」演出用パラメータ ───────────────────
+// ご指示反映: 「固定三本の腕を太くする」演出。GALAXY_BRANCHES=9本のうち3個おき
+// (=120°間隔で均等)の3本だけを対象にし、setGalaxyArmEmphasis(galaxy, 0〜1)で
+// 太さ・明るさを外部からアニメーションできるようにする。
+//   - main.js側: 最後の俯瞰視点(telescopeモード突入)になったタイミングで0→1
+//   - 将来追加予定のレコードのアーム(tonearm)を円盤に置くギミック: 1→0
+//     (=今の常時の静かな見た目に戻す)を想定している(現時点では呼び出し元は
+//     まだ実装されていない)。
+export const GALAXY_ARM_EMPHASIS_BRANCHES = [0, 3, 6]; // 9本中3個おき=120°間隔で均等な3本
+const GALAXY_ARM_THICKEN_STRENGTH = 1.4;   // 強調時、対象の腕の粒を最大(1+この値)倍太くする(仮値)
+const GALAXY_ARM_BRIGHTEN_STRENGTH = 0.9;  // 強調時、対象の腕の粒を最大(1+この値)倍明るくする(仮値)
+
+
 // ── 自転の演出パラメータ ─────────────────────────────
 const ROTATION_AXIS_DIR = new THREE.Vector3(0, 1, 0);
 export const ROTATION_DIRECTION = -1;       // 自転の向き(+1/-1)。以前と逆回転にしたいのでマイナスに
@@ -76,9 +96,19 @@ const NEEDLE_SPIN_MAGNITUDE = Math.PI; // ラジアン/秒(=1秒で半周)
 const VERTEX_SHADER = /* glsl */ `
   uniform float uSize;
   uniform float uPixelRatio;
+  uniform float uNearFadeStart;
+  uniform float uNearFadeRange;
+  uniform float uMaxPixelSize;
+  uniform float uArmEmphasis;         // 0=通常、1=強調full(setGalaxyArmEmphasisで外部からtween)
+  uniform float uArmThickenStrength;  // 強調時の太さ倍率の強さ(bulge側は0=無効)
+  uniform float uArmBrightenStrength; // 強調時の明るさ倍率の強さ(bulge側は0=無効)
   attribute float aScale;
+  attribute float aAlpha;
+  attribute float aArmWeight; // 0/1: 強調対象の腕(GALAXY_ARM_EMPHASIS_BRANCHES)に属するか
   attribute vec3 aColor;
   varying vec3 vColor;
+  varying float vAlpha;
+  varying float vColorBoost;
   void main() {
     vec4 modelPosition = modelMatrix * vec4(position, 1.0);
     vec4 viewPosition = viewMatrix * modelPosition;
@@ -88,74 +118,187 @@ const VERTEX_SHADER = /* glsl */ `
     gl_PointSize = uSize * aScale * uPixelRatio;
     gl_PointSize *= (1.0 / -viewPosition.z);
 
+    // ★ 2026-09-17 追加: 強調対象の腕の粒だけ、uArmEmphasisに応じて太く・明るくする。
+    float armBoost = aArmWeight * uArmEmphasis;
+    gl_PointSize *= 1.0 + armBoost * uArmThickenStrength;
+
+    // ★ 2026-09-17 追加: 画面上の見かけサイズに上限を設ける。カメラが極端に近づいても
+    //   「ベタ塗りの巨大な正方形」までは膨らまなくなる(=バルジ対策その2)。
+    //   uMaxPixelSize未指定(0)のときは無効(既定の1/-viewPosition.z減衰のみ)。
+    if (uMaxPixelSize > 0.0) {
+      gl_PointSize = min(gl_PointSize, uMaxPixelSize);
+    }
+
     vColor = aColor;
+    vColorBoost = 1.0 + armBoost * uArmBrightenStrength;
+    // ★ 2026-09-17 追加: カメラが粒に近づきすぎたとき(=バルジのように大きいsizeを
+    //   持つ粒にカメラが接近して、テクスチャなしの円が画面いっぱいの「巨大なドット」に
+    //   見えてしまうケース)に、距離に応じてアルファを落として消す。銀河本体側は
+    //   常に十分遠いので、uNearFadeStart=0/uNearFadeRange=1(実質無効)で呼べばよい。
+    float viewDist = -viewPosition.z;
+    float nearFade = smoothstep(uNearFadeStart, uNearFadeStart + max(uNearFadeRange, 0.0001), viewDist);
+    vAlpha = aAlpha * nearFade;
   }
 `;
 
 const FRAGMENT_SHADER = /* glsl */ `
   uniform float uAlpha;
   varying vec3 vColor;
+  varying float vAlpha;
+  varying float vColorBoost;
   void main() {
     float strength = distance(gl_PointCoord, vec2(0.5));
     strength = 1.0 - smoothstep(0.0, 0.5, strength);
     if (strength <= 0.0) discard;
-    gl_FragColor = vec4(vColor, strength * uAlpha);
+    gl_FragColor = vec4(vColor * vColorBoost, strength * uAlpha * vAlpha);
   }
 `;
 
 // ── ジオメトリ生成: 位置・色・サイズ属性をJS側で一度だけ計算する ─────────
 // 渦巻き円盤のみ(中心の棒状バルジは撤去済み。上部コメント参照)。
-function buildGalaxyGeometry() {
+// ★ 2026-09-16 追加(ご指示反映): 「バルジ出現の際に銀河に穴をあけて、バルジから
+//   腕が生えてるように見せたい」への対応。bar_bulge_preview.htmlのGALAXY_INNER_RADIUS
+//   と同じ考え方で、innerRadius(既定0=以前と同じ、中心まで詰まった円盤)を受け取り、
+//   半径を[innerRadius, GALAXY_RADIUS]の範囲にリマップして中心に穴を作れるようにした。
+function buildGalaxyGeometry(innerRadius = 0) {
   const totalCount = GALAXY_PARTICLE_COUNT;
 
   const positions = new Float32Array(totalCount * 3);
   const colors = new Float32Array(totalCount * 3);
   const scales = new Float32Array(totalCount);
+  const alphas = new Float32Array(totalCount);
+  const armWeights = new Float32Array(totalCount);
+
+  // 外周/内周のフェード幅(ワールド単位)。0除算を避けるため下限を持たせる。
+  const outerFadeWidth = Math.max(GALAXY_RADIUS * GALAXY_OUTER_FADE, 1e-6);
+  const innerFadeWidth = innerRadius > 0 ? Math.max(innerRadius * GALAXY_INNER_FADE, 1e-6) : 0;
+
+  const smoothstep = (edge0, edge1, x) => {
+    const t = Math.min(Math.max((x - edge0) / (edge1 - edge0), 0), 1);
+    return t * t * (3 - 2 * t);
+  };
 
   for (let i = 0; i < totalCount; i++) {
     const i3 = i * 3;
 
-    const radius = Math.pow(Math.random(), 0.7) * GALAXY_RADIUS;
-    const branchAngle = ((i % GALAXY_BRANCHES) / GALAXY_BRANCHES) * Math.PI * 2;
+    const radius = innerRadius + Math.pow(Math.random(), 0.7) * (GALAXY_RADIUS - innerRadius);
+    const armIndex = i % GALAXY_BRANCHES;
+    const branchAngle = (armIndex / GALAXY_BRANCHES) * Math.PI * 2;
     const spinAngle = radius * GALAXY_SPIN * 0.02;
 
-    const randomSign = () => (Math.random() < 0.5 ? 1 : -1);
+    // ★ 2026-09-17 修正: 腕からのブレを等方(球面上で一様な向き)にする。
+    //   以前はX/Zに「同じ大きさ・符号だけランダム」な値を足していたため、ブレの向きが
+    //   常に対角4方向(±s, ±s)に限られ、稀に大きく外れる粒子が四隅に集中して、
+    //   銀河の周縁が四角いシルエットに見えていた。向きを球面上で一様にサンプリングし、
+    //   大きさだけをrandomStrengthで決めることで、どの方位にも等確率で散る=円状になる。
     const randomStrength = Math.pow(Math.random(), GALAXY_RANDOMNESS_POWER) * GALAXY_RANDOMNESS * radius;
-    const randomX = randomSign() * randomStrength;
-    const randomY = randomSign() * randomStrength * GALAXY_FLATTEN;
-    const randomZ = randomSign() * randomStrength;
+    const dirTheta = Math.random() * Math.PI * 2;
+    const dirY = Math.random() * 2 - 1;          // cos(φ)を一様に取ると球面上で一様になる
+    const dirXZ = Math.sqrt(1 - dirY * dirY);
+    const randomX = Math.cos(dirTheta) * dirXZ * randomStrength;
+    const randomY = dirY * randomStrength * GALAXY_FLATTEN; // Y方向だけ薄くして円盤にする
+    const randomZ = Math.sin(dirTheta) * dirXZ * randomStrength;
 
-    positions[i3] = Math.cos(branchAngle + spinAngle) * radius + randomX;
+    const x = Math.cos(branchAngle + spinAngle) * radius + randomX;
+    const z = Math.sin(branchAngle + spinAngle) * radius + randomZ;
+
+    positions[i3] = x;
     positions[i3 + 1] = randomY;
-    positions[i3 + 2] = Math.sin(branchAngle + spinAngle) * radius + randomZ;
+    positions[i3 + 2] = z;
 
     const mixedColor = GALAXY_INSIDE_COLOR.clone().lerp(GALAXY_OUTSIDE_COLOR, radius / GALAXY_RADIUS);
     colors[i3] = mixedColor.r;
     colors[i3 + 1] = mixedColor.g;
     colors[i3 + 2] = mixedColor.b;
 
-    scales[i] = Math.random() * 0.7 + 0.3; // 大きさに個体差をつける(0.3〜1.0)
+    // ★ 2026-09-17 追加: 境界フェード。ブレを足した「実際の」XZ半径で判定するので、
+    //   腕から外へ飛び出した粒子も含めて縁が滑らかに消える。
+    const finalRadius = Math.hypot(x, z);
+    let edge = 1 - smoothstep(GALAXY_RADIUS - outerFadeWidth, GALAXY_RADIUS, finalRadius);
+    if (innerFadeWidth > 0) {
+      // 中心に穴があるとき(バルジ出現時)は、穴のふちも同様にぼかす。
+      edge *= smoothstep(innerRadius, innerRadius + innerFadeWidth, finalRadius);
+    }
+
+    alphas[i] = edge;
+    // 縁では粒そのものも細らせると、フェードがより自然に見える。
+    const sizeJitter = Math.random() * 0.7 + 0.3; // 大きさに個体差をつける(0.3〜1.0)
+    scales[i] = sizeJitter * (1 - GALAXY_EDGE_SIZE_FALLOFF * (1 - edge));
+
+    // 強調対象の3本の腕(GALAXY_ARM_EMPHASIS_BRANCHES)に属する粒だけ1、それ以外は0。
+    armWeights[i] = GALAXY_ARM_EMPHASIS_BRANCHES.includes(armIndex) ? 1 : 0;
   }
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
   geometry.setAttribute('aScale', new THREE.BufferAttribute(scales, 1));
+  geometry.setAttribute('aAlpha', new THREE.BufferAttribute(alphas, 1));
+  geometry.setAttribute('aArmWeight', new THREE.BufferAttribute(armWeights, 1));
   return geometry;
 }
 
-function buildGalaxyMaterial() {
+// ── 2026-09-16 追加: バルジ出現のタイミングでrecord.js側から呼んでもらい、円盤の
+//    中心にinnerRadius分の穴をあける(=そこから先はバルジが埋める想定)。
+//    ジオメトリを丸ごと作り直して差し替える、簡易な実装(アニメーションなし。
+//    「出現の際に」という一度きりのタイミングなので、瞬時の切り替えで十分という判断)。
+export function setGalaxyInnerRadius(galaxy, innerRadius) {
+  if (!galaxy || !galaxy.points) return;
+  const newGeometry = buildGalaxyGeometry(innerRadius);
+  galaxy.points.geometry.dispose();
+  galaxy.points.geometry = newGeometry;
+}
+
+// ── 2026-09-17 追加: 固定3本の腕(GALAXY_ARM_EMPHASIS_BRANCHES)の強調度を設定する。
+//    amountは0(通常)〜1(太さ・明るさとも最大)。値そのものを毎フレーム/tweenの
+//    onUpdateから渡す想定(このモジュール自体はアニメーションしない。呼び出し側の
+//    main.js/record.js側でgsap.toなどを使ってamountを0→1、1→0とtweenしてください)。
+export function setGalaxyArmEmphasis(galaxy, amount) {
+  if (!galaxy || !galaxy.material) return;
+  galaxy.material.uniforms.uArmEmphasis.value = amount;
+}
+
+// ── 2026-09-17 追加: 銀河・バルジなど「Points+この円形ソフトシェーダー」を使う
+//    描画すべてで共有するマテリアル生成関数。record.js側のバルジも同じ質感
+//    (円形フォールオフ・縁のフェード・近接時のサイズ上限とフェード)を使えるよう
+//    export している。
+//   - size: uSize(基準の点サイズ)
+//   - nearFadeStart/nearFadeRange: この距離(ワールド単位)より近づくとアルファが
+//     落ちて消える。銀河のように常に十分遠い場合は0のままでよい(実質無効)。
+//   - maxPixelSize: 画面上の見かけサイズの上限(px)。0で無効。
+export function createStarPointsMaterial({
+  size,
+  nearFadeStart = 0,
+  nearFadeRange = 1,
+  maxPixelSize = 0,
+  armThickenStrength = 0,
+  armBrightenStrength = 0,
+} = {}) {
   return new THREE.ShaderMaterial({
     vertexShader: VERTEX_SHADER,
     fragmentShader: FRAGMENT_SHADER,
     uniforms: {
-      uSize: { value: GALAXY_POINT_SIZE },
+      uSize: { value: size },
       uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
       uAlpha: { value: 1 },
+      uNearFadeStart: { value: nearFadeStart },
+      uNearFadeRange: { value: nearFadeRange },
+      uMaxPixelSize: { value: maxPixelSize },
+      uArmEmphasis: { value: 0 }, // setGalaxyArmEmphasisで0〜1をtweenする
+      uArmThickenStrength: { value: armThickenStrength },
+      uArmBrightenStrength: { value: armBrightenStrength },
     },
     transparent: true,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
+  });
+}
+
+function buildGalaxyMaterial() {
+  return createStarPointsMaterial({
+    size: GALAXY_POINT_SIZE,
+    armThickenStrength: GALAXY_ARM_THICKEN_STRENGTH,
+    armBrightenStrength: GALAXY_ARM_BRIGHTEN_STRENGTH,
   });
 }
 
