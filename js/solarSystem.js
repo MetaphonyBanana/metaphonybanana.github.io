@@ -76,11 +76,8 @@ export const ORBIT_RADIUS_BASE = TRIPOD_RADIUS * 2.4;      // createSolarSystem�
 // 相対的に決めていたが、針(recordAssembly.js)が触れた位置次第で開始半径が変わるようになった
 // ため、縮小先は絶対値の固定半径にした)。
 export const FINAL_ORBIT_RADIUS = TRIPOD_RADIUS * 0.9; // 仮値。「少し小さく」の度合いは見ながら調整
-const ORBIT_SHRINK_DURATION = 4.8;     // 縮小にかける秒数(銀河の収束(COLLAPSE_DURATION)と歩調を揃えたいので近い値。仮値)
 const ORBIT_BEND = 0;                  // 0=正円。バナナへ変形するときはここをBANANA_TARGET_BENDへ近づけていく想定
 const ORBIT_HEIGHT_WOBBLE = 0;         // 0=完全に平面的な正円。バナナ変形時はBANANA_TARGET_HEIGHT_WOBBLEへ
-const BANANA_TARGET_BEND = 5;          // (未使用・将来用)バナナ変形時の膨らみの強さ目標値
-const BANANA_TARGET_HEIGHT_WOBBLE = 1.2; // (未使用・将来用)バナナ変形時の上下うねり目標値
 const ORBIT_CURVE_POINTS = 64;         // 曲線を近似する制御点の数
 // ↓ galaxy.js側が「銀河の自転速度を太陽系の公転速度と揃える」「太陽系が軌道を一周したら
 //   銀河を縮小する」の両方の基準時間として参照するためexportした。
@@ -305,7 +302,7 @@ export function createSolarSystem(scene) {
 export function updateSolarSystem(solarSystem, elapsedSeconds) {
   if (!solarSystem.group.visible) return;
 
-  const t = (elapsedSeconds / SUN_ORBIT_PERIOD) % 1;
+  const t = (elapsedSeconds / SUN_ORBIT_PERIOD/10) % 1;
   computeSunPose(solarSystem.orbitCurve, t, _curvePoint, _sunQuat);
   solarSystem.sunGroup.position.copy(_curvePoint);
   solarSystem.sunGroup.quaternion.copy(_sunQuat); // ← 公転面を進行方向と直交させる(らせんの仕組み)
