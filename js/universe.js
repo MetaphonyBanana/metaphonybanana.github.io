@@ -232,13 +232,30 @@ function makeAxisLine(tip) {
 // 金色の細いリング。実際の軸線は回転で位置が変わるが、このリングは終端が通る円周上に
 // 固定して置くだけなので、tripodの自転(updateUniverseの回転)に合わせて動かす必要はない
 // (円は回転対称なので、動かなくても「ぐるぐる回る三脚の外周をなぞっている」ように見える)。
-const RING_COLOR = 0xffcc33;                  // 仮値(金色)
+const RING_COLOR = 0xd4af37;                  // 仮値(金色。金属質になったので少し落ち着いた色味に)
 const RING_TUBE_RADIUS = AXIS_LENGTH * 0.018; // リングの太さ(仮値)
 const RING_FADE_DURATION = 1.4;               // フェードインの秒数(仮値)
 
+// ★ 2026-09-17 修正(ご指摘反映): 「新たに発生するリングは鏡tripodと同じように
+//   鏡面のリアルな金のリングで下側」への対応。以前はMeshBasicMaterial(単色・
+//   反射なし)だったが、鏡tripodと同じ考え方の金属質のマテリアル
+//   (MeshStandardMaterial。metalness・roughness)に変更した。envMapは生成時点では
+//   まだ存在しない(鏡のCubeCameraはrecord.js側で後から作られる)ため、ここでは
+//   nullのまま作っておき、record.js側のcreateRecordDisplayが
+//   universe.goldenRing.material.envMap = (鏡と同じrenderTarget.texture) を後から
+//   設定する(新たにCubeCameraを増やすと重くなるため、既存の1つを使い回すため)。
+const RING_METALNESS = 1;
+const RING_ROUGHNESS = 0.28; // 仮値。鏡(0.05)ほどは滑らかにせず、金属らしい艶にした
 function makeGoldenRing() {
-  const geometry = new THREE.TorusGeometry(TRIPOD_RADIUS, RING_TUBE_RADIUS, 12, 96);
-  const material = new THREE.MeshBasicMaterial({ color: RING_COLOR, transparent: true, opacity: 0 });
+  const geometry = new THREE.TorusGeometry(TRIPOD_RADIUS, RING_TUBE_RADIUS, 16, 128);
+  const material = new THREE.MeshStandardMaterial({
+    color: RING_COLOR,
+    metalness: RING_METALNESS,
+    roughness: RING_ROUGHNESS,
+    envMap: null,
+    transparent: true,
+    opacity: 0,
+  });
   const mesh = new THREE.Mesh(geometry, material);
   mesh.rotation.x = Math.PI / 2; // Torusは既定でXY平面上の輪になるので、水平(XZ平面)へ寝かせる
   mesh.position.set(0, TRIPOD_GROUND_Y, 0); // 終端3点と同じ高さ
@@ -404,20 +421,20 @@ function spawnRoofParticle(universe, worldOrigin, worldTip, color) {
 //   実体はもうTHREE.Spriteではない点に注意。
 const IH_SVG_URL = new URL('./data/ih.svg', import.meta.url).href;
 const IH_WORLD_HEIGHT = 8.4;        // 表示の高さ(ワールド単位、仮値。以前の70%に縮小。幅はSVGの比率から自動計算)
-const IH_THICKNESS = IH_WORLD_HEIGHT * 0.3; // 押し出しの厚み(ExtrudeGeometryのdepth。ワールド単位、仮値。見ながら調整)
+const IH_THICKNESS = IH_WORLD_HEIGHT * 10; // 押し出しの厚み(ExtrudeGeometryのdepth。ワールド単位、仮値。見ながら調整)
 const IH_ORBIT_RADIUS = TRIPOD_RADIUS * 0.85; // リングより「すこし内側」を周回する半径(仮値)
 // ★ 2026-09-12 修正(ご指示反映):「ihの高さがおかしいのでリングの上に配置して。ただし
-//   下振れの時にリングより低くならないよう少し高めに」への対応。以前はIH_ORBIT_HEIGHTが
-//   「金のリングは常にy=0」という前提の絶対的な固定値だったが、tripodRingSwap.js側の
-//   変更でリング(universe.goldenRing)自体がcarousel/鏡切り替えに応じて上下に動くように
-//   なったため、ih側だけが元の高さに取り残されて「リングとの上下関係がおかしい」状態に
-//   なっていた。そこでih側は絶対値ではなく「リングの現在の高さ(universe.goldenRing.
-//   position.y。これはtripodRingSwap.js側が毎フレーム書き換える)からの相対的な底上げ量」
-//   IH_ABOVE_RING_MARGINへ変更した。下のIH_BOB_AMPLITUDEぶん上下にバウンスしても
-//   リングを下回らないよう、IH_ABOVE_RING_MARGIN > IH_BOB_AMPLITUDE にしてある
-//   (調整したい場合はこのIH_ABOVE_RING_MARGINを変えてください。値を大きくするほど
-//   リングから高く浮きます)。
-const IH_ABOVE_RING_MARGIN = AXIS_LENGTH * 0.35; // リングの高さからどれだけ上に配置するか(仮値)
+//   下振れの時にリングより低くならないよう少し高めに」への対応。ih側は絶対値ではなく
+//   「リングの高さ(universe.goldenRing.position.y。常にTRIPOD_GROUND_Yで固定)からの
+//   相対的な底上げ量」IH_ABOVE_RING_MARGINで決めている。下のIH_BOB_AMPLITUDEぶん
+//   上下にバウンスしてもリングを下回らないよう、IH_ABOVE_RING_MARGIN > IH_BOB_AMPLITUDE
+//   にしてある。
+// ★ 2026-09-17 修正(ご指摘反映): 「carouselのihの位置が上にあるので下げて」への対応。
+//   IH_ABOVE_RING_MARGIN(=リングからの浮かせ量)が0.35と大きめだったため0.15へ下げた。
+//   ★ ここが調整箇所です: この値を大きくするほどリングから高く浮き、小さくするほど
+//   リングに近づきます。IH_BOB_AMPLITUDE(バウンス振幅)より必ず大きい値にしてください
+//   (小さくするとバウンスの下振れでリングに埋まって見えてしまいます)。
+const IH_ABOVE_RING_MARGIN = AXIS_LENGTH * 0.15; // リングの高さからどれだけ上に配置するか(仮値)
 const IH_ORBIT_SPEED = 0.35;        // 周回の角速度(ラジアン/秒、仮値)
 const IH_BOB_AMPLITUDE = AXIS_LENGTH * 0.12; // 上下バウンスの振幅(仮値。IH_ABOVE_RING_MARGINより必ず小さくすること)
 const IH_BOB_SPEED = 1.6;           // 上下バウンスの速さ(ラジアン/秒、仮値)
@@ -669,53 +686,33 @@ export function createUniverse(scene) {
   };
 }
 
-// ── tripodクリックで呼ぶ: 金のリングをフェードインさせる ─────────────
-// リング自体は地面(y=0)に固定のまま。tripodがliftTripodで浮上しても、リングは
-// 「元いた場所の目印」としてそのまま残る想定。
-export function revealTripodRing(universe, { duration = RING_FADE_DURATION, onComplete } = {}) {
+// ── tripodクリックで呼ぶ: 「tripodのリングが解禁された」フラグを立てる ──────
+// ★ 2026-09-17 バグ修正(ご指摘反映): 「tripodクリックでリングが上下二つ発生する」
+//   原因はここだった。この関数がuniverse.goldenRing(carousel完了後専用の据え置き
+//   リング。TRIPOD_GROUND_Yに固定)を可視化・フェードインさせる一方で、
+//   tripodRingSwap.js側もtripodRingRevealedフラグを見てrecord.crossfadeRing
+//   (RING_DOWN_Y=TRIPOD_GROUND_Yより10下、に置かれる「引き継ぎ用」リング)を
+//   同時に可視化していたため、10ユニット離れた2つのリングが同時に見えていた。
+//   crossfadeRingが「tripodクリック後〜戴冠演出完了まで」の見た目を一手に引き受ける
+//   設計にしたので、この関数ではもうgoldenRingに触れず、フラグを立てるだけにした。
+//   universe.goldenRingは、tripodRingSwap.js側のfinishTripodRingSwapが戴冠演出完了の
+//   タイミングで初めて可視化する(=crossfadeRingからgoldenRingへの引き継ぎ)。
+export function revealTripodRing(universe, { onComplete } = {}) {
   if (universe.tripodRingRevealed) return;
   universe.tripodRingRevealed = true;
-  universe.goldenRing.visible = true;
-  gsap.to(universe.goldenRing.material, {
-    opacity: 1,
-    duration,
-    ease: 'power1.out',
-    onComplete: () => { if (onComplete) onComplete(); },
-  });
+  if (onComplete) onComplete();
 }
 
-// ── record.js側の戴冠演出専用: 金のリングを「太陽系のらせん軌道(=ORBIT_RADIUS_BASE)」の
-//    サイズまで拡大する ────────────────────────────────
-// リングの見た目上の半径は mesh.scale(均一倍率)で決める。ジオメトリ自体の半径は常に
-// TRIPOD_RADIUS(生成時の値)のままなので、targetRadius/TRIPOD_RADIUSの倍率をtweenする。
-// ★ 均一スケールなので、リングの太さ(RING_TUBE_RADIUS)も同じ倍率で太くなる(仮値。
-//   太さを変えたくない場合はgeometryを作り直す方式に変更してください)。
-const RING_GROW_DURATION_DEFAULT = 3.0; // 仮値
-export function growGoldenRing(universe, { targetRadius, duration = RING_GROW_DURATION_DEFAULT, ease = 'power2.inOut', onComplete } = {}) {
-  const targetScale = targetRadius / TRIPOD_RADIUS;
-  gsap.to(universe.goldenRing.scale, {
-    x: targetScale,
-    y: targetScale,
-    z: targetScale,
-    duration,
-    ease,
-    onComplete: () => { if (onComplete) onComplete(); },
-  });
-}
-
-// ── record.js側の戴冠演出専用: 太陽がリングに到達したら、リングを消す ──────
-const RING_HIDE_DURATION_DEFAULT = 0.8; // 仮値
-export function hideGoldenRing(universe, { duration = RING_HIDE_DURATION_DEFAULT, onComplete } = {}) {
-  gsap.to(universe.goldenRing.material, {
-    opacity: 0,
-    duration,
-    ease: 'power1.in',
-    onComplete: () => {
-      universe.goldenRing.visible = false;
-      if (onComplete) onComplete();
-    },
-  });
-}
+// ★ 2026-09-17 移設(ご指摘反映): 「carouselのリング(universe.goldenRing)まで一緒に
+//   消える」「ihの高さもおかしくなる」バグの原因が、このgoldenRingを戴冠演出用にも
+//   直接書き換えていたことだったため、戴冠演出の「拡大→消滅」はrecord.js側の
+//   crossfadeRing(バナナと同じ高さにあるリング自身)が担うことにし、ここからは
+//   削除した。universe.goldenRingは「拡大も消滅もしない、carousel本来のリング」
+//   としての役割に専念する。
+// ★ 2026-09-17 追加修正(ご指摘反映): 「tripodクリックでリングが上下二つ発生する」
+//   バグの修正に伴い、revealTripodRingからもgoldenRingへの参照を外した。
+//   universe.goldenRingは以後、tripodRingSwap.js側のfinishTripodRingSwap(戴冠演出
+//   完了時に初めて可視化)とmain.js側の俯瞰時の表示切り替え以外では一切触られない。
 
 // ── tripodクリックで呼ぶ: tripod自体を持ち上げる ────────────────────
 const TRIPOD_LIFT_HEIGHT = APEX_HEIGHT * 0.9; // 浮上後の高さ(仮値)
