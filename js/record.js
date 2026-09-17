@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { HOME_CAMERA_POS, HOME_CAMERA_TARGET, AXIS_LENGTH } from './config.js';
 import { TRIPOD_ANGULAR_SPEED } from './universe.js';
 import { FINAL_ORBIT_RADIUS, ORBIT_RADIUS_BASE, setOrbitRadius, setOrbitCenter, growOrbitToFull } from './solarSystem.js';
-import { GALAXY_RADIUS } from './galaxy.js';
+import { GALAXY_RADIUS, setGalaxyInnerRadius, createStarPointsMaterial } from './galaxy.js';
 import { createCaptionBox, makeCaptionController } from './captions.js';
 
 // ══════════════════════════════════════════════════════════════
@@ -95,19 +95,31 @@ function getCoronationCaption() {
   return coronationCaption;
 }
 
-// ── ②バルジ(棒状バー+コア)。galaxy.jsの本体バルジと同じ
-//    bar_bulge_preview.html由来の形状をそのまま流用し、AXIS_LENGTH基準の
-//    ごく小さいスケールでバナナのあった位置(mirrorVisualAnchorの頂点)に
-//    出す。galaxy.js側は「銀河本体に常設された巨大なバー」だが、こちらは
-//    「戴冠演出の一場面としてバナナの代わりに一瞬現れる小さな echo」という
-//    位置づけの別インスタンス(スケールも文脈も違うため、galaxy.js側の
-//    定数をそのまま使い回さず、AXIS_LENGTH基準の値をここで別途持つ)。 ──
+// ── ②バルジ(棒状バー+コア)。galaxy.jsの本体バルジ(撤去済み)・
+//    bar_bulge_preview.html由来の形状をそのまま流用する。
+//    ★ 2026-09-16 設計変更(ご指示反映): 以前は「戴冠演出中だけ一瞬現れる、バナナの
+//    位置に乗る豆粒サイズのecho」で、演出終了後は(mirrorVisualAnchorごと)消える
+//    仕様だった。今回、「太陽系軌道の半分ほどのサイズで、出現させたまま(=銀河本体の
+//    一部として永続表示)。位置は銀河中心。見た目はプレビューと同じでよい」との
+//    ご指示を受け、galaxy.starsGroup(銀河本体の自転グループ)の子として銀河中心
+//    (ローカル原点)に配置し直し、戴冠演出中に一度フェードインしたらそのまま
+//    ずっと表示され続ける(mirrorVisualAnchorの可視状態に一切連動しない)ように
+//    変更した。バー/コアの各比率(HALF_WIDTH/HEIGHT比・CONCENTRATION_POWER等)は
+//    プレビューと同じ値をそのまま踏襲している。 ──
 const BULGE_REVEAL_FADE_DURATION = 3.0;   // ②バナナ消滅+バルジ出現にかける秒数(ご指示通り3秒)
-// ★ バナナが完全に消えたのを見せてからバルジが出始めるように、両者の間に
-//   ごく短い間(ま)を置く。0にすると従来通り「消滅と同時にフェード開始」に戻る。
-const BANANA_TO_BULGE_GAP = 0.4; // 仮値(秒)。「消滅→(間)→出現」を感じさせる程度の長さ
-const BULGE_PARTICLE_COUNT = 1800;        // 仮値。分布を密にするため700→1800に増量
-const BULGE_BAR_HALF_LENGTH = AXIS_LENGTH * 0.05; // 仮値。頂点に乗る程度の小ささ
+// ★ 2026-09-17 変更(ご指示反映): 「バルジの登場は、バナナの縮小と合わせて、拡大させながら
+//   登場にして」への対応。以前はBANANA_TO_BULGE_GAPだけ待ってから、opacityだけを
+//   0→1にフェードしていたが、(a)バナナの縮小開始と同時にバルジも出現を始める
+//   (間を置かない)、(b)opacityだけでなくscaleもBULGE_REVEAL_START_SCALE→1へ
+//   一緒にtweenして「拡大しながら」見えるようにした(下記startBulgeAndNeedle参照)。
+const BULGE_REVEAL_START_SCALE = 0; // 仮値。0=完全に無から拡大してくる見え方
+// ★ 2026-09-16 変更(ご指示反映): 「バナナの消滅は回転とスケーリングで小さくして
+//   ほしい」への対応。bananaMesh.visible=falseで瞬時に消していたのを、自転しながら
+//   縮小して消える演出に変更した。
+const BANANA_VANISH_DURATION = 0.6; // 仮値(秒)。回転・縮小にかける時間
+const BANANA_VANISH_SPINS = 2;      // 仮値。消えるまでに何回転させるか
+const BANANA_VANISH_EASE = 'power1.in'; // 仮値。だんだん加速しながら消える感じ
+const BULGE_BAR_HALF_LENGTH = ORBIT_RADIUS_BASE / 2; // ご指定「太陽系軌道の半分ほど」の直接反映
 const BULGE_BAR_HALF_WIDTH  = BULGE_BAR_HALF_LENGTH * 0.32;
 const BULGE_BAR_HALF_HEIGHT = BULGE_BAR_HALF_LENGTH * 0.22;
 const BULGE_BAR_TILT = THREE.MathUtils.degToRad(25); // 仮値(galaxy.js側のBAR_TILT_DEGと同じ角度)
@@ -119,6 +131,42 @@ const BULGE_CORE_FRACTION = 0.18;           // BULGE_PARTICLE_COUNTのうちコ�
 const BULGE_CORE_RADIUS_RATIO = 0.22;       // コア半径 = BULGE_BAR_HALF_LENGTH × この比率(仮値)
 const BULGE_CORE_CONCENTRATION_POWER = 2.6; // コアはバーより強めに中心へ偏らせる(仮値。galaxy.js側と同じ値)
 const BULGE_CORE_COLOR = 0xfff6c9;          // バー本体よりやや明るい白味がかった黄色(仮値)
+// ★ 2026-09-17 大幅見直し(ご指摘反映): 「近くで見るとパーティクルが銀河のそれと違って
+//   巨大なドットにしか見える」問題への対応。原因は、バルジがテクスチャなしの素の
+//   PointsMaterialで、sizeがワールド単位・粒子数900という低密度だったこと
+//   (テクスチャなしのPointsは円ではなくベタ塗りの正方形として描かれ、カメラが
+//   近づくとその正方形が画面いっぱいに見える)。対応として:
+//   (a) galaxy.js側と同じシェーダー(円形ソフトフォールオフ+縁のフェード)を
+//       createStarPointsMaterialで共有し、質感を銀河本体と揃える。
+//   (b) 粒を大幅に小さくしつつ粒子数を増やし、「大きい粒が少し」ではなく
+//       「小さい粒がたくさん」で光の塊を表現する(密度で見せる)。
+//   (c) カメラが極端に近づいたときのための画面上サイズの上限(uMaxPixelSize)と、
+//       さらに近づいたら透明にフェードするnearFadeを追加。太陽系がバルジ付近を
+//       周回する際に画面いっぱいの色面になる事故を構造的に防ぐ。
+//   ★ この見直しにより、直前(2026-09-17 1回目)の「Bloomのにじみが強すぎる」対応
+//     (BULGE_BLOOM_INTENSITYを0.15→0.06に弱めた件)は、粒自体が縮小されたことで
+//     にじみの絶対量も下がっているはずだが、値は前回のまま残してある。見ながら
+//     必要なら調整してください。
+const BULGE_BLOOM_INTENSITY = 0.06;         // 0〜1。Bloomの強さを弱める(0=完全オフ、1=通常と同じ強さ。仮値)
+const BULGE_PARTICLE_COUNT = 6000;          // 900→6000(仮値。粒を小さくした分、密度で光の塊に見せる)
+const BULGE_BAR_POINT_SIZE = BULGE_BAR_HALF_LENGTH * 0.022;  // 以前の0.12から大幅に縮小(仮値)
+const BULGE_CORE_POINT_SIZE = BULGE_BAR_HALF_LENGTH * 0.016; // 以前の0.09から大幅に縮小(仮値)
+// 画面上の最大サイズ(px)。sizeAttenuationはシェーダー側で常に効くが、極端接近時の
+// 保険としてクランプする(仮値。frontend次第でuPixelRatio込みなのでpx基準)。
+const BULGE_MAX_PIXEL_SIZE = 48;
+// この距離(ワールド単位)より近づくと、粒のアルファがフェードして消え始める。
+// ORBIT_RADIUS_BASE(太陽系軌道の基準半径)基準にしておくと、太陽系が周回で
+// 接近する距離感と自然に対応する(仮値)。
+const BULGE_NEAR_FADE_START = ORBIT_RADIUS_BASE * 0.15;
+const BULGE_NEAR_FADE_RANGE = ORBIT_RADIUS_BASE * 0.35;
+// バー/コアそれぞれの外縁を、galaxy.js側と同じ考え方でソフトにフェードさせる比率
+// (中心からの相対半径[0,1]のうち、このぶんの幅を1→0へかける。仮値)。
+const BULGE_EDGE_FADE = 0.35;
+// ★ 2026-09-16 追加(ご指示反映): 「出現の際に銀河に穴をあけて、バルジから腕が
+//   生えてるように見せたい」への対応。bar_bulge_preview.html側のGALAXY_INNER_RADIUS_RATIO
+//   と同じ考え方(バーの半長に対する比率)で、銀河円盤側にあける穴の半径を決める。
+const GALAXY_HOLE_RADIUS_RATIO = 0.9; // 仮値。プレビューと同じ値
+const GALAXY_HOLE_RADIUS = BULGE_BAR_HALF_LENGTH * GALAXY_HOLE_RADIUS_RATIO;
 
 // concentrationPower: 1.0で一様分布、大きいほど中心(r=0)寄りに偏る。tiltはバーの
 // 長軸をY軸まわりにどれだけ傾けるか(コアは呼び出し側でtilt=0を渡して球形にする)。
@@ -160,57 +208,110 @@ function sampleBulgeCorePosition() {
   };
 }
 
+// galaxy.js側のsmoothstep相当(0除算を避けるための下限つき)。バー/コアそれぞれの
+// 外縁を、中心からの相対半径(0〜1)ベースでソフトにフェードさせるために使う。
+function edgeSmoothstep(edge0, edge1, x) {
+  const t = Math.min(Math.max((x - edge0) / (edge1 - edge0), 0), 1);
+  return t * t * (3 - 2 * t);
+}
+
 function makeBulgePlaceholder() {
   // バー本体とコアを別のPointsにして、色・粒の大きさを分けて重ねる
   // (galaxy.js本体のバルジと同じ考え方)。フェード演出(startBulgeAndNeedle)
   // が両方まとめて透明度を操作できるよう、group.userData.materialsに
-  // 両方のPointsMaterialをまとめておく。
+  // 両方のShaderMaterialをまとめておく。
+  //
+  // ★ 2026-09-17 見直し(ご指摘反映): 以前はテクスチャなしの素のPointsMaterialで
+  //   粒が大きく粒子数も少なかったため、近づくと「巨大な正方形のドット」に見えていた。
+  //   galaxy.js側と同じcreateStarPointsMaterial(円形ソフトフォールオフ・縁のフェード・
+  //   近接時のサイズ上限とアルファフェード)を使い、粒を小さく・数を増やして密度で
+  //   見せるようにした。
   const coreCount = Math.floor(BULGE_PARTICLE_COUNT * BULGE_CORE_FRACTION);
   const barCount = BULGE_PARTICLE_COUNT - coreCount;
 
   const barPositions = new Float32Array(barCount * 3);
+  const barColors = new Float32Array(barCount * 3);
+  const barScales = new Float32Array(barCount);
+  const barAlphas = new Float32Array(barCount);
+  const barColor = new THREE.Color(BULGE_BAR_COLOR);
   for (let i = 0; i < barCount; i++) {
     const p = sampleBulgeBarPosition();
     barPositions[i * 3] = p.x;
     barPositions[i * 3 + 1] = p.y;
     barPositions[i * 3 + 2] = p.z;
+    barColors[i * 3] = barColor.r;
+    barColors[i * 3 + 1] = barColor.g;
+    barColors[i * 3 + 2] = barColor.b;
+    // 中心からの相対半径(長軸基準の概算)で外縁をソフトにフェード。
+    const relRadius = Math.min(Math.hypot(p.x, p.y, p.z) / BULGE_BAR_HALF_LENGTH, 1);
+    const edge = 1 - edgeSmoothstep(1 - BULGE_EDGE_FADE, 1, relRadius);
+    barAlphas[i] = edge;
+    const sizeJitter = Math.random() * 0.7 + 0.3;
+    barScales[i] = sizeJitter * (1 - 0.5 * (1 - edge));
   }
   const barGeo = new THREE.BufferGeometry();
   barGeo.setAttribute('position', new THREE.BufferAttribute(barPositions, 3));
-  const barMat = new THREE.PointsMaterial({
-    color: BULGE_BAR_COLOR,
-    size: BULGE_BAR_HALF_LENGTH * 0.12,
-    sizeAttenuation: true,
-    transparent: true,
-    opacity: 0,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
+  barGeo.setAttribute('aColor', new THREE.BufferAttribute(barColors, 3));
+  barGeo.setAttribute('aScale', new THREE.BufferAttribute(barScales, 1));
+  barGeo.setAttribute('aAlpha', new THREE.BufferAttribute(barAlphas, 1));
+  // galaxy.js側の共有シェーダーがaArmWeightを参照するが、バルジには「腕」の概念が
+  // ないので全て0(=常にuArmThickenStrength/uArmBrightenStrengthの影響を受けない)。
+  barGeo.setAttribute('aArmWeight', new THREE.BufferAttribute(new Float32Array(barCount), 1));
+  const barMat = createStarPointsMaterial({
+    size: BULGE_BAR_POINT_SIZE,
+    nearFadeStart: BULGE_NEAR_FADE_START,
+    nearFadeRange: BULGE_NEAR_FADE_RANGE,
+    maxPixelSize: BULGE_MAX_PIXEL_SIZE,
   });
+  barMat.uniforms.uAlpha.value = 0; // フェードイン前は非表示(startBulgeAndNeedleが0→1にtween)
   const barPoints = new THREE.Points(barGeo, barMat);
+  barPoints.raycast = () => {}; // クリック対象ではないので無効化(galaxy.js側と同じ扱い)
 
   const corePositions = new Float32Array(coreCount * 3);
+  const coreColors = new Float32Array(coreCount * 3);
+  const coreScales = new Float32Array(coreCount);
+  const coreAlphas = new Float32Array(coreCount);
+  const coreColor = new THREE.Color(BULGE_CORE_COLOR);
+  const coreRadius = BULGE_BAR_HALF_LENGTH * BULGE_CORE_RADIUS_RATIO;
   for (let i = 0; i < coreCount; i++) {
     const p = sampleBulgeCorePosition();
     corePositions[i * 3] = p.x;
     corePositions[i * 3 + 1] = p.y;
     corePositions[i * 3 + 2] = p.z;
+    coreColors[i * 3] = coreColor.r;
+    coreColors[i * 3 + 1] = coreColor.g;
+    coreColors[i * 3 + 2] = coreColor.b;
+    const relRadius = Math.min(Math.hypot(p.x, p.y, p.z) / coreRadius, 1);
+    const edge = 1 - edgeSmoothstep(1 - BULGE_EDGE_FADE, 1, relRadius);
+    coreAlphas[i] = edge;
+    const sizeJitter = Math.random() * 0.7 + 0.3;
+    coreScales[i] = sizeJitter * (1 - 0.5 * (1 - edge));
   }
   const coreGeo = new THREE.BufferGeometry();
   coreGeo.setAttribute('position', new THREE.BufferAttribute(corePositions, 3));
-  const coreMat = new THREE.PointsMaterial({
-    color: BULGE_CORE_COLOR,
-    size: BULGE_BAR_HALF_LENGTH * 0.09, // バーより粒は小さく、密集させて「光の塊」に見せる(仮値)
-    sizeAttenuation: true,
-    transparent: true,
-    opacity: 0,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
+  coreGeo.setAttribute('aColor', new THREE.BufferAttribute(coreColors, 3));
+  coreGeo.setAttribute('aScale', new THREE.BufferAttribute(coreScales, 1));
+  coreGeo.setAttribute('aAlpha', new THREE.BufferAttribute(coreAlphas, 1));
+  coreGeo.setAttribute('aArmWeight', new THREE.BufferAttribute(new Float32Array(coreCount), 1));
+  const coreMat = createStarPointsMaterial({
+    size: BULGE_CORE_POINT_SIZE, // バーより粒は小さく、密集させて「光の塊」に見せる
+    nearFadeStart: BULGE_NEAR_FADE_START,
+    nearFadeRange: BULGE_NEAR_FADE_RANGE,
+    maxPixelSize: BULGE_MAX_PIXEL_SIZE,
   });
+  coreMat.uniforms.uAlpha.value = 0;
   const corePoints = new THREE.Points(coreGeo, coreMat);
+  corePoints.raycast = () => {};
 
   const group = new THREE.Group();
   group.add(barPoints, corePoints);
   group.visible = false;
+  // ★ createStarPointsMaterialはShaderMaterialなので、フェード演出は
+  //   m.opacity(素のPointsMaterial時代の名残)ではなくm.uniforms.uAlpha.valueを
+  //   操作する必要がある。呼び出し側(startBulgeAndNeedle)を書き換えずに済むよう、
+  //   ここではuserData.materialsに「ShaderMaterialそのもの」を渡し、呼び出し側の
+  //   `.opacity = x` 代入は使わず `.uniforms.uAlpha.value = x` に統一している
+  //   (該当箇所は本ファイル内のstartBulgeAndNeedleを参照)。
   group.userData.materials = [barMat, coreMat];
   return group;
 }
@@ -219,12 +320,58 @@ function makeBulgePlaceholder() {
 // ▼▼▼ ①戴冠 → ②バルジ+針+太陽出現 → ③銀河高速回転で中心へ
 //     → ④金のリングに接触で太陽系(8惑星)出現 ▼▼▼
 // ══════════════════════════════════════════════════════════════
-const NEEDLE_DIR = new THREE.Vector3(1, 0, 0);          // 「右」= ワールド+X(固定。見た目を見て調整可)
-const NEEDLE_RADIUS = AXIS_LENGTH * 0.05;               // 「巨大に太く」の反映(仮値)
-const NEEDLE_ARM_LENGTH = AXIS_LENGTH * 3;              // 横棒の長さ(仮値)
-const NEEDLE_DROP_HEIGHT = AXIS_LENGTH * 1.2;           // 縦棒の長さ=肘から接地点までの高さ(仮値)
+// ── 「右」「奥」の基準方向 ─────────────────────────────
+const NEEDLE_RIGHT_DIR = new THREE.Vector3(1, 0, 0); // 「右」= ワールド+X(仮。見た目を見て調整可)
+const NEEDLE_BACK_DIR = new THREE.Vector3(0, 0, -1); // 「奥」= ワールド-Z(仮値。実際に見て手前/奥が逆なら反転してください)
+
+// ══════════════════════════════════════════════════════════════
+// ★ 2026-09-16 変更(ご指示より): 針を「付け根(=土台への取り付け点)は常に固定され、
+//   アームがそこを軸に弧を描いて回転することで、先端の針先(点)が追従する」という、
+//   実物のレコードプレーヤーのトーンアームと同じ方式に変更した。
+//   以前は針全体(付け根含む)をNEEDLE_DIR方向へまっすぐ平行移動させるだけの実装
+//   だったが、「付け根部分を軸にして、太陽移動で軸を回転させて針の点が追従」という
+//   ご指示を反映するため、付け根中心の円(半径=アーム長)と銀河中心の円(半径=狙いたい
+//   太陽の軌道半径)の交点を求める古典的な幾何計算(setNeedleRadius内)に置き換えた。
+//
+//   配置の基準(数値は全て仮値。「適当でよい」とのご指示のため、実際に見ながら
+//   調整してください。針メッシュ自体も別途作り直す想定):
+//     - 付け根(pivot)は銀河中心から見て「右+奥」方向に固定オフセットした、常に
+//       動かない点(NEEDLE_PIVOT_RIGHT_RATIO / NEEDLE_PIVOT_BACK_RATIOで
+//       GALAXY_RADIUS基準のオフセット比率を指定)。
+//     - アーム長(NEEDLE_ARM_LENGTH)は「付け根〜銀河中心の距離」と同じ値に揃えてある
+//       (設計上の選択)。これにより、アームを回転させるだけで針先の可動域が
+//       半径0(=銀河中心そのもの)〜2倍(=付け根から見て中心と正反対の最遠点)まで
+//       無理なくカバーできる。
+//     - 「休符(まだ演奏していない)」状態の針先はNEEDLE_REST_RADIUS
+//       (レコード=銀河の一番右側=galaxyCenter.x+GALAXY_RADIUS よりわずかに外側)。
+//       演奏開始時はまずここから盤面の周縁(NEEDLE_START_RADIUS)まで、付け根を軸に
+//       回転させて「載せる」動作(NEEDLE_PLACE_DURATION秒)を挟む。
+//     - 針(アーム+ドロップ)はレコード盤面よりNEEDLE_PIVOT_HEIGHT_ABOVE_RECORDぶん
+//       高い位置に浮かせ、針先(タッチポイント)はそこからNEEDLE_DROP_HEIGHTぶん
+//       下がった、盤面よりわずかに高い位置(NEEDLE_TIP_CLEARANCEぶんの隙間)に
+//       来るようにしてある(「レコードより少し高く」の反映)。
+//   ※ 今後、銀河俯瞰時に針をクリック(ドラッグ)で動かせるようにする構想があるが、
+//     今回はまだ実装しない(ご指示より)。実装する際は、setNeedleRadiusが既に
+//     「半径→角度→ワールド座標」の変換を担っているので、ドラッグ量から狙いの半径を
+//     逆算してsetNeedleRadiusに渡す形になる想定。
+// ══════════════════════════════════════════════════════════════
+const NEEDLE_PIVOT_RIGHT_RATIO = 1.15;  // 付け根の右方向オフセット = GALAXY_RADIUS × この値(仮値)
+const NEEDLE_PIVOT_BACK_RATIO = 0.35;   // 付け根の奥方向オフセット = GALAXY_RADIUS × この値(仮値)
+const NEEDLE_PIVOT_DISTANCE = GALAXY_RADIUS * Math.hypot(NEEDLE_PIVOT_RIGHT_RATIO, NEEDLE_PIVOT_BACK_RATIO); // 付け根〜銀河中心の距離(計算値)
+const NEEDLE_ARM_LENGTH = NEEDLE_PIVOT_DISTANCE;        // アーム長。付け根〜中心の距離と揃え、半径0まで届く可動域にする(仮値の設計選択)
+const NEEDLE_SWEEP_SIGN = 1;                            // アームの回転方向(+1/-1)。見た目が不自然なら反転してください
+
+const NEEDLE_PIVOT_HEIGHT_ABOVE_RECORD = AXIS_LENGTH * 1.4; // 付け根(アーム)を盤面よりどれだけ高く浮かせるか(仮値。「拡大して」に合わせ以前よりだいぶ高めに)
+const NEEDLE_TIP_CLEARANCE = AXIS_LENGTH * 0.15;             // 針先(タッチポイント)を盤面よりほんの少しだけ高く保つ隙間(「レコードより少し高く」の反映。仮値)
+const NEEDLE_DROP_HEIGHT = NEEDLE_PIVOT_HEIGHT_ABOVE_RECORD - NEEDLE_TIP_CLEARANCE; // ドロップ(縦棒)の長さ=肘〜針先の高さ差(計算値)
+
+const NEEDLE_RADIUS_RATIO = 0.012;                      // 針の太さ = NEEDLE_ARM_LENGTH × この比率(「拡大して」の反映。仮値)
+const NEEDLE_RADIUS = NEEDLE_ARM_LENGTH * NEEDLE_RADIUS_RATIO; // 「巨大に太く」の反映(仮値。アーム長のスケールに合わせて再計算)
 const NEEDLE_COLOR = 0xd9d9d9;                          // 針の色(仮値。金属っぽいグレー)
-const NEEDLE_START_RADIUS = GALAXY_RADIUS * 0.94;       // 針先(=太陽の出発点)。「銀河の周縁側」(仮値)
+
+const NEEDLE_REST_RADIUS = GALAXY_RADIUS * 1.08;        // 休符位置。「レコードの一番右側よりも右」の反映(仮値)
+const NEEDLE_START_RADIUS = GALAXY_RADIUS * 0.94;       // 演奏開始位置(=盤面の周縁)。以前と同じ値を踏襲(仮値)
+const NEEDLE_PLACE_DURATION = 1.6;                      // 休符位置→盤面の周縁まで、付け根を軸に「載せる」動作にかける秒数(仮値)
 // ★ 2026-09-12 変更: 以前は固定の終端半径(FINAL_ORBIT_RADIUS)まで一定時間で進める
 //   設計だったが、「金のリングに(実際に)触れたら」という接触判定に変更した。
 //   NEEDLE_MIN_RADIUSは「万一リングに接触しないまま進んでしまった場合の安全な下限」
@@ -242,15 +389,18 @@ const SOLAR_SYSTEM_GROW_DURATION = 3.2; // ④太陽系がリング半径から�
 const GROOVE_COLOR = 0xffee66;    // 既存のtrailLinesと同じ黄色
 const GROOVE_MAX_POINTS = 4000;   // 仮値。針の描画秒数に対して十分な点数
 
+// ローカル原点=付け根(pivot)。ここから局所+X方向(=φ=0のとき「銀河中心から見て
+// 付け根のさらに外側」を向く基準方向。mountNeedleAtPivotが実際の向きを決める)へ
+// アームが伸び、その先(局所x=NEEDLE_ARM_LENGTH)からドロップが盤面近くまで下がる。
 function makeNeedleMesh() {
   const mat = new THREE.MeshBasicMaterial({ color: NEEDLE_COLOR, transparent: true, opacity: 0 });
   const armGeo = new THREE.CylinderGeometry(NEEDLE_RADIUS, NEEDLE_RADIUS, NEEDLE_ARM_LENGTH, 12);
   const armMesh = new THREE.Mesh(armGeo, mat);
   armMesh.rotation.z = Math.PI / 2;
-  armMesh.position.set(NEEDLE_ARM_LENGTH / 2, NEEDLE_DROP_HEIGHT, 0);
+  armMesh.position.set(NEEDLE_ARM_LENGTH / 2, 0, 0);
   const dropGeo = new THREE.CylinderGeometry(NEEDLE_RADIUS, NEEDLE_RADIUS, NEEDLE_DROP_HEIGHT, 12);
   const dropMesh = new THREE.Mesh(dropGeo, mat);
-  dropMesh.position.set(0, NEEDLE_DROP_HEIGHT / 2, 0);
+  dropMesh.position.set(NEEDLE_ARM_LENGTH, -NEEDLE_DROP_HEIGHT / 2, 0);
   const group = new THREE.Group();
   group.add(armMesh, dropMesh);
   group.visible = false;
@@ -258,10 +408,41 @@ function makeNeedleMesh() {
   return group;
 }
 
-function positionNeedleAt(needleGroup, center, radius) {
-  const tip = center.clone().addScaledVector(NEEDLE_DIR, radius);
-  needleGroup.position.copy(tip);
-  return tip;
+// 付け根(pivot)のワールド座標。銀河中心から見て「右+奥」に固定オフセットし、
+// 高さは盤面よりNEEDLE_PIVOT_HEIGHT_ABOVE_RECORDぶん高い位置にする。
+function computeNeedlePivot(galaxyCenter) {
+  const pivot = galaxyCenter.clone()
+    .addScaledVector(NEEDLE_RIGHT_DIR, GALAXY_RADIUS * NEEDLE_PIVOT_RIGHT_RATIO)
+    .addScaledVector(NEEDLE_BACK_DIR, GALAXY_RADIUS * NEEDLE_PIVOT_BACK_RATIO);
+  pivot.y = galaxyCenter.y + NEEDLE_PIVOT_HEIGHT_ABOVE_RECORD;
+  return pivot;
+}
+
+// 針を付け根(pivot)に据え付ける。局所+X(φ=0)が「銀河中心から見て付け根の
+// さらに外側」を向くよう基準姿勢(baseQuaternion)を計算して保持しておくことで、
+// 以後はsetNeedleRadiusがbaseQuaternionからrotateY(phi)するだけで、付け根を
+// 軸にしたアームの回転(=針先の追従)を表現できる。
+function mountNeedleAtPivot(needleGroup, pivot, galaxyCenter) {
+  needleGroup.position.copy(pivot);
+  const away = new THREE.Vector3(pivot.x - galaxyCenter.x, 0, pivot.z - galaxyCenter.z).normalize();
+  const baseQuaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(1, 0, 0), away);
+  needleGroup.userData.baseQuaternion = baseQuaternion;
+  needleGroup.quaternion.copy(baseQuaternion);
+}
+
+// 半径radius(銀河中心から見た、針先に置きたい太陽の軌道半径)に対応する角度φを、
+// 付け根中心の円(半径=アーム長L)と銀河中心の円(半径=radius)の交点の式
+// (r² = d² + L² + 2dL・cosφ 。d=付け根〜中心の距離)から逆算し、付け根を軸に
+// アームを回転させる。戻り値は針先(タッチポイント)のワールド座標
+// (groove記録・金リング接触判定に使う)。
+function setNeedleRadius(needleGroup, radius) {
+  const d = NEEDLE_PIVOT_DISTANCE;
+  const L = NEEDLE_ARM_LENGTH;
+  const cosPhi = THREE.MathUtils.clamp((radius * radius - d * d - L * L) / (2 * d * L), -1, 1);
+  const phi = Math.acos(cosPhi) * NEEDLE_SWEEP_SIGN;
+  needleGroup.quaternion.copy(needleGroup.userData.baseQuaternion);
+  needleGroup.rotateY(phi);
+  return needleGroup.localToWorld(new THREE.Vector3(NEEDLE_ARM_LENGTH, -NEEDLE_DROP_HEIGHT, 0));
 }
 
 function makeGrooveLine() {
@@ -292,10 +473,10 @@ function appendGroovePoint(groove, localPoint) {
   groove.line.geometry.attributes.position.needsUpdate = true;
 }
 
-// ゴールドリング(universe.goldenRing)の「半径」との接触判定用。リングの現在位置は
-// tripodRingSwap.js側でY(高さ)が動かされているだけで、中心は原点(XZ)のはずなので、
+// 金のリング(crossfadeRing。バナナと同じ高さで拡大する戴冠演出用リング)の「半径」との
+// 接触判定用。crossfadeRingはXZ中心が原点なので、
 // ここでは「太陽の現在半径(=galaxyCenterからのXZ距離)」がRING_CONTACT_RADIUS以下に
-// なったかどうかだけを見ればよい(リングのYは見ない=真上から見た接触判定)。
+// なったかどうかだけを見ればよい(真上から見た接触判定)。
 function hasTouchedGoldenRing(currentRadius) {
   return currentRadius <= RING_CONTACT_RADIUS;
 }
@@ -308,30 +489,48 @@ function playNeedleSequence(record) {
   needle.userData.material.opacity = 1;
   resetGroove(groove);
   groove.line.visible = true;
-  positionNeedleAt(needle, galaxyCenter, NEEDLE_START_RADIUS);
 
-  const tweenState = { radius: NEEDLE_START_RADIUS };
-  const tween = gsap.to(tweenState, {
-    radius: NEEDLE_MIN_RADIUS, // 通常はここまで到達する前にリング接触で早期終了する(下記onUpdate参照)
-    duration: NEEDLE_DRAW_DURATION,
-    ease: NEEDLE_DRAW_EASE,
-    onUpdate: () => {
-      const tipWorld = positionNeedleAt(needle, galaxyCenter, tweenState.radius);
-      const local = galaxy.starsGroup.worldToLocal(tipWorld.clone());
-      appendGroovePoint(groove, local);
+  // 付け根(pivot)は演奏中ずっと動かない固定点。ここに据え付け、休符位置
+  // (レコードの一番右側よりも右)からスタートする。
+  const pivot = computeNeedlePivot(galaxyCenter);
+  mountNeedleAtPivot(needle, pivot, galaxyCenter);
+  setNeedleRadius(needle, NEEDLE_REST_RADIUS);
 
-      // ★ ④の接触判定: 毎フレーム、太陽(=針先)がゴールドリングの半径まで
-      // 到達したかどうかを見る。到達したらtweenを打ち切り、太陽系を召喚する。
-      if (hasTouchedGoldenRing(tweenState.radius)) {
-        tween.kill();
-        onRingContact(tweenState.radius);
-      }
-    },
-    onComplete: () => {
-      // 安全下限まで到達してしまった場合(通常は起きない想定)も、同じ処理で締める。
-      onRingContact(tweenState.radius);
-    },
+  // ── 「針を載せる」: 付け根を軸に回転させ、休符位置から盤面の周縁まで下ろす ──
+  const placeState = { radius: NEEDLE_REST_RADIUS };
+  gsap.to(placeState, {
+    radius: NEEDLE_START_RADIUS,
+    duration: NEEDLE_PLACE_DURATION,
+    ease: 'power2.out',
+    onUpdate: () => setNeedleRadius(needle, placeState.radius),
+    onComplete: beginGrooveTracking,
   });
+
+  function beginGrooveTracking() {
+    const tweenState = { radius: NEEDLE_START_RADIUS };
+    const tween = gsap.to(tweenState, {
+      radius: NEEDLE_MIN_RADIUS, // 通常はここまで到達する前にリング接触で早期終了する(下記onUpdate参照)
+      duration: NEEDLE_DRAW_DURATION,
+      ease: NEEDLE_DRAW_EASE,
+      onUpdate: () => {
+        // 付け根を軸にアームを回転させ、針先(点)を太陽の現在半径に追従させる。
+        const tipWorld = setNeedleRadius(needle, tweenState.radius);
+        const local = galaxy.starsGroup.worldToLocal(tipWorld.clone());
+        appendGroovePoint(groove, local);
+
+        // ★ ④の接触判定: 毎フレーム、太陽(=針先)がゴールドリングの半径まで
+        // 到達したかどうかを見る。到達したらtweenを打ち切り、太陽系を召喚する。
+        if (hasTouchedGoldenRing(tweenState.radius)) {
+          tween.kill();
+          onRingContact(tweenState.radius);
+        }
+      },
+      onComplete: () => {
+        // 安全下限まで到達してしまった場合(通常は起きない想定)も、同じ処理で締める。
+        onRingContact(tweenState.radius);
+      },
+    });
+  }
 
   function onRingContact(contactRadius) {
     // ▼ ④太陽系(8惑星)の召喚: リング接触時点の半径からスタートし、本来の大きさまで広がる。
@@ -342,6 +541,25 @@ function playNeedleSequence(record) {
     solarSystem.sunTrailLastRecorded = -Infinity;
     growOrbitToFull(solarSystem, { duration: SOLAR_SYSTEM_GROW_DURATION });
     // ▲ ここまで
+    // ★ 2026-09-17 再訂正(ご指摘反映): 「太陽が到達して消える金のリング」は、
+    //   もともと上(バナナと同じ高さ)にあるcrossfadeRing自身(=拡大したリングその
+    //   もの)。新設した別リングではない。crossfadeRingはcarousel本来のリング
+    //   (universe.goldenRing)とは無関係なので、消してもcarousel側は一切影響を
+    //   受けない。
+    //   hideCrossfadeRingのフェードが実際に完了した後(onComplete)でrecord.onSequenceComplete
+    //   を呼ぶ(tripod⇔鏡tripodの表示をcarousel側へ確定させる後始末はfinishTripodRingSwapが行う)。
+    hideCrossfadeRing(record.crossfadeRing, {
+      onComplete: () => {
+        // ★ 2026-09-15 追加(ご指示反映): 「リングが消滅すると同時にcarousel一式(数式・ih・
+        //   下側のリング)に交換してほしい。以後、リング・鏡tripod・バナナは二度と登場させない」
+        //   への対応。tripod⇔鏡tripodの切り替え(tripodRingSwap.js)は、以後もう
+        //   scroll駆動では使わない片道切符の演出だったので、ここで「終了」を通知して
+        //   carousel側へ強制的に戻してもらう。実体(finishTripodRingSwap呼び出し)は
+        //   main.js側でこのフックに差し込まれている(createRecordDisplay時点ではまだ
+        //   tripodRingSwapのインスタンスが存在しないため)。
+        if (record.onSequenceComplete) record.onSequenceComplete();
+      },
+    }); // ★ 太陽がリングに到達したので、拡大しておいた金のリング(crossfadeRing)を消す
     record.phase = 'done';
     galaxy.needleSpinActive = false; // 銀河の回転を通常速度へ戻す
     needle.visible = false;
@@ -357,14 +575,24 @@ function playNeedleSequence(record) {
 function playCoronationSequence(record) {
   if (record.coronationStarted) return; // 二重発火防止
   record.coronationStarted = true;
+  // ★ バグ修正: 演出中はmirrorVisualAnchor(バナナ・王冠・バルジの親)がスクロールで
+  //   非表示に戻されないよう、tripodRingSwap.js側に強制表示を依頼する。
+  record.coronationLockVisible = true;
 
-  const { bananaMesh, crownGroup, bulge } = record;
+  const { bananaMesh, crownGroup, bulge, galaxy } = record;
   const caption = getCoronationCaption();
 
   // ① 戴冠(5秒): crown.glbをバナナの上空からtweenで落下させる(mirrorVisualAnchor内のローカル座標)。
   crownGroup.position.copy(bananaMesh.position).add(new THREE.Vector3(0, CROWN_DROP_START_HEIGHT, 0));
   crownGroup.visible = true;
   caption.setText(CORONATION_TEXT);
+  // ★ ご指摘反映: テキスト表示と同時に、バナナと同じ高さにある既存のリング
+  //   (crossfadeRing)自身を「太陽系のらせん軌道(=ORBIT_RADIUS_BASE。
+  //   playNeedleSequence側が太陽の到達判定に使うRING_CONTACT_RADIUSと同じ値)」の
+  //   サイズまで拡大しておく。新しいリングを追加で発生させるのではなく、この
+  //   もとからあるリング自身を拡大する。太陽(針先)が実際にそこへ到達した時点
+  //   (playNeedleSequence内のonRingContact)で、この拡大したリングを消す。
+  growCrossfadeRing(record.crossfadeRing, { targetRadius: ORBIT_RADIUS_BASE, duration: CORONATION_DURATION });
 
   gsap.to(crownGroup.position, {
     y: bananaMesh.position.y + BANANA_RADIUS * 0.6, // バナナの上に軽く乗る高さ(仮値)
@@ -378,33 +606,55 @@ function playCoronationSequence(record) {
   }, CORONATION_DURATION * 1000);
 
   // ② バルジ+針+太陽出現(3秒でフェードイン)。バナナは消滅。
-  //   ★ 「消滅→(間)→出現」に見えるよう、バナナを隠した直後ではなく
-  //     BANANA_TO_BULGE_GAP秒だけ待ってからバルジのフェードインを開始する。
+  //   ★ 2026-09-17 変更(ご指示反映): 「バルジの登場は、バナナの縮小と合わせて、
+  //     拡大させながら登場にして」への対応。以前は「消滅→(間)→出現」という
+  //     順番待ちだったが、バナナの縮小開始と同時にバルジも出現を始め、opacityと
+  //     scaleを一緒にtweenして「拡大しながら」現れるようにした。
   function startBulgeAndNeedle() {
-    bananaMesh.visible = false;
     crownGroup.visible = false; // 王冠もバナナと一緒に役目を終える(仮の挙動。残したい場合は消さない)
+    gsap.to(bananaMesh.rotation, {
+      y: bananaMesh.rotation.y + Math.PI * 2 * BANANA_VANISH_SPINS,
+      duration: BANANA_VANISH_DURATION,
+      ease: BANANA_VANISH_EASE,
+    });
+    gsap.to(bananaMesh.scale, {
+      x: 0, y: 0, z: 0,
+      duration: BANANA_VANISH_DURATION,
+      ease: BANANA_VANISH_EASE,
+      onComplete: () => {
+        bananaMesh.visible = false;
+        // 次にまた表示することがあれば元の見た目に戻るよう、回転・スケールを戻しておく。
+        bananaMesh.rotation.set(0, 0, 0);
+        bananaMesh.scale.set(1, 1, 1);
+      },
+    });
 
-    bulge.userData.materials.forEach((m) => { m.opacity = 0; });
-
-    setTimeout(() => {
-      bulge.visible = true;
-      // bulgeは今はバー+コアの2つのPointsを子に持つGroup。両方のopacityを
-      // 同じ進行度から一斉に動かすため、単一のtween変数を経由させる
-      // (バラバラのタイミングでフェードすると、コアだけ先に見えてしまう等
-      // 不自然になるのを避けるため)。
-      const bulgeFade = { t: 0 };
-      gsap.to(bulgeFade, {
-        t: 1,
-        duration: BULGE_REVEAL_FADE_DURATION,
-        onUpdate: () => {
-          bulge.userData.materials.forEach((m) => { m.opacity = bulgeFade.t; });
-        },
-      });
-    }, BANANA_TO_BULGE_GAP * 1000);
+    // バナナの縮小と同時にバルジも出現を開始する(間を置かない)。
+    bulge.visible = true;
+    bulge.scale.setScalar(BULGE_REVEAL_START_SCALE);
+    bulge.userData.materials.forEach((m) => { m.uniforms.uAlpha.value = 0; });
+    // ★ 2026-09-16 追加(ご指示反映): バルジ出現と同時に、銀河円盤側の中心に
+    //   穴をあけて「バルジから腕が生えている」ように見せる。瞬時の切り替え
+    //   (アニメーションなし)だが、バルジのフェードインが3秒あるので、円盤が
+    //   一瞬で欠けること自体はバルジの光に紛れて目立ちにくいはず。
+    setGalaxyInnerRadius(galaxy, GALAXY_HOLE_RADIUS);
+    // bulgeは今はバー+コアの2つのPointsを子に持つGroup。両方のopacityを
+    // 同じ進行度から一斉に動かすため、単一のtween変数を経由させる
+    // (バラバラのタイミングでフェードすると、コアだけ先に見えてしまう等
+    // 不自然になるのを避けるため)。scaleも同じtに合わせて拡大させる。
+    const bulgeReveal = { t: 0 };
+    gsap.to(bulgeReveal, {
+      t: 1,
+      duration: BULGE_REVEAL_FADE_DURATION,
+      onUpdate: () => {
+        bulge.userData.materials.forEach((m) => { m.uniforms.uAlpha.value = bulgeReveal.t; });
+        bulge.scale.setScalar(THREE.MathUtils.lerp(BULGE_REVEAL_START_SCALE, 1, bulgeReveal.t));
+      },
+    });
 
     setTimeout(() => {
       playNeedleSequence(record); // ③④
-    }, (BANANA_TO_BULGE_GAP + BULGE_REVEAL_FADE_DURATION) * 1000);
+    }, BULGE_REVEAL_FADE_DURATION * 1000);
   }
 }
 // ══════════════════════════════════════════════════════════════
@@ -472,6 +722,130 @@ function createMirrorMaterial() {
   return { material, cubeCamera };
 }
 
+// ══════════════════════════════════════════════════════════════
+// ★ 2026-09-17 訂正(ご指摘反映): 前回、戴冠演出の「拡大→消滅」の役割を、バナナと
+//   同じ高さのリング(crossfadeRing)から切り離し、下側に新設した別リング
+//   (orbitRing)へ移していたが、これはご指示の意図と逆だった。正しくは:
+//     - 拡大→消滅するのは、もともと上(バナナと同じ高さ)にあるリング=crossfadeRing
+//       自身。新しいリングを追加で下に発生させて拡大するのではない。
+//     - 拡大したcrossfadeRingは、太陽がリングに到達したら「消滅」する
+//       (=拡大したリングそのものが消える。従来通りの見た目のまま)。
+//     - 消滅後、carousel側と同じ「下側」に新たに現れるのはuniverse.goldenRing
+//       (carousel本来のリング)。こちらは拡大させず通常サイズのまま、鏡tripodと
+//       同じ鏡面のリアルな金の質感にする(universe.js側でマテリアルを用意し、
+//       ここでenvMapだけ渡す。新たにCubeCameraを増やすと重くなるため、鏡と
+//       同じ1つを使い回している)。
+//   orbitRing(専用の別メッシュ)は不要になったため削除した。
+// ══════════════════════════════════════════════════════════════
+const CROSSFADE_RING_TUBE_RADIUS = AXIS_LENGTH * 0.018; // universe.js側のRING_TUBE_RADIUSと同じ値(仮値)
+const CROSSFADE_RING_COLOR = 0xffcc33; // universe.js側のRING_COLORと同じ値(仮値)。従来通りの非金属な単色
+
+// RING_DOWN_Y⇔バナナの高さを上下する「引き継ぎ」用のリング(従来通りの見た目)。
+// 戴冠演出中はこのリング自身が拡大→消滅する(下記growCrossfadeRing/hideCrossfadeRing)。
+function makeCrossfadeRing() {
+  const geometry = new THREE.TorusGeometry(MIRROR_TRIPOD_RADIUS, CROSSFADE_RING_TUBE_RADIUS, 16, 128);
+  const material = new THREE.MeshBasicMaterial({ color: CROSSFADE_RING_COLOR, transparent: true, opacity: 0 });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.rotation.x = Math.PI / 2; // universe.js側のgoldenRingと同じく水平(XZ平面)へ寝かせる
+  // ★ 2026-09-17 追加(バグ修正): revealCrossfadeRingDrawing()がring.rotation.yで
+  //   「描き始めの向き」をカメラ方向へ振り向かせているが、既定のEuler順序'XYZ'では
+  //   X回転(この行の90°の寝かせ)が先に適用されるため、その後のY回転は「もう縦軸
+  //   ではなくなったローカルY軸」を中心に回ることになり、リングが傾いて見える不具合
+  //   があった。順序を'YXZ'(先にYで世界の縦軸まわりに振り向かせ、その後にXで
+  //   寝かせる)にすることで、常に水平を保ったまま向きだけを変えられるようにした。
+  mesh.rotation.order = 'YXZ';
+  mesh.visible = false; // tripodRingSwap.js側がtripodRingRevealed成立時に初めて可視化する
+  mesh.userData.radius = MIRROR_TRIPOD_RADIUS; // 現在の「径」(太さは常にCROSSFADE_RING_TUBE_RADIUSのまま)
+  return mesh;
+}
+
+// ★ 2026-09-17 修正(ご指摘反映): 「リングの拡大が膨張して謎の物体になっている。
+//   太さは変えず、径だけ変えてほしい」への対応。以前はmesh.scaleを均一倍率で
+//   tweenしていたが、TorusGeometryを丸ごと均一スケールすると、径(main radius)だけ
+//   でなく太さ(tube radius)まで一緒に太ってしまい、大きくなるほど「膨張した謎の
+//   物体」に見えていた。scaleでは径と太さを別々に扱えないため、径が変わるたびに
+//   ジオメトリ自体を(太さ=CROSSFADE_RING_TUBE_RADIUS固定のまま)作り直す方式にした。
+function setCrossfadeRingRadius(ring, radius) {
+  const old = ring.geometry;
+  ring.geometry = new THREE.TorusGeometry(radius, CROSSFADE_RING_TUBE_RADIUS, 16, 128);
+  old.dispose();
+  ring.userData.radius = radius;
+}
+
+// ★ 2026-09-17 追加(ご指示反映): 「tripodクリック時のリング出現を、一周描きながら
+//   出現するようにしてほしい。開始点は円でカメラに一番近い点、回転方向はcarouselと
+//   同じ、スピードは速くてよい」への対応。
+//   TorusGeometryのarc引数(掃引角。マイナス値も三角関数的に正しく解釈されるため、
+//   逆回転の指定に使える)を0→2πへtweenし、ring.rotation.yで「描き始め(u=0)」の
+//   向きをカメラ方向に固定した上で、径と同じくジオメトリを毎フレーム作り直すことで
+//   「輪が一周描かれながら現れる」演出にした。
+const RING_REVEAL_DURATION = 0.5; // 仮値。「スピードは速くてよい」の反映
+// carousel(universe.js側のtripod自転。rotateOnWorldAxisにrotationDelta=-ANGULAR_SPEEDを
+// 渡している=world Y軸まわりの負方向)と同じ向きに掃引するための符号(仮。逆に見えたら反転)。
+const RING_REVEAL_SWEEP_SIGN = -1;
+
+function setCrossfadeRingArc(ring, arcFraction) {
+  const old = ring.geometry;
+  const safeFraction = Math.max(arcFraction, 0.001); // arc=0だと退化するので下限を設ける
+  const arc = RING_REVEAL_SWEEP_SIGN * safeFraction * Math.PI * 2;
+  ring.geometry = new THREE.TorusGeometry(ring.userData.radius, CROSSFADE_RING_TUBE_RADIUS, 16, 128, arc);
+  old.dispose();
+}
+
+// tripodクリック時、1回だけ呼ぶ。tripodRingSwap.js側から呼ばれる想定でexportしてある。
+export function revealCrossfadeRingDrawing(ring, camera, { duration = RING_REVEAL_DURATION, onComplete } = {}) {
+  // 「開始点は円でカメラに一番近い点」: 中心(リング自身のXZ座標)からカメラへ向かう
+  // 方向がそのまま「円上の最近点」の方向になる。この角度をTorusのu=0(=描き始め)に
+  // 向くようring.rotation.yへ設定する。
+  const dx = camera.position.x - ring.position.x;
+  const dz = camera.position.z - ring.position.z;
+  ring.rotation.y = Math.atan2(dz, dx);
+
+  ring.visible = true;
+  ring.material.opacity = 1;
+
+  const state = { t: 0 };
+  gsap.to(state, {
+    t: 1,
+    duration,
+    ease: 'power1.out',
+    onUpdate: () => setCrossfadeRingArc(ring, state.t),
+    onComplete: () => {
+      setCrossfadeRingRadius(ring, ring.userData.radius); // 仕上げに厳密な全周ジオメトリへ確定させる
+      if (onComplete) onComplete();
+    },
+  });
+}
+
+// ── 戴冠演出専用: crossfadeRingを「太陽系のらせん軌道」サイズまで拡大する ──────
+// 径(ring.userData.radius)そのものをtweenし、更新のたびにsetCrossfadeRingRadiusで
+// ジオメトリを作り直す(太さは常にCROSSFADE_RING_TUBE_RADIUSのまま変えない)。
+function growCrossfadeRing(ring, { targetRadius, duration, ease = 'power2.inOut', onComplete } = {}) {
+  const state = { radius: ring.userData.radius };
+  if (ring.userData.radiusTween) ring.userData.radiusTween.kill();
+  ring.userData.radiusTween = gsap.to(state, {
+    radius: targetRadius,
+    duration,
+    ease,
+    onUpdate: () => setCrossfadeRingRadius(ring, state.radius),
+    onComplete: () => { if (onComplete) onComplete(); },
+  });
+}
+
+// ── 戴冠演出専用: 太陽がリングに到達したら、拡大しておいたcrossfadeRingを消す ──
+function hideCrossfadeRing(ring, { duration = 0.8, onComplete } = {}) {
+  if (ring.userData.radiusTween) ring.userData.radiusTween.kill();
+  gsap.to(ring.material, {
+    opacity: 0,
+    duration,
+    ease: 'power1.in',
+    onComplete: () => {
+      ring.visible = false;
+      if (onComplete) onComplete();
+    },
+  });
+}
+
 function makeHitAreaMesh(radius) {
   return new THREE.Mesh(
     new THREE.SphereGeometry(radius, 12, 12),
@@ -504,8 +878,20 @@ function makeBananaMesh() {
 // deps: { camera, galaxy, solarSystem } ── いずれもmain.js側で既に作成済みの「既存インスタンス」を渡す。
 // ★ solarSystemは現状(針が無効化されているため)このファイル内では使っていないが、
 //   針を復活させたときにそのまま使えるよう引数はそのまま残してある。
-export function createRecordDisplay(scene, renderer, { camera, galaxy, solarSystem, universe }) {
+export function createRecordDisplay(scene, renderer, { camera, galaxy, solarSystem, universe, excludeFromBloom }) {
   const { material: mirrorMaterial, cubeCamera } = createMirrorMaterial();
+
+  // universe.goldenRing(carouselの飾りリング)とは別の、この演出専用のリング。
+  // 位置(ringDownY↔バナナの高さの上下)はtripodRingSwap.js側が毎フレーム動かす。
+  const crossfadeRing = makeCrossfadeRing();
+  scene.add(crossfadeRing);
+
+  // ★ ご指摘反映: 「リアルな金のリング」はcarousel本来のリング(universe.goldenRing)
+  //   自身のこと(=下側に新しい専用リングを追加するのではない)。universe.js側で
+  //   マテリアルの種類(MeshStandardMaterial・metalness・roughness)は用意済みなので、
+  //   ここでは鏡と同じCubeCamera環境マップ(mirrorMaterial.envMap)を渡すだけでよい
+  //   (新たにCubeCameraを増やすと重くなるため、既存の1つを使い回している)。
+  universe.goldenRing.material.envMap = mirrorMaterial.envMap;
 
   const apex = new THREE.Vector3(0, MIRROR_APEX_HEIGHT, 0);
 
@@ -533,10 +919,24 @@ export function createRecordDisplay(scene, renderer, { camera, galaxy, solarSyst
     console.error('crown.glbの読み込みに失敗しました。', err);
   });
 
-  // ② バルジ(プレースホルダー)。バナナと同じ場所を起点に生やす。
+  // ② バルジ(プレースホルダー)。ご指示反映: 銀河本体(galaxy.starsGroup)の子として
+  //   銀河中心(ローカル原点)に配置する。以前はmirrorVisualAnchor(バナナの位置)の
+  //   子だったため、戴冠演出後にmirrorVisualAnchorごと恒久的に非表示になっていたが、
+  //   今後は「銀河本体の一部としてずっと表示され続ける」ものにするため、独立した
+  //   親(galaxy.starsGroup)に変更した。galaxy.starsGroupは銀河の自転そのものの
+  //   グループなので、バルジも銀河と一緒に回転し、「バルジから腕が生えている」
+  //   見た目に自然に馴染む。
   const bulge = makeBulgePlaceholder();
-  bulge.position.copy(bananaMesh.position);
-  mirrorVisualAnchor.add(bulge);
+  // 位置は銀河中心(galaxy.starsGroupのローカル原点)でよい、とのご指示のため0のまま。
+  // ★ ご指摘の「コアのある複雑な形に見えない」件の原因はこれ。バー・コアの粒はどちらも
+  //   AdditiveBlendingで、除外しない限りmain.js側のBloomがそのままフルの強さで乗ってしまう
+  //   ため、粒同士の光がにじんで混ざり合い、バー+コアという構造が潰れて見えていた。
+  //   ここでBloomを完全にオフにはせず、BULGE_BLOOM_INTENSITYまで弱める(0にすると
+  //   Bloom完全オフ=最もくっきり見えるが、光っている感じは失われる。仮値、要調整)。
+  if (excludeFromBloom) {
+    bulge.children.forEach((child) => excludeFromBloom(child, BULGE_BLOOM_INTENSITY));
+  }
+  galaxy.starsGroup.add(bulge);
 
   mirrorVisualAnchor.position.copy(computeMirrorGroupPosition());
   mirrorVisualAnchor.visible = false; // 表示はtripodRingSwap.js側が一元管理する(swapT>=1で表示に切り替わる)
@@ -579,9 +979,18 @@ export function createRecordDisplay(scene, renderer, { camera, galaxy, solarSyst
   return {
     scene, renderer, camera, galaxy, solarSystem, universe,
     mirrorGroup, mirrorVisualAnchor, mirrorVisualHome: mirrorVisualAnchor.position.clone(),
+    crossfadeRing,
     pyramidMesh, bananaMesh, crownGroup, bulge, needle, groove,
     galaxyCenter: galaxy.starsGroup.position.clone(), // ← 針・太陽軌道の中心(銀河の中心。生成時点で固定)
     coronationStarted: false, // ← バナナクリック演出の二重発火防止
+    // ★ 2026-09-16 追加(バグ修正): 「バルジが出現していない」への対応。戴冠演出中、
+    //   スクロールが(何らかの理由で)後方向に動くと、tripodRingSwap.js側の
+    //   updateTripodRingSwapがrecord.viewMixCurrentを見てmirrorVisualAnchor.visibleを
+    //   falseに戻してしまい、その子であるbulge/バナナ/王冠ごと非表示になってしまう
+    //   可能性があった。演出中(coronationStarted〜finishTripodRingSwapまで)は
+    //   このフラグをtrueにして、tripodRingSwap.js側にmirrorVisualAnchorを強制的に
+    //   表示させ続けてもらう。
+    coronationLockVisible: false,
     cubeCamera, mirrorLookTarget,
     viewMixTarget: 0,  // 0=carousel側を向く / 1=鏡側を向く。applyScrollが更新する
     viewMixCurrent: 0, // 実際にcontrols.targetへ適用する、軽くスムージングした値
@@ -592,6 +1001,13 @@ export function createRecordDisplay(scene, renderer, { camera, galaxy, solarSyst
     pullbackApplied: 0, // 直前フレームでcamera.positionへ実際に足した量(次フレームで打ち消すために保持)
     // 'inactive' → 'mirror' → (針を復活させれば 'needle' → 'done' も使える。現状は'mirror'止まり)
     phase: 'inactive',
+    // ★ 2026-09-15 追加: バナナクリック後の演出(戴冠→リング拡大→リング消滅)が完了した
+    //   瞬間(onRingContact)に呼ばれるフック。createRecordDisplay時点ではまだ
+    //   tripodRingSwap.jsのインスタンスが存在しない(main.js側の生成順序がrecord→
+    //   tripodRingSwapのため)ので、ここではnullのまま返し、main.js側で
+    //   record.onSequenceComplete = () => finishTripodRingSwap(tripodRingSwap) のように
+    //   後から差し込んでもらう想定。未設定なら何もしない(呼び出し側はnullチェック不要)。
+    onSequenceComplete: null,
   };
 }
 
