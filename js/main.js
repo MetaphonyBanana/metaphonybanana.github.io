@@ -19,7 +19,7 @@ import { createBananafish } from './bananafish.js';
 import { createHotspots } from './hotspots.js';
 import { createDialogue } from './dialogue.js';
 import { createIntroSequence } from './introSequence.js';
-import { getAxisStationView, flyToAxisStation, UNIVERSE_CAMERA_TARGET } from './config.js';
+import { getAxisStationView, flyToAxisStation, UNIVERSE_CAMERA_POS, UNIVERSE_CAMERA_TARGET } from './config.js';
 import { createAxisStationOverlay } from './axisStationOverlay.js';
 import { createAxisConstellationOverlay } from './axisConstellationOverlay.js';
 import { AXIS_CONTENT } from './data/axisContent.js';
@@ -28,8 +28,8 @@ import { createEquationAssembly, startPhase1, zoomToEquation, startPhase3 } from
 import { playOriginBurst } from './originBurst.js';
 import { createUniverse, enterUniverse, toggleUniverseEquation, updateUniverse, updateEquationHoverByPointer, revealTripodRing, liftTripod, startTripodRoofPulse, createUniverseProjectionMixer, unlockIh } from './universe.js';
 import { createSolarSystem, updateSolarSystem, generatePlanetTrails } from './solarSystem.js';
-import { createGalaxy, updateGalaxy, revealGalaxy, ANGULAR_SPEED as GALAXY_ANGULAR_SPEED, ROTATION_DIRECTION as GALAXY_ROTATION_DIRECTION } from './galaxy.js';
-import { createTripodRingSwap, updateTripodRingSwap } from './tripodRingSwap.js';
+import { createGalaxy, updateGalaxy, revealGalaxy, setGalaxyArmEmphasis, ANGULAR_SPEED as GALAXY_ANGULAR_SPEED, ROTATION_DIRECTION as GALAXY_ROTATION_DIRECTION } from './galaxy.js';
+import { createTripodRingSwap, updateTripodRingSwap, finishTripodRingSwap } from './tripodRingSwap.js';
 import {
   createRecordDisplay, startRecordDisplay, tryRecordClick, updateRecordDisplay,
   applyScroll, SCROLL_MAX,
@@ -146,6 +146,19 @@ const EQUATION_BLOOM_INTENSITY = 0.8;
 Object.values(equationAssembly.sprites).forEach((sprite) => excludeFromBloom(sprite, EQUATION_BLOOM_INTENSITY));
 const axes = createAxes(scene);
 const universe = createUniverse(scene); // ← Phase3以降、画面クリックで遷移する「宇宙ページ」(星なし・回転する三軸+方程式画像)
+// ★ 2026-09-17 追加(ご指摘反映): 「銀河俯瞰時、レコード(=universe.goldenRing)が
+//   画面上で小さく見えるとき(望遠鏡モードの既定fov・ドラッグでズームしていない状態)
+//   に白飛びする」への対応。starField/equationAssembly/バルジと同じ原因
+//   (UnrealBloomPassはミップベースの実装のため、対象が画面上で小さいほど、その
+//   小ささに対して相対的に強くブルーム=白飛びしやすい弱点がある)なので、同じ対策
+//   (excludeFromBloomでBloom強度を弱める)を適用する。
+//   ★ ただしgoldenRing自体は宇宙ページの他の場面(carousel表示時など、画面上で
+//     十分大きく見える距離)でも使われる同一インスタンスなので、値を0にして完全に
+//     Bloomを切るのではなく、近くで見たときの輝きもある程度残るよう中間値にしてある
+//     (仮値。見ながら調整してください。近くでの見映えを優先するなら上げる、
+//     俯瞰時の白飛びをより確実に抑えたいなら下げる)。
+const GOLDEN_RING_BLOOM_INTENSITY = 0.35;
+excludeFromBloom(universe.goldenRing, GOLDEN_RING_BLOOM_INTENSITY);
 // tripodクリックで「金のリング→円錐状の粒子→ih.png」が出現する演出(universe.js側で完結)に加えて、
 // 太陽系(solarSystem.js)・銀河(galaxy.js)・レコードプレーヤー操作パネル(record.js)も
 // 同じ宇宙ページ内に共存させる。
@@ -163,6 +176,18 @@ const record = createRecordDisplay(scene, renderer, { camera, galaxy, solarSyste
 // universe/recordの両方が揃った後でないと作れないので、ここで呼ぶ。
 const tripodRingSwap = createTripodRingSwap(scene, universe, record);
 
+// ★ 2026-09-15 追加(ご指示反映): バナナクリック後の演出(戴冠→リング拡大→リング消滅)が
+//   完了した瞬間、record.js側(playNeedleSequence内のonRingContact)からこのフックが
+//   呼ばれる。以後tripod⇔鏡tripodの切り替え(tripodRingSwap)はもう使わない片道切符
+//   なので、carousel側へ強制的に戻して固定する(finishTripodRingSwap)。
+//   recordSequenceDoneは、以後の「スクロール/左右ドラッグの用途を銀河俯瞰に切り替える」
+//   判定にmain.js側で使う(下記ホイールハンドラ・レンダーループ参照)。
+let recordSequenceDone = false;
+record.onSequenceComplete = () => {
+  finishTripodRingSwap(tripodRingSwap);
+  recordSequenceDone = true;
+};
+
 // ── スクロールによる画面切り替え(下=鏡、上=carousel)・銀河のscrub ──────────
 // 累積スクロール量を0〜SCROLL_MAXにクランプして保持し、そのままrecord.js側に渡す
 // (画面の向き・銀河の出現度合いの計算はrecord.js側で完結させている)。
@@ -170,9 +195,248 @@ let recordScrollY = 0;
 renderer.domElement.addEventListener('wheel', (e) => {
   if (!universe.isActive) return; // 宇宙ページ内でのみ有効
   e.preventDefault();
+  // ★ 2026-09-17 追加(ご指示反映): 「バナナクリック後は、スクロールとクリックを
+  //   一時的に不可にして」への対応。戴冠演出(record.coronationStarted)が始まって
+  //   から、一連の演出が完了する(recordSequenceDone)までの間は、スクロールを
+  //   一切受け付けない。
+  if (record.coronationStarted && !recordSequenceDone) return;
+  // ★ 2026-09-15 追加(ご指示反映): バナナクリック後の演出が完了した(recordSequenceDone)
+  //   以降は、スクロールの用途をcarousel⇔鏡の切り替えから「銀河俯瞰カメラの高さ調整」へ
+  //   切り替える。以後applyScroll(record, ...)は二度と呼ばない(呼んでも
+  //   tripodRingSwap.updateTripodRingSwapはswap.done===trueで無視するだけだが、
+  //   record.viewMixTarget自体が無駄に動くのを避けるため、ここで完全に分岐しておく)。
+  if (recordSequenceDone) {
+    applyGalaxyOverviewScroll(e.deltaY);
+    return;
+  }
   recordScrollY = THREE.MathUtils.clamp(recordScrollY + e.deltaY, 0, SCROLL_MAX);
   applyScroll(record, recordScrollY);
 }, { passive: false });
+
+// ── 2026-09-15 追加(2回目の修正): レコード完成後(recordSequenceDone)のカメラ ──────
+// ご指摘反映: 「銀河へ寄っていく俯瞰」ではなく望遠鏡のようなUXにしたい
+// (=近づく移動は一切しない。高さを変えるか、fov(光学ズーム)を変えるだけ)。
+// そのため、以前のenterGalaxyOverview(新しい俯瞰位置へカメラを飛ばす)は撤回し、
+// 基準位置を「universe開始位置そのもの」= config.jsのUNIVERSE_CAMERA_POSに固定した。
+//   - スクロール: UNIVERSE_CAMERA_TARGETを中心にした仰角(elevation)だけを変える。
+//     targetからの距離は常に一定(=近づく/離れるという移動が起きない)。
+//   - 左右同時ドラッグ: fovだけを変える光学ズーム(位置は不変)。ドラッグしている間だけ
+//     拡大でき、指を離す(ボタンを離す)と既定fovへ戻る(=ドラッグ中でしか拡大できない)。
+// ★ 2026-09-16 3回目の修正(ご指摘反映):
+//   - 「スクロールでの高さは0から50度ぐらいまででよい」→ 世界座標のYを直接動かす方式
+//     (前回の実装)をやめ、UNIVERSE_CAMERA_TARGETを中心とした球面座標で「仰角」を
+//     0°(=現状のuniverse開始時の見下ろし角そのもの)〜OVERVIEW_ELEVATION_MAX_DEG(=50°)
+//     の範囲で動かす方式に変更した。距離(target〜カメラ)は球面座標の半径として常に
+//     一定に保たれるので、望遠鏡のように「首を振るだけで近づかない」動きになる。
+//   - 「デフォルト銀河はまだ全然小さいので、もう少しzoomできない?」→ 望遠鏡UX
+//     (位置は動かさずfovだけで寄る)の制約の中でできる対応として、最大ズーム時のfovを
+//     さらに狭めた(6→2)。
+const OVERVIEW_ELEVATION_MAX_DEG = 50;    // ご指定値。仰角を0°〜この角度まで動かす
+const OVERVIEW_HEIGHT_SMOOTHING = 3.0;    // 仮値。スクロールでの仰角変化をなめらかにする係数(record.jsのVIEW_MIX_SMOOTHINGと同じ流儀)
+const OVERVIEW_TRANSITION_DURATION = 1.2; // 仮値。銀河俯瞰(=telescopeの基準姿勢)へ最初に戻すフライトの秒数
+const OVERVIEW_SCROLL_RANGE = 1200;       // 仮値。この累積スクロール量で仰角が0°⇔MAXまで振れる
+// ★ 2026-09-16 7回目の修正(ご指摘反映): 「デフォルトのfovが大きすぎるし、拡大限度も
+//   小さい」への対応。前回のtanベースの倍率計算は、結局「基準fovが広すぎる」問題を
+//   引きずったまま拡大量を決めていたため不十分だった。ここでは基準fov・最大ズームを
+//   それぞれ直接の角度指定に戻し、基準を大きく狭め、最大ズームもより強くした。
+//   (前々回、fov=2という極端な値を「バグの原因では」と疑ったが、実際の原因は
+//   ドラッグ判定側にあったと判明したため、狭いfov自体は問題ない)
+const OVERVIEW_FOV_BASE = 35;             // 仮値。銀河俯瞰時の既定(ドラッグしていない)fov。以前(70)より大幅に狭めた
+const OVERVIEW_FOV_ZOOMED = 4;            // 仮値。目一杯ドラッグしたときの最大ズーム。以前より強めた
+const OVERVIEW_FOV_DRAG_DISTANCE = 400;   // 仮値。このぶん(px)左右ドラッグしたらズームが振り切る
+const OVERVIEW_FOV_RESET_DURATION = 0.6;  // 仮値。ドラッグを離したときにbase fovへ戻る速さ(早すぎず遅すぎず)
+// ★ 2026-09-16 追加(ご指示反映): 最後の俯瞰画面で、レコード(=universe.goldenRing。
+//   carousel側へ戻された「下側のリング」)の右側に針(record.needle)を配置する。
+//   針のメッシュ形状・角度・挙動は今後作り直す予定とのことなので、ここでは既存の
+//   needleオブジェクト(戴冠演出で使っていたものと同じインスタンス)を再利用し、
+//   位置を合わせて再表示するだけの最小限の実装にしてある。
+//   ★ 太陽出現シーン(playNeedleSequence)側では、この針は銀河の周縁〜中心を大きく
+//     移動するため画面外に出ることがある(既知の別の話。今回はノータッチ)。
+const OVERVIEW_NEEDLE_OFFSET_X = 40; // 仮値。レコード(goldenRing)からどれだけ右(+X)に離すか
+
+// ★ 2026-09-16 追加(ご指示反映)・2026-09-17 単純化(ご指摘反映):
+//   「0〜8度で太陽系軌道の消滅。8〜50度でcarousel(tripod一式)の消滅」という単純な
+//   1本の境界線でよかったので、閾値を2つ持つのをやめてOVERVIEW_HIDE_SPLIT_DEG
+//   1つに統一した(仰角がこれ未満なら軌道を隠し、これ以上ならcarouselを隠す)。
+const OVERVIEW_HIDE_SPLIT_DEG = 8; // 仮値。見た目を見ながら調整してください
+
+// UNIVERSE_CAMERA_TARGETを中心とした球面座標(半径・仰角・方位角)。仰角0°=このまま
+// (=UNIVERSE_CAMERA_POSそのもの)、仰角を上げるほどtargetの真上寄りへ弧を描いて
+// 移動する(半径=targetからの距離は不変)。
+const OVERVIEW_BASE_OFFSET = new THREE.Vector3().subVectors(UNIVERSE_CAMERA_POS, UNIVERSE_CAMERA_TARGET);
+const OVERVIEW_BASE_SPHERICAL = new THREE.Spherical().setFromVector3(OVERVIEW_BASE_OFFSET);
+
+let overviewActive = false;      // telescopeモードへの移行が完了(または移行中)かどうか
+// ★ 2026-09-17 追加(ご指示反映): 「固定3本の腕を太くする」演出のtween進行度(0〜1)。
+//   galaxy.js側のsetGalaxyArmEmphasisへそのまま渡す。growGalaxyArms/calmGalaxyArms
+//   参照。
+// ★ 2026-09-16 修正(ご指摘反映): 「スクロールでの高さ移動量をもっとなめらかに」への対応。
+//   以前はホイールイベントのたびに高さを即座に反映していたが、record.js(viewMixCurrent)
+//   と同じ「target(即時更新) → current(毎フレーム指数スムージングで追従)」の2段構えにした。
+let overviewScrollTarget = 0;  // 0〜OVERVIEW_SCROLL_RANGE。0=仰角0°(基準姿勢)から開始
+let overviewScrollCurrent = 0; // 毎フレームtargetへなめらかに近づく実際の値(仰角の計算に使う)
+let overviewFovDragActive = false;
+let overviewFovDragStartX = 0;
+let overviewFovResetTween = null; // ドラッグ解除時のbaseへ戻すtween(次のドラッグ開始時にkillする)
+let overviewFlightInProgress = false; // enterGalaxyOverviewの基準姿勢フライト中かどうか
+const galaxyArmEmphasis = { t: 0 }; // 0=通常、1=固定3本の腕が太く・明るく強調された状態
+
+// 仰角(度)からカメラのワールド座標を計算する(半径・方位角は基準のまま固定=近づかない)。
+function overviewPositionForElevationDeg(elevationDeg) {
+  const elevationRad = THREE.MathUtils.degToRad(elevationDeg);
+  const spherical = OVERVIEW_BASE_SPHERICAL.clone();
+  // phiはY軸(上)からの角度。仰角(見下ろす角度)を増やすほどtargetの真上に近づく=phiを減らす。
+  spherical.phi = THREE.MathUtils.clamp(OVERVIEW_BASE_SPHERICAL.phi - elevationRad, 0.001, Math.PI - 0.001);
+  spherical.makeSafe();
+  return new THREE.Vector3().setFromSpherical(spherical).add(UNIVERSE_CAMERA_TARGET);
+}
+
+// 現在のoverviewScrollCurrentから仰角を計算し、カメラへ反映する(距離は常に一定=
+// 近づく移動は発生しない)。
+function applyOverviewCameraHeight() {
+  const t = overviewScrollCurrent / OVERVIEW_SCROLL_RANGE; // 0〜1
+  const elevationDeg = t * OVERVIEW_ELEVATION_MAX_DEG;
+  camera.position.copy(overviewPositionForElevationDeg(elevationDeg));
+  camera.lookAt(UNIVERSE_CAMERA_TARGET);
+}
+
+// 毎フレーム呼ぶ(animate内、overviewActive中のみ意味を持つ)。overviewScrollCurrentを
+// overviewScrollTargetへ指数スムージングで近づけ、その結果をカメラへ反映する。
+// ★ 突入直後の基準姿勢へ戻すフライト(enterGalaxyOverview)の最中は、position自体を
+//   flight側が管理しているのでここでは何もしない(でないと毎フレーム上書きし合って
+//   フライトのlerpが機能しなくなる)。
+function updateOverviewCameraHeight(deltaSeconds) {
+  if (!overviewActive || overviewFlightInProgress) return;
+  const smoothing = 1 - Math.exp(-OVERVIEW_HEIGHT_SMOOTHING * deltaSeconds);
+  overviewScrollCurrent = THREE.MathUtils.lerp(overviewScrollCurrent, overviewScrollTarget, smoothing);
+  applyOverviewCameraHeight();
+}
+
+// ── 2026-09-17 追加(ご指示反映): 銀河の固定3本の腕(galaxy.js側の
+//    GALAXY_ARM_EMPHASIS_BRANCHES=[0,3,6]、120°間隔)を太く・明るく強調する演出。
+//   - growGalaxyArms(): 最後の俯瞰視点(telescopeモード突入=enterGalaxyOverview)の
+//     タイミングで呼ぶ。0→1へアニメーションし、3本だけが太く浮き上がって見える。
+//   - calmGalaxyArms(): 1→0へ戻す(=今の常時の静かな見た目に戻す)。
+//     ★ 現時点ではまだ呼び出し元がない。「レコードのアーム(tonearm)を円盤に置く」
+//       ギミックを今後追加する予定とのことなので、その完了ハンドラからこの関数を
+//       呼ぶ想定で用意しておく(=アームが置かれたら銀河も静かなレコードモードに戻る、
+//       という対応関係)。
+const GALAXY_ARM_GROW_DURATION = 1.8; // 仮値。腕が太くなっていく速さ(秒)
+const GALAXY_ARM_CALM_DURATION = 1.2; // 仮値。calmGalaxyArms()で元に戻す速さ(秒)
+
+function growGalaxyArms() {
+  gsap.to(galaxyArmEmphasis, {
+    t: 1,
+    duration: GALAXY_ARM_GROW_DURATION,
+    ease: 'power2.out',
+    onUpdate: () => setGalaxyArmEmphasis(galaxy, galaxyArmEmphasis.t),
+  });
+}
+
+// eslint-disable-next-line no-unused-vars -- 将来のtonearm設置ギミックからの呼び出し用に用意
+function calmGalaxyArms() {
+  gsap.to(galaxyArmEmphasis, {
+    t: 0,
+    duration: GALAXY_ARM_CALM_DURATION,
+    ease: 'power2.inOut',
+    onUpdate: () => setGalaxyArmEmphasis(galaxy, galaxyArmEmphasis.t),
+  });
+}
+
+// 最初のスクロールで一度だけ呼ぶ: 右ドラッグ等でズレていたカメラ位置/fovを、
+// telescopeの基準姿勢(UNIVERSE_CAMERA_POS=仰角0°・base fov)へ滑らかに戻す。
+// ★ ここでも「今の位置から基準位置へ寄せる」だけで、銀河へ近づく移動先には飛ばさない。
+function enterGalaxyOverview() {
+  if (overviewActive) return;
+  overviewActive = true;
+  if (controls) controls.enabled = false; // telescopeモード中は専用のスクロール/ドラッグでのみ制御する
+
+  // ★ 2026-09-17 追加(ご指示反映): 「最後の俯瞰視点になったときに変化」の反映。
+  //   telescopeモードに入った(=最後の俯瞰画面に到達した)このタイミングで、
+  //   銀河の固定3本の腕を太く・明るく強調し始める。
+  growGalaxyArms();
+
+  // ★ 2026-09-16 追加: レコード(goldenRing)の右側に針を配置して再表示する。
+  //   (仮の位置合わせ。角度・挙動は今後作り直す予定とのこと)
+  const ringPos = universe.goldenRing.position;
+  record.needle.position.set(ringPos.x + OVERVIEW_NEEDLE_OFFSET_X, ringPos.y, ringPos.z);
+  record.needle.visible = true;
+  record.needle.userData.material.opacity = 1;
+
+  const startPos = camera.position.clone();
+  const startFov = camera.fov;
+  const targetPos = overviewPositionForElevationDeg(0); // 仰角0°=UNIVERSE_CAMERA_POSと同じ
+  const flight = { t: 0 };
+  overviewFlightInProgress = true;
+  gsap.to(flight, {
+    t: 1,
+    duration: OVERVIEW_TRANSITION_DURATION,
+    ease: 'power2.inOut',
+    onUpdate: () => {
+      camera.position.lerpVectors(startPos, targetPos, flight.t);
+      camera.fov = THREE.MathUtils.lerp(startFov, OVERVIEW_FOV_BASE, flight.t);
+      camera.updateProjectionMatrix();
+      camera.lookAt(UNIVERSE_CAMERA_TARGET);
+    },
+    onComplete: () => {
+      overviewFlightInProgress = false;
+    },
+  });
+}
+
+// ホイールハンドラから呼ぶ: 未突入ならtelescopeの基準姿勢へ戻すトリガーとしてだけ使い、
+// 突入済みならtargetを更新するだけにする(実際の反映はupdateOverviewCameraHeightが
+// 毎フレームなめらかに追従させる)。
+function applyGalaxyOverviewScroll(deltaY) {
+  if (!overviewActive) {
+    enterGalaxyOverview();
+    return;
+  }
+  overviewScrollTarget = THREE.MathUtils.clamp(overviewScrollTarget + deltaY, 0, OVERVIEW_SCROLL_RANGE);
+}
+
+// 左右ボタン同時押しのままドラッグ(このプロジェクトの他の箇所と同じジェスチャー)で
+// fov(光学ズーム)だけを調整する。位置は変えない。telescopeモード中(overviewActive)のみ有効。
+// ★ ドラッグしている間だけ拡大でき、ボタンを離すとbase fovへ戻る(=ドラッグ中でしか
+//   拡大できない仕様)。
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (!overviewActive) return;
+  const bothDown = e.buttons === 3; // 左(1)+右(2)の同時押し
+
+  if (!overviewFovDragActive) {
+    if (!bothDown) return;
+    overviewFovDragActive = true;
+    overviewFovDragStartX = e.clientX;
+    if (overviewFovResetTween) overviewFovResetTween.kill(); // 戻り途中に再ドラッグしたら即座に手動制御へ戻す
+    return;
+  }
+
+  if (!bothDown) {
+    endOverviewFovDrag();
+    return;
+  }
+
+  // 左右どちらへドラッグしてもズーム量として扱う(距離が大きいほど狭fov=望遠寄り)。
+  const dragged = Math.abs(e.clientX - overviewFovDragStartX);
+  const zoomT = THREE.MathUtils.clamp(dragged / OVERVIEW_FOV_DRAG_DISTANCE, 0, 1);
+  camera.fov = THREE.MathUtils.lerp(OVERVIEW_FOV_BASE, OVERVIEW_FOV_ZOOMED, zoomT);
+  camera.updateProjectionMatrix();
+});
+window.addEventListener('pointerup', () => {
+  if (overviewFovDragActive) endOverviewFovDrag();
+});
+
+// ドラッグ解除時にbase fovへ、早すぎず遅すぎずの速度(OVERVIEW_FOV_RESET_DURATION秒)で
+// 戻す。
+function endOverviewFovDrag() {
+  overviewFovDragActive = false;
+  overviewFovResetTween = gsap.to(camera, {
+    fov: OVERVIEW_FOV_BASE,
+    duration: OVERVIEW_FOV_RESET_DURATION,
+    ease: 'power2.out',
+    onUpdate: () => camera.updateProjectionMatrix(),
+  });
+}
 
 // ── 疑似正射影 ⇄ 透視図の右ドラッグ切り替え ─────────────────────
 // ご指示「carouselから切り替え、右ドラッグで透視図モードに切り替える」の反映。
@@ -198,7 +462,14 @@ renderer.domElement.addEventListener('pointermove', (e) => {
 
   if (!projectionDragActive) {
     if (!bothDown) return;
-    if (!universe.isActive || record.perspectiveActive) return; // universe開始前 or 切り替え済みなら無視
+    // ★ 2026-09-16 6回目の修正(ご指摘反映): 「ドラッグでのzoom距離に反映されてる」バグの
+    //   本当の原因はここだった。overviewActiveは「最初のスクロールをした後」にしか
+    //   trueにならないため、recordSequenceDone(バナナ演出完了)直後、まだ一度も
+    //   スクロールしていないタイミングで左右ドラッグすると、この判定をすり抜けて
+    //   旧来の「距離を変えるズーム」(setUniverseProjectionMix)が起動してしまっていた。
+    //   overviewActiveではなくrecordSequenceDone(演出完了後は恒久的にtrue)で判定する
+    //   ことで、スクロールの有無に関わらず演出完了後はこの旧ハンドラを確実に無効化する。
+    if (!universe.isActive || record.perspectiveActive || recordSequenceDone) return; // universe開始前 or 切り替え済み or バナナ演出完了後なら無視
     projectionDragActive = true;
     projectionDragStartX = e.clientX;
     return; // 開始位置を記録するだけ。動かすのは次のmoveから
@@ -461,6 +732,12 @@ function fadeTransition({ fadeInDuration = 0.3, hold = 0.15, fadeOutDuration = 0
 
 renderer.domElement.addEventListener('click', (e) => {
   if (intro.getState() === 'idle') { intro.startSequence(); return; }
+
+  // ★ 2026-09-17 追加(ご指示反映): 「バナナクリック後は、スクロールとクリックを
+  //   一時的に不可にして」への対応。戴冠演出(record.coronationStarted)が始まって
+  //   から、一連の演出が完了する(recordSequenceDone)までの間は、クリックを
+  //   一切受け付けない(record.js側の二重発火防止フラグをそのまま流用している)。
+  if (record.coronationStarted && !recordSequenceDone) return;
 
   // フィナーレ中でも「i」アイコンだけは特別にクリックを許可する
   // (ただし、カメラがFINALE_DESTに完全に静止してから。理由は finaleCameraSettled の定義部を参照)
@@ -910,8 +1187,32 @@ function animate() {
   //   極端に視点が切り替わる」ように見えていた。universe.isActiveの間はこの行を
   //   完全にスキップし、向きの制御をOrbitControls(controls.target)に一元化する。
   if (state !== 'home' && !universe.isActive) camera.lookAt(lookTarget);
-  if (state === 'home' && !cameraBusy && !finaleActive) controls.update();
-  if (state === 'home' && !labelsShown) { labelsShown = true; axisLabels.show(); }
+  // ★ 2026-09-17 追加調査(ご指摘の「たまにuniverse開始時にカメラ位置がおかしくなる」
+  //   バグへの対応): 直上の2026-09-11修正では、camera.lookAt(lookTarget)の誤発火
+  //   だけをuniverse.isActiveで二重に防いだが、まったく同じ「intro.getState()が一瞬
+  //   (またはなんらかの理由で)'home'のまま/'home'に戻ってしまう」状況で、直後の
+  //   controls.update()も同様に誤発火しうることに気づいていなかった。
+  //   OrbitControls.update()は、自身が最後に記憶している内部の球面座標(target
+  //   からの距離・方位角・仰角)を元にcamera.positionを直接書き換える。universe中は
+  //   カメラをcode側(updateUniverse・setUniverseProjectionMix等)が直接動かしており、
+  //   OrbitControls側の内部状態は更新されず「最後にhome画面にいたときのまま」古い
+  //   値を持ち続けている。そのため、何らかの理由でintro.getState()==='home'が
+  //   一瞬でも真になった状態でcontrols.update()が呼ばれると、カメラが突然その
+  //   「古いhome画面の球面座標」から計算された、universe中のカメラ位置とは無関係な
+  //   座標へジャンプしてしまう。ご報告いただいたcamera.positionの不可解な値
+  //   (GSAPのtweenは0件=誰も明示的にアニメーションしていない)は、この
+  //   controls.update()による上書きと辻褄が合う。
+  //   line 1136と同じ考え方でuniverse.isActiveを追加のガードにし、universe中は
+  //   intro.getState()が何を返そうとcontrols.update()自体を一切呼ばせないようにした
+  //   (labelsShownの表示も、意味的にhome画面専用の演出なので同様に揃えてある)。
+  //   ★ ただし、これは「camera.positionが壊れる」という症状そのものへの対症療法
+  //   (=OrbitControls側の古い内部状態で上書きされるのを防ぐ)であり、そもそも
+  //   なぜintro.getState()が universe.isActive===true の状況で 'home' を返すことが
+  //   あるのか、という根本原因はintro側(このファイルには無い、intro状態機械の
+  //   実装)にある可能性が高い。intro側で「universe突入後は二度と'home'を返さない」
+  //   ことを保証できるなら、そちらで直すのがより根本的な修正になる。
+  if (state === 'home' && !universe.isActive && !cameraBusy && !finaleActive) controls.update();
+  if (state === 'home' && !universe.isActive && !labelsShown) { labelsShown = true; axisLabels.show(); }
   dialogue.updatePosition();
   starField.update(clock.getElapsedTime());
   // らせんの位相回転更新でここが万一例外を投げても、レンダーループ全体(=軸クリックの見た目上の反応)が
@@ -942,7 +1243,7 @@ function animate() {
   //   (エラーはconsoleには出るが、画面上は「PHASE3の視点で止まって見える」だけなので
   //   気づきにくい)。再発した場合に画面全体を巻き込まないよう、try/catchで隔離する。
   try {
-    if (universe.isActive && !projectionDragActive && !record.perspectiveActive) {
+    if (universe.isActive && !projectionDragActive && !record.perspectiveActive && !overviewActive) {
       const relative = camera.position.clone().sub(UNIVERSE_CAMERA_TARGET);
       relative.applyAxisAngle(
         new THREE.Vector3(0, 1, 0),
@@ -955,7 +1256,8 @@ function animate() {
     console.error('universe camera auto-rotate failed:', err);
   }
   updateRecordDisplay(record, delta, controls); // 鏡の反射撮影+スクロールに応じた画面切り替え+三角錐の自転(メインのrender()より前)
-  updateTripodRingSwap(tripodRingSwap); // 「二つのtripod・二つの円環」のクロスフェード+移動(record.viewMixCurrentに連動)
+  updateTripodRingSwap(tripodRingSwap, camera); // 「二つのtripod・二つの円環」のクロスフェード+移動(record.viewMixCurrentに連動)
+  updateOverviewCameraHeight(delta); // ★ 2026-09-16追加: 銀河俯瞰(telescope)中、スクロール高さをなめらかに追従させる
   // ご指示「carouselとrecordは可視、不可視の関係」の反映: 画面がどちら向きかに応じて、
   // 互いの見た目(carousel側の粒子/ih、record側のbanana搭載mirrorGroup)を排他的に切り替える。
   // ★ tripod本体(axesGroup)・金のリング(goldenRing)は、以前はここで0.5をしきい値に
@@ -964,11 +1266,36 @@ function animate() {
   //   外してある(残すと、そちらの演出が瞬時に隠れてしまい台無しになるため)。
   // 銀河・太陽系は元々「鏡側を向いてから」しか出現しない作りなので、ここでは強制していない。
   if (universe.isActive) {
-    const showRecordSide = record.viewMixCurrent >= 0.5;
+    // ★ 2026-09-15 修正(ご指示反映): recordSequenceDone(バナナ演出完了・carousel側へ
+    //   固定済み)以降は、record.viewMixCurrentの値に関わらずshowRecordSideを強制的に
+    //   falseにする。以前はここが常にrecord.viewMixCurrent(鏡側へ向いたまま止まっている
+    //   累積スクロール値)だけを見ていたため、演出完了後もshowRecordSideがtrueのまま
+    //   固定されてしまい、carousel側の粒子(roofParticles)・tripodHitMesh・ihが
+    //   ずっと非表示のままになる不具合があった(ご指摘の「リングが消えたまま」も
+    //   この一種。リング自体はfinishTripodRingSwap側で個別に直している)。
+    const showRecordSide = recordSequenceDone ? false : record.viewMixCurrent >= 0.5;
     universe.roofParticles.visible = !showRecordSide;
     universe.tripodHitMesh.visible = !showRecordSide;
     universe.ihSprite.visible = !showRecordSide && universe.ihRevealed;
-    if (record.phase !== 'inactive') record.mirrorGroup.visible = showRecordSide;
+    if (record.phase !== 'inactive' && !recordSequenceDone) record.mirrorGroup.visible = showRecordSide;
+  }
+
+  // ★ 2026-09-16 追加(ご指示反映)・2026-09-17 単純化(ご指摘反映): 「0〜8度で太陽系軌道、
+  //   8〜50度でcarousel(tripod一式。roofParticlesも含む)」という単純な1本の境界線
+  //   (OVERVIEW_HIDE_SPLIT_DEG)で切り替える。上のshowRecordSideブロックより後に
+  //   実行することで、ihSpriteなどの値をこちらが最後に上書きする。
+  //   ★ 閾値は仮値です。見た目を見ながら調整してください。
+  if (overviewActive) {
+    const elevationDeg = (overviewScrollCurrent / OVERVIEW_SCROLL_RANGE) * OVERVIEW_ELEVATION_MAX_DEG;
+    const hideSolarSystem = elevationDeg < OVERVIEW_HIDE_SPLIT_DEG;
+    const hideCarousel = elevationDeg >= OVERVIEW_HIDE_SPLIT_DEG;
+
+    universe.tripodAnchor.visible = !hideCarousel;   // TRIPOD(軸・数式はこの子なので一緒に隠れる)
+    universe.goldenRing.visible = !hideCarousel;     // リング
+    universe.roofParticles.visible = !hideCarousel;  // tripodが残す粒子の軌跡(carousel側の一部)
+    if (universe.ihRevealed) universe.ihSprite.visible = !hideCarousel; // ih
+
+    solarSystem.group.visible = !hideSolarSystem; // 太陽系軌道
   }
   // ★ 2026-09-11 追加(バグ調査用): 「カメラ設定を変えても最終的な視点が変わらない」の
   //   原因調査のため、universe.isActive中は1秒おきに自動でdumpCameraする(キー操作不要)。
