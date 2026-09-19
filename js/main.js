@@ -26,8 +26,8 @@ import { AXIS_CONTENT } from './data/axisContent.js';
 import { createFinale, runFinale, handleIconClick } from './finale.js';
 import { createEquationAssembly, startPhase1, zoomToEquation, startPhase3 } from './equationAssembly.js';
 import { playOriginBurst } from './originBurst.js';
-import { createUniverse, enterUniverse, toggleUniverseEquation, updateUniverse, updateEquationHoverByPointer, revealTripodRing, liftTripod, startTripodRoofPulse, createUniverseProjectionMixer, unlockIh } from './universe.js';
-import { createSolarSystem, updateSolarSystem, generatePlanetTrails } from './solarSystem.js';
+import { createUniverse, enterUniverse, toggleUniverseEquation, updateUniverse, updateEquationHoverByPointer, revealTripodRing, liftTripod, startTripodRoofPulse, createUniverseProjectionMixer, unlockIh, setTripodAngularSpeed } from './universe.js';
+import { createSolarSystem, updateSolarSystem, generatePlanetTrails, ORBIT_CENTER } from './solarSystem.js';
 import { createGalaxy, updateGalaxy, revealGalaxy, setGalaxyArmEmphasis, ANGULAR_SPEED as GALAXY_ANGULAR_SPEED, ROTATION_DIRECTION as GALAXY_ROTATION_DIRECTION } from './galaxy.js';
 import { createTripodRingSwap, updateTripodRingSwap, finishTripodRingSwap } from './tripodRingSwap.js';
 import {
@@ -164,10 +164,29 @@ excludeFromBloom(universe.goldenRing, GOLDEN_RING_BLOOM_INTENSITY);
 // 同じ宇宙ページ内に共存させる。
 // tripod直下を公転する太陽系(8惑星入れ子)。宇宙ページ限定の装飾。
 const solarSystem = createSolarSystem(scene);
-// ★ 銀河は他の何にも依存させず、単純にワールド原点(0,0,0)に固定配置する。
-//   (以前試していた「バナナの実座標に追従させる」ロジックは、初期化タイミングの
-//   問題で座標が不安定になる不具合があったため撤去した。)
-const galaxy = createGalaxy(scene, new THREE.Vector3(0, 13, 0));
+// ★ 2026-09-19 修正(ご指摘反映): 「太陽系の公転面が銀河と一致しているか確認して。
+//   高くも低くも見える」への対応。原因はここだった。solarSystem.js側の主軌道
+//   (sunGroupが辿るorbitCurve)はORBIT_CENTER(=universe.jsのRECORD_ANCHOR)を中心にした
+//   平面上にあるのに対し、銀河はそれと無関係にここでハードコードした(0, 13, 0)を
+//   中心にしていたため、2つの円盤面の高さがわずかにズレていた(すぐ下のコメントも
+//   「ワールド原点(0,0,0)に固定配置する」と書かれたまま実際の値は(0,13,0)になっており、
+//   このズレ自体が過去の調整の残骸だったことを示している)。solarSystem.js側が元々
+//   「galaxy.js側が銀河の中心をORBIT_CENTERに合わせる想定」とコメントしていた通りに、
+//   ORBIT_CENTERをそのまま銀河の中心として渡すよう修正した。
+const galaxy = createGalaxy(scene, ORBIT_CENTER);
+// ★ 2026-09-19 追加(ご指摘反映): 「星が明るく、ぼやけてしまった」への対応その3。
+//   galaxy.js側でトーンアームの透過(transmission)用に追加した不透明な「核」レイヤー
+//   (galaxy.opaquePoints)は、見た目上は輝きレイヤー(galaxy.points)の中に完全に隠れる
+//   想定のごく小さな点だが、UnrealBloomPassは小さく硬い(不透明な)点に弱く、ここが
+//   Bloomの対象に入っていると輝きレイヤーとは別に自分自身もBloomしてしまい、結果的に
+//   全体が余分に明るく・ぼやけて見える一因になっていた。starField(冒頭のexcludeFromBloom
+//   参照)と同じ理由でここも完全にBloom対象から除外する。
+excludeFromBloom(galaxy.opaquePoints);
+// ★ 2026-09-19 追加(ご指摘反映): 「carousel回転も、太陽系の銀河公転速度に合わせて」
+//   への対応。GALAXY_ANGULAR_SPEED(galaxy.jsのANGULAR_SPEED。既にSUN_ORBIT_PERIODから
+//   導出済み=太陽系の公転と同じ速度)を、そのままtripod/carousel自体の自転速度としても
+//   使うようにした。
+setTripodAngularSpeed(GALAXY_ANGULAR_SPEED);
 // 「レコードプレーヤー(操作パネル)」: カメラ背後の鏡三脚+バナナ→銀河出現→銀河クリックで
 // 針+太陽系召喚、という一連の流れを管理する(詳細はrecord.js冒頭のコメント参照)。
 // 銀河・太陽系はここで新規作成せず、上で作った既存のgalaxy/solarSystemをそのまま使う。
@@ -246,13 +265,9 @@ const OVERVIEW_FOV_ZOOMED = 4;            // 仮値。目一杯ドラッグし�
 const OVERVIEW_FOV_DRAG_DISTANCE = 400;   // 仮値。このぶん(px)左右ドラッグしたらズームが振り切る
 const OVERVIEW_FOV_RESET_DURATION = 0.6;  // 仮値。ドラッグを離したときにbase fovへ戻る速さ(早すぎず遅すぎず)
 // ★ 2026-09-16 追加(ご指示反映): 最後の俯瞰画面で、レコード(=universe.goldenRing。
-//   carousel側へ戻された「下側のリング」)の右側に針(record.needle)を配置する。
-//   針のメッシュ形状・角度・挙動は今後作り直す予定とのことなので、ここでは既存の
-//   needleオブジェクト(戴冠演出で使っていたものと同じインスタンス)を再利用し、
-//   位置を合わせて再表示するだけの最小限の実装にしてある。
-//   ★ 太陽出現シーン(playNeedleSequence)側では、この針は銀河の周縁〜中心を大きく
-//     移動するため画面外に出ることがある(既知の別の話。今回はノータッチ)。
-const OVERVIEW_NEEDLE_OFFSET_X = 40; // 仮値。レコード(goldenRing)からどれだけ右(+X)に離すか
+//   carousel側へ戻された「下側のリング」)の右側に針(record.needle)を配置する演出を
+//   試していたが、位置が定まらず不自然だったため、2026-09-17に撤去した(下記の
+//   enterGalaxyOverview内も参照。関連コードは削除済み)。
 
 // ★ 2026-09-16 追加(ご指示反映)・2026-09-17 単純化(ご指摘反映):
 //   「0〜8度で太陽系軌道の消滅。8〜50度でcarousel(tripod一式)の消滅」という単純な
@@ -355,13 +370,6 @@ function enterGalaxyOverview() {
   //   telescopeモードに入った(=最後の俯瞰画面に到達した)このタイミングで、
   //   銀河の固定3本の腕を太く・明るく強調し始める。
   growGalaxyArms();
-
-  // ★ 2026-09-16 追加: レコード(goldenRing)の右側に針を配置して再表示する。
-  //   (仮の位置合わせ。角度・挙動は今後作り直す予定とのこと)
-  const ringPos = universe.goldenRing.position;
-  record.needle.position.set(ringPos.x + OVERVIEW_NEEDLE_OFFSET_X, ringPos.y, ringPos.z);
-  record.needle.visible = true;
-  record.needle.userData.material.opacity = 1;
 
   const startPos = camera.position.clone();
   const startFov = camera.fov;
@@ -781,7 +789,18 @@ renderer.domElement.addEventListener('click', (e) => {
         //   liftTripodは既発火済みで実質no-opのため「何も起きない」ように見えつつ)
         //   tryRecordClickまで到達できていなかった。tripodRingSwap.jsのTODOコメントで
         //   指摘されていた不具合そのもの。明示的にvisibleを見て判定自体をスキップする。
-        const tripodHit = universe.tripodHitMesh.visible
+        // ★ 2026-09-18 修正(ご指摘反映): 「銀河俯瞰時、tripodクリックでtripodが上に
+        //   移動するバグ」への対応。tripodHitMesh(当たり判定用の大きな球)はtripodAnchorの
+        //   子ではなくscene直下にあるため、hideCarousel(俯瞰中のcarousel非表示)で
+        //   tripodAnchor.visible=falseにしても、この当たり判定自体は生き残ったままだった。
+        //   さらにこの判定はshowRecordSide(=recordSequenceDone後は常にfalse)経由で
+        //   tripodHitMesh.visible=trueに固定され続けるため、俯瞰中でも過去の場所への
+        //   クリックがここに飛び込んでしまっていた。revealTripodRing/liftTripod自体は
+        //   二重発火防止フラグがあるので同じ高さへ「跳ね直る」ことはなかったはずだが、
+        //   本来この判定一式は「戴冠演出が終わるまで」の片道切符(tripodRingSwap.js側の
+        //   doneフラグと同じ設計思想)であり、完了後(recordSequenceDone)に生かしておく
+        //   理由がない古いコードだったため、ここで明示的に無効化した。
+        const tripodHit = (!recordSequenceDone && universe.tripodHitMesh.visible)
           ? raycaster.intersectObject(universe.tripodHitMesh, true)[0]
           : null;
         if (tripodHit) {
@@ -894,6 +913,9 @@ renderer.domElement.addEventListener('click', (e) => {
                   //   銀河本体には(内部バナナも含め)クリック対象は無く、以後この銀河
                   //   自体を拡大・縮小する操作はない(常にこのフルサイズのまま)。
                   revealGalaxy(galaxy);
+                  // ★ 2026-09-17 追加(ご指示反映): トーンアーム(ガラス製。record.js側で
+                  //   位置決めまで実装済み)も銀河と同じタイミングで表示する。
+                  record.tonearm.visible = true;
                   // universe開始時点のセリフ差し替え。
                   const axisHint2 = document.getElementById('axisHint');
                   if (axisHint2) axisHint2.textContent = 'What is the sound of two hands clapping?';
