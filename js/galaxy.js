@@ -154,6 +154,54 @@ const FRAGMENT_SHADER = /* glsl */ `
   }
 `;
 
+// ★ 2026-09-19 追加(ご指摘反映): 「ガラス(トーンアーム)に星が透過しない」への対応。
+//   three.jsのtransmissionは、その時点までに描画済みの「不透明(opaque)」なジオメトリ
+//   だけを背景としてキャプチャする。銀河の粒はAdditiveBlending+transparent:trueな
+//   ソフトな光でできているため、透過パスより後(半透明パス)で描かれてしまい、
+//   ガラス越しには一切映らない。そこで、同じ位置・色を使った「不透明な核」だけの
+//   レイヤーをもう1枚(下記FRAGMENT_SHADER_OPAQUE + createGalaxyOpaqueMaterial)追加し、
+//   従来のソフトな輝きレイヤーの下に重ねて描く。核レイヤーはtransparent:false/
+//   depthWrite:trueの完全な不透明ジオメトリなので、これがtransmissionに正しく
+//   キャプチャされ、ガラス越しに星が見えるようになる。
+const FRAGMENT_SHADER_OPAQUE = /* glsl */ `
+  varying vec3 vColor;
+  varying float vAlpha;
+  varying float vColorBoost;
+  void main() {
+    float strength = distance(gl_PointCoord, vec2(0.5));
+    if (strength > 0.42) discard;
+    // 縁のフェード(vAlpha。円盤外周/穴のふちで0に近づく)がごく小さい粒は、
+    // もともと「見えない」ことを意図した粒なので、不透明レイヤー側でも描かない。
+    if (vAlpha < 0.05) discard;
+    // ★ 2026-09-19 修正(ご指摘反映): 「星が明るく、ぼやけてしまった」への対応。
+    //   このレイヤーはtransmission用に「不透明な何か」を用意するためだけの黒子であり、
+    //   見た目そのものは従来通り上の輝きレイヤー(FRAGMENT_SHADER)だけで作る想定だった。
+    //   ところがvColorBoost(腕の強調時の増光)まで掛けたうえで完全不透明(alpha=1固定)に
+    //   していたため、輝きレイヤーの下で実質「もう一枚ぶん明るい円」が常時重なる形になり、
+    //   全体が明るく・(UnrealBloomPassが小さな不透明な円に弱いため)ぼやけて見える原因に
+    //   なっていた。vColorBoostの掛け算をやめ、少し暗めの色で塗るだけにする
+    //   (下のGALAXY_OPAQUE_POINT_SIZEも大幅に縮小してあり、main.js側でBloom対象からも
+    //   完全に除外している)。
+    // ★ 2026-09-19 追加(前回修正の副作用の是正): 「鏡tripodがほとんど何も映らなく
+    //   なった」への対応。鏡tripod(record.js createMirrorMaterial)はCubeCameraで
+    //   シーンをそのまま撮影しており、main.js側のBloom(ポストプロセス)を一切経由しない。
+    //   そのため、excludeFromBloomでBloom対象から外しても鏡の見え方には無関係で、
+    //   鏡に映る明るさは「このレイヤーの生の色」だけで決まる。前回、直接見た画面の
+    //   Bloomのぼやけ対策として色を0.7倍に暗くしたところ、光源が一つもないこのシーンで
+    //   鏡が拾える数少ない明るい material だったため、鏡がほぼ何も映さなくなって
+    //   しまった。サイズ(GALAXY_OPAQUE_POINT_SIZE=小さいまま)とBloom除外はそのまま
+    //   残しつつ、色だけ鏡用に明るく(1.0倍より明るい1.4倍に)戻す。excludeFromBloomは
+    //   main.js側のBloom合成にしか効かないので、この明るさを上げても直接見た画面が
+    //   再びぼやけることはない。
+    gl_FragColor = vec4(vColor * 1.4, 1.0);
+  }
+`;
+// ★ 2026-09-19 修正: 上のvColor*1.4(鏡用の明るさ)に合わせて、サイズも0.1倍→0.16倍へ
+//   少しだけ戻した。鏡(CubeCamera)は解像度256pxしかないため、点が小さすぎると
+//   ほぼサブピクセルになって消えてしまう。直接見た画面ではBloom除外+輝きレイヤーの
+//   下に隠れる大きさなので、この程度ならまだ見た目への影響はほぼない想定。
+const GALAXY_OPAQUE_POINT_SIZE = GALAXY_POINT_SIZE * 0.16; // 仮値。鏡での見え方とのバランスで調整してください
+
 // ── ジオメトリ生成: 位置・色・サイズ属性をJS側で一度だけ計算する ─────────
 // 渦巻き円盤のみ(中心の棒状バルジは撤去済み。上部コメント参照)。
 // ★ 2026-09-16 追加(ご指示反映): 「バルジ出現の際に銀河に穴をあけて、バルジから
@@ -244,9 +292,11 @@ function buildGalaxyGeometry(innerRadius = 0) {
 //    「出現の際に」という一度きりのタイミングなので、瞬時の切り替えで十分という判断)。
 export function setGalaxyInnerRadius(galaxy, innerRadius) {
   if (!galaxy || !galaxy.points) return;
+  const oldGeometry = galaxy.points.geometry; // opaquePointsとも共有している同一インスタンス
   const newGeometry = buildGalaxyGeometry(innerRadius);
-  galaxy.points.geometry.dispose();
   galaxy.points.geometry = newGeometry;
+  if (galaxy.opaquePoints) galaxy.opaquePoints.geometry = newGeometry; // ← 核レイヤーにも同じジオメトリを張り直す
+  oldGeometry.dispose();
 }
 
 // ── 2026-09-17 追加: 固定3本の腕(GALAXY_ARM_EMPHASIS_BRANCHES)の強調度を設定する。
@@ -256,6 +306,7 @@ export function setGalaxyInnerRadius(galaxy, innerRadius) {
 export function setGalaxyArmEmphasis(galaxy, amount) {
   if (!galaxy || !galaxy.material) return;
   galaxy.material.uniforms.uArmEmphasis.value = amount;
+  if (galaxy.opaqueMaterial) galaxy.opaqueMaterial.uniforms.uArmEmphasis.value = amount; // 核レイヤーも一緒に強調する
 }
 
 // ── 2026-09-17 追加: 銀河・バルジなど「Points+この円形ソフトシェーダー」を使う
@@ -294,11 +345,53 @@ export function createStarPointsMaterial({
   });
 }
 
+// ★ 2026-09-19 追加: 上記createStarPointsMaterialの「不透明な核」版。頂点シェーダーは
+//   同じもの(位置・サイズ計算を完全に揃えるため)を使い、フラグメントシェーダーだけ
+//   FRAGMENT_SHADER_OPAQUEに差し替える。transparent:falseかつdepthWrite:trueにすることで、
+//   このレイヤーだけがrenderer側の不透明パスに乗り、ガラスのtransmissionに正しく
+//   キャプチャされる(詳細は上のFRAGMENT_SHADER_OPAQUE定義部のコメント参照)。
+//   見た目は「輝きレイヤーの中心にある、少し小さめの実体」程度になるよう
+//   GALAXY_OPAQUE_POINT_SIZEを輝きより小さくしてある。
+export function createGalaxyOpaqueMaterial({
+  size,
+  nearFadeStart = 0,
+  nearFadeRange = 1,
+  maxPixelSize = 0,
+  armThickenStrength = 0,
+  armBrightenStrength = 0,
+} = {}) {
+  return new THREE.ShaderMaterial({
+    vertexShader: VERTEX_SHADER,
+    fragmentShader: FRAGMENT_SHADER_OPAQUE,
+    uniforms: {
+      uSize: { value: size },
+      uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+      uAlpha: { value: 1 },
+      uNearFadeStart: { value: nearFadeStart },
+      uNearFadeRange: { value: nearFadeRange },
+      uMaxPixelSize: { value: maxPixelSize },
+      uArmEmphasis: { value: 0 },
+      uArmThickenStrength: { value: armThickenStrength },
+      uArmBrightenStrength: { value: armBrightenStrength },
+    },
+    transparent: false,
+    depthWrite: true,
+  });
+}
+
 function buildGalaxyMaterial() {
   return createStarPointsMaterial({
     size: GALAXY_POINT_SIZE,
     armThickenStrength: GALAXY_ARM_THICKEN_STRENGTH,
     armBrightenStrength: GALAXY_ARM_BRIGHTEN_STRENGTH,
+  });
+}
+
+function buildGalaxyOpaqueMaterial() {
+  return createGalaxyOpaqueMaterial({
+    size: GALAXY_OPAQUE_POINT_SIZE,
+    armThickenStrength: GALAXY_ARM_THICKEN_STRENGTH, // 輝きレイヤーと同じ比率で太さも連動させる(見た目に出ないサイズだが念のため揃える)
+    armBrightenStrength: 0, // このレイヤーの色はもう固定(vColor*0.7)なので、増光側は使わない
   });
 }
 
@@ -313,10 +406,18 @@ export function createGalaxy(scene, anchor) {
   // ないので無効化しておく(no-op化)。
   points.raycast = () => {};
 
+  // ★ 2026-09-19 追加: 不透明な「核」レイヤー(ガラス越しの透過用。上記コメント参照)。
+  //   輝きレイヤー(points)とまったく同じジオメトリ(=同じBufferGeometryインスタンス)を
+  //   共有するので、位置・見た目のフェードは常に完全に一致する。
+  const opaqueMaterial = buildGalaxyOpaqueMaterial();
+  const opaquePoints = new THREE.Points(geometry, opaqueMaterial);
+  opaquePoints.raycast = () => {};
+
   // starsGroup: 銀河のパーティクルだけを持つグループ。ここをrotateすることで自転を表現する。
   const starsGroup = new THREE.Group();
   starsGroup.position.copy(anchor);
-  starsGroup.add(points);
+  starsGroup.add(opaquePoints); // 先に不透明な核を描画し、
+  starsGroup.add(points);       // その上から輝きレイヤーを重ねる
   starsGroup.visible = false; // revealGalaxyまで隠しておく(solarSystem.groupと同じ扱い)
   scene.add(starsGroup);
 
@@ -324,8 +425,15 @@ export function createGalaxy(scene, anchor) {
     starsGroup,
     points,
     material,
+    opaquePoints,   // ← ガラス透過用の不透明レイヤー(setGalaxyInnerRadiusが一緒に張り替える)
+    opaqueMaterial,
     state: 'hidden', // 'hidden' → 'idle'
-    needleSpinActive: false, // ← record.js側がplayNeedleSequence中だけtrueにする(「1秒で半周」の速さになる)
+    needleSpinActive: false, // ← 旧・針実装が使っていたフラグ(現在は呼び出し元なし。将来の再利用のため残す)
+    // ★ 2026-09-18 追加(ご指示反映): 「トーンアームを円盤の外周に置いたら、銀河の
+    //   回転を少し上げる」への対応。needleSpinActive(固定でπ rad/秒という大きな
+    //   ジャンプ)とは別に、通常速度に対する「掛け算の倍率」だけを持たせておき、
+    //   setGalaxySpinBoost()で自由な値に変えられるようにした。
+    spinBoost: 1,
   };
 }
 
@@ -340,8 +448,15 @@ export function revealGalaxy(galaxy) {
 // ── 毎フレーム呼ぶ: 銀河をworld Yまわりに自転させる(state==='idle'の間) ──
 export function updateGalaxy(galaxy, deltaSeconds) {
   if (!galaxy || galaxy.state === 'hidden') return;
-  const magnitude = galaxy.needleSpinActive ? NEEDLE_SPIN_MAGNITUDE : ANGULAR_SPEED;
+  const magnitude = galaxy.needleSpinActive ? NEEDLE_SPIN_MAGNITUDE : ANGULAR_SPEED * (galaxy.spinBoost ?? 1);
   galaxy.starsGroup.rotateOnWorldAxis(ROTATION_AXIS_DIR, ROTATION_DIRECTION * magnitude * deltaSeconds);
+}
+
+// トーンアーム(record.js側)が針を置いたときなど、銀河の自転速度を通常のANGULAR_SPEEDに
+// 対する倍率で一時的に変えたいときに呼ぶ。multiplier=1が通常速度。
+export function setGalaxySpinBoost(galaxy, multiplier) {
+  if (!galaxy) return;
+  galaxy.spinBoost = multiplier;
 }
 
 // TODO:
@@ -353,7 +468,8 @@ export function updateGalaxy(galaxy, deltaSeconds) {
 //     +1/-1で自転の向きを切り替えられます(GALAXY_SPINの符号と合わせて渦の見え方が決まります)。
 //   - リサイズ時にuPixelRatioを更新したい場合は、resizeハンドラから
 //     galaxy.material.uniforms.uPixelRatio.value = Math.min(window.devicePixelRatio, 2)
-//     を呼んでください(このモジュール単体ではresizeイベントを監視していません)。
+//     galaxy.opaqueMaterial.uniforms.uPixelRatio.value = Math.min(window.devicePixelRatio, 2)
+//     の両方を呼んでください(このモジュール単体ではresizeイベントを監視していません)。
 //   - ★ 2026-09-14: 銀河そのものの拡大・縮小(バナナクリックでの収束消滅・スクロールでの
 //     出し入れ・ドラッグでの掴み移動など)は仕様として廃止されたため、関連コードは
 //     すべて削除しました。削除したもの: 中心の棒状バルジ(バー+コア。上部コメント参照)、
