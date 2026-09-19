@@ -68,7 +68,8 @@ function makeHitAreaMesh(radius) {
 // 「太陽系の軌道も大きくしてほしい」とのご指示で、tripodより一回り大きくしてある(仮値・倍率)。
 // もうtripodの直径と一致させる制約は外れたので、SOLAR_SYSTEM_SCALEの対象外という位置づけだけ
 // (太陽本体・惑星本体・惑星軌道半径には掛からない)は変わらず維持している。
-export const ORBIT_RADIUS_BASE = TRIPOD_RADIUS * 2.4;      // createSolarSystem時点の初期主軌道半径(仮値)
+// ★ 2026-09-19 修正(ご指摘反映):「太陽の銀河の公転半径を1.5倍ほど大きくして」への対応。
+export const ORBIT_RADIUS_BASE = TRIPOD_RADIUS * 2.4 * 1.5;      // createSolarSystem時点の初期主軌道半径(仮値。以前の1.5倍)
 // ↑ recordAssembly.js側の針が銀河に触れた瞬間、setOrbitRadius()でこれよりもっと大きい値
 //   (針が触れた位置=銀河上の接触点の半径)に即座に置き換えられる。あくまで生成直後の初期値。
 // ── 「規定軌道」: バナナクリック後、軌道が最終的に縮み切る先の固定半径 ───────────
@@ -81,7 +82,10 @@ const ORBIT_HEIGHT_WOBBLE = 0;         // 0=完全に平面的な正円。バナ
 const ORBIT_CURVE_POINTS = 64;         // 曲線を近似する制御点の数
 // ↓ galaxy.js側が「銀河の自転速度を太陽系の公転速度と揃える」「太陽系が軌道を一周したら
 //   銀河を縮小する」の両方の基準時間として参照するためexportした。
-export const SUN_ORBIT_PERIOD = 40;    // 太陽が軌道を1周するのにかかる秒数(仮値)
+// ★ 2026-09-19 修正(ご指摘反映):「太陽系の銀河の公転速度は遅くてよい」への対応。
+//   以前の40から60へ(仮値。遅くする分にはいくらでも調整して構わないとのことなので、
+//   見た目を見ながらさらに大きくしてもよい)。
+export const SUN_ORBIT_PERIOD = 60;    // 太陽が軌道を1周するのにかかる秒数(仮値)
 
 // radius: 呼び出し時点の主軌道半径。バナナクリック後の縮小アニメーション中は、
 // この関数を毎フレーム呼び直して軌道形状を再計算する(rebuildOrbitCurve参照)。
@@ -120,7 +124,12 @@ function makeSunMesh() {
 // speedは「1秒あたりの角速度(rad/秒)」に変換して使う(ANGULAR_SPEED_SCALEで調整)。
 // フレームごとの加算(旧実装)ではなく経過時間から直接角度を計算する方式にしたことで、
 // フレームレートに依存せず動く。
-const ANGULAR_SPEED_SCALE = 0.6; // 旧実装(1フレームあたりspeed*0.01, 60fps想定)と近い見た目速度になるよう変換
+// ★ 2026-09-19 修正(ご指摘反映): 「らせん回転の比率を上げたい」の本来の調整箇所は
+//   ここ。以前は0.6だったが、銀河を一周する時間(SUN_ORBIT_PERIOD)はそのままに、
+//   1周あたりの惑星の自転(=らせんの巻き数)だけを10倍にしたいとのご指示のため、
+//   ここを10倍(0.6→6)にした(主軌道側のtへ誤って加えていた/10は上のupdateSolarSystem
+//   側で削除済み)。
+const ANGULAR_SPEED_SCALE = 6; // 旧実装(1フレームあたりspeed*0.01, 60fps想定)と近い見た目速度になるよう変換したうえで、らせんの巻き数を10倍にする係数
 const PLANETS = [
   { name: 'Mercury', radius: 0.12, orbit: 1.4, speed: 4.1, color: 0xb1b1b1 },
   { name: 'Venus',   radius: 0.18, orbit: 1.9, speed: 3.0, color: 0xe0c16c },
@@ -302,7 +311,16 @@ export function createSolarSystem(scene) {
 export function updateSolarSystem(solarSystem, elapsedSeconds) {
   if (!solarSystem.group.visible) return;
 
-  const t = (elapsedSeconds / SUN_ORBIT_PERIOD/10) % 1;
+  // ★ 2026-09-19 修正(ご指摘反映): 「らせん回転の比率を上げようとして係数に10を追加したが、
+  //   軌道の線が銀河を一周しなくなった」への対応。原因はここだった。ここのtはSUN_ORBIT_PERIODで
+  //   主軌道(銀河の周り)を1周する太陽自身の位置パラメータであり、「らせんの巻き数(惑星が
+  //   太陽の周りを何回自転するか)」の比率とは無関係。ここに/10を足してしまったせいで
+  //   主軌道の1周にかかる時間が10倍に伸び、軌道の線がもう銀河を一周しきれなくなっていた。
+  //   「らせんの巻き数を上げる」の本来の調整箇所は、下のPLANETS.forEach内で使っている
+  //   ANGULAR_SPEED_SCALE(惑星の自転速度側の係数)。そちらを10倍にすることで、主軌道の
+  //   周期(=銀河を一周する時間)は元に戻したまま、1周あたりの惑星の公転(自転)回数だけを
+  //   10倍に保っている。
+  const t = (elapsedSeconds / SUN_ORBIT_PERIOD) % 1;
   computeSunPose(solarSystem.orbitCurve, t, _curvePoint, _sunQuat);
   solarSystem.sunGroup.position.copy(_curvePoint);
   solarSystem.sunGroup.quaternion.copy(_sunQuat); // ← 公転面を進行方向と直交させる(らせんの仕組み)
