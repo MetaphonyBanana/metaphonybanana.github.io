@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { MIRROR_APEX_HEIGHT, BANANA_HEIGHT_ABOVE_APEX, revealCrossfadeRingDrawing } from './record.js';
 import { PHASE_SWAP_END } from './config.js';
-import { TRIPOD_GROUND_Y, setIhFade } from './universe.js';
+import { TRIPOD_GROUND_Y, RING_DOWN_Y, setIhFade } from './universe.js';
 
 // ══════════════════════════════════════════════════════════════
 // ── 切り替え時の座標入れ替え: tripod ⇄ 鏡tripod / リング ⇄ バナナの高さ ─────
@@ -75,10 +75,11 @@ import { TRIPOD_GROUND_Y, setIhFade } from './universe.js';
 //   TRIPOD_GROUND_Y(=0)基準のままなので、ここを変えても影響しない
 //   (universe.js側は一切変更していない)。
 const REST_Y = TRIPOD_GROUND_Y;
-// ★ 2026-09-17 修正(ご指摘反映): 「ihがcarouselの屋根にぶつかる」ため、リングの
-//   下限(carousel側の着地点)をさらに少し下げた(10→16。仮値)。
-const RING_DOWN_DROP = 16; // 仮値。リングの下限(carousel側)だけをREST_Yからどれだけ下げるか
-const RING_DOWN_Y = REST_Y - RING_DOWN_DROP;
+// ★ 2026-09-18 修正(ご指摘反映): リングの下限(RING_DOWN_Y)は、ihの高さ計算からも
+//   直接参照したくなったため、このファイル内のローカル定数ではなくuniverse.js側で
+//   一元管理する定数(TRIPOD_GROUND_Yのすぐ下で定義)に変更した。値そのものを調整
+//   したい場合はuniverse.js側のRING_DOWN_DROPを編集してください(以前16→14。
+//   「リングの下限をほんの少し高く」というご指示への対応)。
 
 // ★ 2026-09-17 修正(ご指摘反映): 「なぜTRIPOD/IH/下側リングの座標を使い回さず、
 //   わざわざ新しい定数(CAROUSEL_FINAL_DROP・RING_EXTRA_LIFT)を足しているのか」との
@@ -256,7 +257,7 @@ export function finishTripodRingSwap(swap) {
   //   での最下限位置(ringDownY)に出現させて」への対応。以前はuniverse.goldenRingの
   //   生成時の位置(TRIPOD_GROUND_Y)のまま何もしていなかったが、ここで明示的に
   //   ringDownY(crossfadeRingが下限として使っているのと同じ値。ih が carousel の
-  //   屋根にぶつからないよう、上でRING_DOWN_DROPをさらに下げてある)へ移動させる。
+  //   屋根にぶつからないよう、universe.js側のRING_DOWN_DROPで下げてある)へ移動させる。
   universe.goldenRing.visible = true;
   universe.goldenRing.material.opacity = 1;
   universe.goldenRing.position.set(0, ringDownY, 0);
@@ -283,8 +284,8 @@ export function finishTripodRingSwap(swap) {
 
 // TODO:
 //   - PHASE_SWAP_END・IH_EDGE_FADE_RANGEはどちらも仮値です。見た目を見ながら調整してください。
-//   - RING_DOWN_DROP(=10)も仮値です。リングのcarousel側の下限をREST_Yからどれだけ
-//     下げるか、見た目を見ながら調整してください。
+//   - RING_DOWN_DROP(=14。universe.js側で定義)も仮値です。リングのcarousel側の下限を
+//     TRIPOD_GROUND_Yからどれだけ下げるか、見た目を見ながら調整してください。
 //   - tripodHitMesh(tripodクリック判定用、universe.js側でsceneに直接addされておりtripodAnchorの
 //     子ではない)は今回動かしていません。鏡側表示中にtripodHitMeshへのクリック判定が
 //     残ってしまう可能性があるので、必要であれば main.js側でswap.swappedを見て
