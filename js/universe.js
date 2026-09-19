@@ -192,6 +192,16 @@ const APEX_HEIGHT   = AXIS_LENGTH * Math.cos(TRIPOD_ANGLE_FROM_VERTICAL); // 頂
 // tripodRingSwap.js・main.js(銀河の配置)など他ファイルからも同じ基準を参照したいため定数化した。
 export const TRIPOD_GROUND_Y = 0;
 
+// ★ 2026-09-18 追加(ご指摘反映): リングの「下限」(carousel側の着地点)を、
+//   以前はtripodRingSwap.js側だけで閉じたローカル定数(RING_DOWN_Y)として持っていたが、
+//   ihの高さもこの値を直接基準にしたいため、ここ(universe.js)へ一元化した。
+//   tripodRingSwap.js側はこれをimportして使う(ローカル定義は削除済み)。
+//   ★ ここが調整箇所です: RING_DOWN_DROPを大きくするほどリングの下限は低く、
+//   小さくするほど高くなります(以前16→今回14に。「リングの下限をほんの少し高く」
+//   というご指示への対応)。
+export const RING_DOWN_DROP = 14; // 仮値。TRIPOD_GROUND_Yからどれだけ下げるか
+export const RING_DOWN_Y = TRIPOD_GROUND_Y - RING_DOWN_DROP;
+
 // 三軸の交点(頂点)。高さ軸(world Y)上に固定。
 const ORIGIN = new THREE.Vector3(0, APEX_HEIGHT, 0);
 
@@ -246,6 +256,20 @@ const RING_FADE_DURATION = 1.4;               // フェードインの秒数(仮
 //   設定する(新たにCubeCameraを増やすと重くなるため、既存の1つを使い回すため)。
 const RING_METALNESS = 1;
 const RING_ROUGHNESS = 0.28; // 仮値。鏡(0.05)ほどは滑らかにせず、金属らしい艶にした
+// ★ 2026-09-19 追加(ご指摘反映):「鏡tripodがほとんど何も映らない」への対応。
+//   原因は、鏡・このリングどちらが使っているenvMap(record.js側のCubeCamera)も、
+//   THREE.WebGLRenderer.render()を直接呼ぶだけの「素の」撮影だという点にあった。
+//   このプロジェクトの見た目の明るさ・賑やかさの大部分はcomposer側のBloom
+//   (UnrealBloomPass。main.js冒頭のexcludeFromBloom等を参照)が担っているが、
+//   CubeCamera.update()はcomposerを一切経由しないため、Bloom適用前の、実際よりずっと
+//   暗く・素っ気ない状態のシーンを撮影してしまう。これがそのままenvMapとして使われる
+//   ため、反射面(鏡・このリング)が「ほとんど何も映っていない」ように見えていた
+//   (Bloomは元から存在するので、これは今回に限らず以前から起きていた現象のはず)。
+//   Bloom込みで撮り直す(=CubeCameraをもう1系統composerで撮る)のは重くなりすぎるため、
+//   代わりに反射側のenvMapIntensityを底上げすることで、最終的な(Bloom込みの)画面に
+//   合成されたときの見え方を補っている。
+//   ★ ここが調整箇所です: 反射がまだ物足りない場合はこの値をさらに上げてください。
+export const REFLECTIVE_ENV_MAP_INTENSITY = 3.0; // 仮値。以前は鏡・リングとも未設定(既定の1)だった
 function makeGoldenRing() {
   const geometry = new THREE.TorusGeometry(TRIPOD_RADIUS, RING_TUBE_RADIUS, 16, 128);
   const material = new THREE.MeshStandardMaterial({
@@ -253,6 +277,7 @@ function makeGoldenRing() {
     metalness: RING_METALNESS,
     roughness: RING_ROUGHNESS,
     envMap: null,
+    envMapIntensity: REFLECTIVE_ENV_MAP_INTENSITY,
     transparent: true,
     opacity: 0,
   });
@@ -420,21 +445,29 @@ function spawnRoofParticle(universe, worldOrigin, worldTip, color) {
 // ★ プロパティ名はuniverse.ihSpriteのまま(main.js側の参照を変えずに済むように)残してあるが、
 //   実体はもうTHREE.Spriteではない点に注意。
 const IH_SVG_URL = new URL('./data/ih.svg', import.meta.url).href;
-const IH_WORLD_HEIGHT = 8.4;        // 表示の高さ(ワールド単位、仮値。以前の70%に縮小。幅はSVGの比率から自動計算)
+// ★ 2026-09-18 修正(ご指摘反映): 「ihを8割ぐらいに小さくして」への対応。以前の8.4から
+//   さらに0.8倍(=もとの56%)に縮小した。幅はSVGの比率から自動計算。
+const IH_WORLD_HEIGHT = 8.4 * 0.8;
 const IH_THICKNESS = IH_WORLD_HEIGHT * 10; // 押し出しの厚み(ExtrudeGeometryのdepth。ワールド単位、仮値。見ながら調整)
 const IH_ORBIT_RADIUS = TRIPOD_RADIUS * 0.85; // リングより「すこし内側」を周回する半径(仮値)
 // ★ 2026-09-12 修正(ご指示反映):「ihの高さがおかしいのでリングの上に配置して。ただし
 //   下振れの時にリングより低くならないよう少し高めに」への対応。ih側は絶対値ではなく
-//   「リングの高さ(universe.goldenRing.position.y。常にTRIPOD_GROUND_Yで固定)からの
-//   相対的な底上げ量」IH_ABOVE_RING_MARGINで決めている。下のIH_BOB_AMPLITUDEぶん
-//   上下にバウンスしてもリングを下回らないよう、IH_ABOVE_RING_MARGIN > IH_BOB_AMPLITUDE
-//   にしてある。
+//   「リングの下限(RING_DOWN_Y)からの相対的な底上げ量」IH_ABOVE_RING_MARGINで決めている。
+//   下のIH_BOB_AMPLITUDEぶん上下にバウンスしてもリングを下回らないよう、
+//   IH_ABOVE_RING_MARGIN > IH_BOB_AMPLITUDE にしてある。
 // ★ 2026-09-17 修正(ご指摘反映): 「carouselのihの位置が上にあるので下げて」への対応。
 //   IH_ABOVE_RING_MARGIN(=リングからの浮かせ量)が0.35と大きめだったため0.15へ下げた。
-//   ★ ここが調整箇所です: この値を大きくするほどリングから高く浮き、小さくするほど
+// ★ 2026-09-18 修正(ご指摘反映): 「ihの出現位置がリングの出現位置(=当時の
+//   universe.goldenRing.position.y)を基準にしていて高い」への対応。goldenRingは
+//   戴冠演出が終わるまでTRIPOD_GROUND_Y(=0)に隠れたまま動かないため、実際に画面に
+//   見えているリング(record.crossfadeRing)の下限より高い位置がihの基準になって
+//   しまっていた。updateIhOrbitPosition側の参照をuniverse.goldenRing.position.yから
+//   固定値RING_DOWN_Y(リングの下限。上で定義)へ変更したので、以後はここの値が
+//   「リングの下限からの浮かせ量」として素直に機能する。
+//   ★ ここが調整箇所です: この値を大きくするほどリングの下限から高く浮き、小さくするほど
 //   リングに近づきます。IH_BOB_AMPLITUDE(バウンス振幅)より必ず大きい値にしてください
 //   (小さくするとバウンスの下振れでリングに埋まって見えてしまいます)。
-const IH_ABOVE_RING_MARGIN = AXIS_LENGTH * 0.15; // リングの高さからどれだけ上に配置するか(仮値)
+const IH_ABOVE_RING_MARGIN = AXIS_LENGTH * 0.15; // リングの下限からどれだけ上に配置するか(仮値)
 const IH_ORBIT_SPEED = 0.35;        // 周回の角速度(ラジアン/秒、仮値)
 const IH_BOB_AMPLITUDE = AXIS_LENGTH * 0.12; // 上下バウンスの振幅(仮値。IH_ABOVE_RING_MARGINより必ず小さくすること)
 const IH_BOB_SPEED = 1.6;           // 上下バウンスの速さ(ラジアン/秒、仮値)
@@ -455,7 +488,7 @@ function updateIhOrbitPosition(universe) {
   const angle = universe.ihElapsed * IH_ORBIT_SPEED;
   const x = IH_ORBIT_RADIUS * Math.cos(angle);
   const z = IH_ORBIT_RADIUS * Math.sin(angle);
-  const y = universe.goldenRing.position.y + IH_ABOVE_RING_MARGIN + IH_BOB_AMPLITUDE * Math.sin(universe.ihElapsed * IH_BOB_SPEED);
+  const y = RING_DOWN_Y + IH_ABOVE_RING_MARGIN + IH_BOB_AMPLITUDE * Math.sin(universe.ihElapsed * IH_BOB_SPEED);
   universe.ihSprite.position.set(x, y, z);
 
   // 固定方向: カメラを追わず、「円の外側」(=中心軸から見た放射方向。惑星でいう遠心力の向き)へ
@@ -785,9 +818,20 @@ export function unlockIh(universe) {
 //    ぐるっと回転させる(座標変換のみ。線やジオメトリは増やしていない) ──
 // 頂点(ORIGIN)はこの軸の直上にあるため、回転させても頂点自体はワールド座標上で動かない。
 // 固定のワールド軸なので、カメラの向きに依存しない。そのためcameraは不要。
-const ANGULAR_SPEED = 0.18; // ラジアン/秒。仮値、見ながら調整してください
-// ↓ record.js側の鏡三角錐が「回転周期を共有」するためexportしてある(ご指示反映)。
-export const TRIPOD_ANGULAR_SPEED = ANGULAR_SPEED;
+// ★ 2026-09-19 修正(ご指摘反映): 「carousel回転も、太陽系の銀河公転速度に合わせて」
+//   への対応。以前は独自の固定値(0.18 rad/秒)だったが、universe.jsはsolarSystem.js/
+//   galaxy.js(TRIPOD_RADIUS・RECORD_ANCHORの参照元であり、両ファイルから見て
+//   「土台」となる基礎モジュール)なので、ここから直接solarSystem.jsのSUN_ORBIT_PERIODを
+//   importすると循環importになってしまう。そのため定数のままにはせず、`let`にして
+//   main.js側(galaxy.js・solarSystem.jsの両方を読み込んだ後)からsetTripodAngularSpeed()
+//   で一度だけ書き換えてもらう方式にした(export const TRIPOD_ANGULAR_SPEEDは
+//   record.jsが直接importして使っているが、ESモジュールのimportは「生きた参照」なので、
+//   ここで再代入すればrecord.js側からも常に最新の値が見える)。
+//   ★ ここが調整箇所です: 呼び出し元(main.js)を変えない場合の既定値は0.18のまま。
+export let TRIPOD_ANGULAR_SPEED = 0.18; // ラジアン/秒。仮値、見ながら調整してください
+export function setTripodAngularSpeed(value) {
+  TRIPOD_ANGULAR_SPEED = value;
+}
 
 const _roofWorldOrigin = new THREE.Vector3();
 const _roofWorldTip = new THREE.Vector3();
@@ -795,7 +839,7 @@ const ROOF_LEG_TIPS = [AXIS_TIPS.X, AXIS_TIPS.Y, AXIS_TIPS.Z];
 
 export function updateUniverse(universe, deltaSeconds, camera) {
   if (!universe.isActive) return;
-  const rotationDelta = -ANGULAR_SPEED * deltaSeconds;
+  const rotationDelta = -TRIPOD_ANGULAR_SPEED * deltaSeconds;
   universe.axesGroup.rotateOnWorldAxis(ROTATION_AXIS_DIR, rotationDelta);
 
   if (universe.roofPulseActive) {
