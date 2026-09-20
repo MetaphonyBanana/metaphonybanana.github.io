@@ -255,7 +255,7 @@ const RING_FADE_DURATION = 1.4;               // フェードインの秒数(仮
 //   universe.goldenRing.material.envMap = (鏡と同じrenderTarget.texture) を後から
 //   設定する(新たにCubeCameraを増やすと重くなるため、既存の1つを使い回すため)。
 const RING_METALNESS = 1;
-const RING_ROUGHNESS = 0.28; // 仮値。鏡(0.05)ほどは滑らかにせず、金属らしい艶にした
+const RING_ROUGHNESS = 0.0; // 仮値。鏡(0.05)ほどは滑らかにせず、金属らしい艶にした
 // ★ 2026-09-19 追加(ご指摘反映):「鏡tripodがほとんど何も映らない」への対応。
 //   原因は、鏡・このリングどちらが使っているenvMap(record.js側のCubeCamera)も、
 //   THREE.WebGLRenderer.render()を直接呼ぶだけの「素の」撮影だという点にあった。
@@ -467,7 +467,7 @@ const IH_ORBIT_RADIUS = TRIPOD_RADIUS * 0.85; // リングより「すこし内�
 //   ★ ここが調整箇所です: この値を大きくするほどリングの下限から高く浮き、小さくするほど
 //   リングに近づきます。IH_BOB_AMPLITUDE(バウンス振幅)より必ず大きい値にしてください
 //   (小さくするとバウンスの下振れでリングに埋まって見えてしまいます)。
-const IH_ABOVE_RING_MARGIN = AXIS_LENGTH * 0.15; // リングの下限からどれだけ上に配置するか(仮値)
+const IH_ABOVE_RING_MARGIN = AXIS_LENGTH * 0.35; // リングの下限からどれだけ上に配置するか(仮値)
 const IH_ORBIT_SPEED = 0.35;        // 周回の角速度(ラジアン/秒、仮値)
 const IH_BOB_AMPLITUDE = AXIS_LENGTH * 0.12; // 上下バウンスの振幅(仮値。IH_ABOVE_RING_MARGINより必ず小さくすること)
 const IH_BOB_SPEED = 1.6;           // 上下バウンスの速さ(ラジアン/秒、仮値)
@@ -514,6 +514,7 @@ function makeAxisTipLabel(name, tip) {
   const dir = tip.clone().sub(ORIGIN).normalize();
   sprite.position.copy(tip).addScaledVector(dir, AXIS_LABEL_OFFSET);
   sprite.material.opacity = 0; // 軸線・数式と一緒にフェードインさせる(enterUniverse側)
+  sprite.userData.axisName = name; // ← 追加: クリック判定(main.js側)でX/Y/Zを区別するため
   return sprite;
 }
 
@@ -991,7 +992,6 @@ export function toggleUniverseEquation(universe) {
 }
 
 // TODO:
-//     0°に近いほど3本が高さ軸に沿って細く立ち、90°に近いほど平べったく広がる。見ながら調整してください。
 //   - AXIS_LABEL_OFFSET / AXIS_LABEL_WORLD_SIZE(ラベルの位置・サイズ)も仮値です。
 //   - EQUATION_WORLD_WIDTH / EQUATION_HEIGHT_ABOVE_APEX / ANGULAR_SPEED は仮値。実際に見て調整してください。
 //   - EQUATION_COLOR_HOVER / EQUATION_HOVER_RADIUS_PX(マウス接近での色変化)も仮値。
