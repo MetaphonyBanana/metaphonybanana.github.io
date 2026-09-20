@@ -47,7 +47,7 @@ export const GALAXY_RADIUS = TRIPOD_RADIUS *8; // 「巨大」なので、tripod
 // ↑ record.js側がNEEDLE_START_RADIUS(針先=太陽の出発点を「銀河の周縁側」に置く)の
 //   計算に参照するためexportした。
 const GALAXY_BRANCHES = 9;          // 渦の腕の本数
-const GALAXY_SPIN = -8.4;           // 半径に対する巻き付きの強さ(符号を反転=渦の巻き方向を逆に)
+const GALAXY_SPIN = -6.5;           // 半径に対する巻き付きの強さ(符号を反転=渦の巻き方向を逆に)。以前(-8.4)より少し弱めた(仮値)
 const GALAXY_RANDOMNESS = 0.75;     // 腕からのブレの強さ(半径に対する比率)
 const GALAXY_RANDOMNESS_POWER = 4;  // 大きいほど「腕の近くに密集・稀に大きく外れる」分布になる
 const GALAXY_FLATTEN = 0.25;        // 円盤の厚み(Y方向だけXZより浅くする比率)
@@ -216,6 +216,13 @@ function buildGalaxyGeometry(innerRadius = 0) {
   const scales = new Float32Array(totalCount);
   const alphas = new Float32Array(totalCount);
   const armWeights = new Float32Array(totalCount);
+  // ★ 追加: 銀河俯瞰時の差動回転(setGalaxyDifferentialRotation。中心に近いほど
+  //   角速度を速くする)で、毎フレームpositionを再計算するために必要な、粒子ごとの
+  //   半径・基準角度(branchAngle+spinAngle)・(x,z)方向のランダムオフセットを保持する。
+  const diffRadius = new Float32Array(totalCount);
+  const diffBaseAngle = new Float32Array(totalCount);
+  const diffRandomX = new Float32Array(totalCount);
+  const diffRandomZ = new Float32Array(totalCount);
 
   // 外周/内周のフェード幅(ワールド単位)。0除算を避けるため下限を持たせる。
   const outerFadeWidth = Math.max(GALAXY_RADIUS * GALAXY_OUTER_FADE, 1e-6);
@@ -254,6 +261,11 @@ function buildGalaxyGeometry(innerRadius = 0) {
     positions[i3 + 1] = randomY;
     positions[i3 + 2] = z;
 
+    diffRadius[i] = radius;
+    diffBaseAngle[i] = branchAngle + spinAngle;
+    diffRandomX[i] = randomX;
+    diffRandomZ[i] = randomZ;
+
     const mixedColor = GALAXY_INSIDE_COLOR.clone().lerp(GALAXY_OUTSIDE_COLOR, radius / GALAXY_RADIUS);
     colors[i3] = mixedColor.r;
     colors[i3 + 1] = mixedColor.g;
@@ -283,6 +295,12 @@ function buildGalaxyGeometry(innerRadius = 0) {
   geometry.setAttribute('aScale', new THREE.BufferAttribute(scales, 1));
   geometry.setAttribute('aAlpha', new THREE.BufferAttribute(alphas, 1));
   geometry.setAttribute('aArmWeight', new THREE.BufferAttribute(armWeights, 1));
+  geometry.userData.diffRotationData = {
+    radius: diffRadius,
+    baseAngle: diffBaseAngle,
+    randomX: diffRandomX,
+    randomZ: diffRandomZ,
+  };
   return geometry;
 }
 
@@ -434,6 +452,11 @@ export function createGalaxy(scene, anchor) {
     //   ジャンプ)とは別に、通常速度に対する「掛け算の倍率」だけを持たせておき、
     //   setGalaxySpinBoost()で自由な値に変えられるようにした。
     spinBoost: 1,
+    // ★ 追加: 銀河俯瞰時、アームを置くまでの間だけ「中心に近いほど角速度を速く」
+    //   する差動回転を有効にするためのフラグと、粒子ごとの累積回転角(通常の
+    //   剛体回転=starsGroup.rotateOnWorldAxisとは別に、position属性へ直接焼き込む)。
+    diffRotationActive: false,
+    diffAngleOffset: new Float32Array(GALAXY_PARTICLE_COUNT),
   };
 }
 
@@ -448,8 +471,58 @@ export function revealGalaxy(galaxy) {
 // ── 毎フレーム呼ぶ: 銀河をworld Yまわりに自転させる(state==='idle'の間) ──
 export function updateGalaxy(galaxy, deltaSeconds) {
   if (!galaxy || galaxy.state === 'hidden') return;
+  if (galaxy.diffRotationActive) {
+    updateGalaxyDifferentialRotation(galaxy, deltaSeconds);
+    return; // この間は通常の剛体回転(starsGroup全体を一括rotate)はかけない
+  }
   const magnitude = galaxy.needleSpinActive ? NEEDLE_SPIN_MAGNITUDE : ANGULAR_SPEED * (galaxy.spinBoost ?? 1);
   galaxy.starsGroup.rotateOnWorldAxis(ROTATION_AXIS_DIR, ROTATION_DIRECTION * magnitude * deltaSeconds);
+}
+
+// ── 銀河俯瞰時: 中心に近いほど角速度を速くする差動回転(実際の銀河のイメージ) ──
+// 剛体回転(starsGroup全体を一括rotate)だと全粒子が同じ角速度になってしまうため、
+// この間だけ粒子ごとにradiusに応じた角速度でposition属性を直接書き換える。
+// ω(r) = ANGULAR_SPEED * GALAXY_RADIUS / r としており、外周(r=GALAXY_RADIUS)では通常の
+// ANGULAR_SPEEDに一致し、中心に近づくほど速くなる(実際の銀河の回転曲線がほぼ平坦な
+// ことの簡易的な近似)。中心付近で角速度が発散しないよう下限半径を設けている。
+const GALAXY_DIFF_MIN_RADIUS_RATIO = 0.06; // GALAXY_RADIUSに対する比率(仮値)
+function updateGalaxyDifferentialRotation(galaxy, deltaSeconds) {
+  const geometry = galaxy.points.geometry;
+  const data = geometry.userData.diffRotationData;
+  if (!data) return; // 念のため(データを持たない古いジオメトリ等)
+  const { radius, baseAngle, randomX, randomZ } = data;
+  const positionAttr = geometry.attributes.position;
+  const posArray = positionAttr.array;
+  const angleOffset = galaxy.diffAngleOffset;
+  const minRadius = GALAXY_RADIUS * GALAXY_DIFF_MIN_RADIUS_RATIO;
+  const count = radius.length;
+  for (let i = 0; i < count; i++) {
+    const r = radius[i];
+    const omega = ANGULAR_SPEED * (GALAXY_RADIUS / Math.max(r, minRadius));
+    // ★ 符号に関する注意: rotateOnWorldAxis(Y軸, θ)による剛体回転は、内部的には
+    //   x' = x*cosθ + z*sinθ / z' = -x*sinθ + z*cosθ という変換であり、これは
+    //   ここで使っている極座標表現(x=cosφ*r, z=sinφ*r)のφをθぶん"減らす"操作に
+    //   相当する(符号が逆)。そのため剛体回転と見た目の回転方向を一致させるには、
+    //   ここでのφの増分にはROTATION_DIRECTIONの符号を反転させたものを使う必要がある
+    //   (このマイナスが無いと、俯瞰時(差動回転)だけ回転方向が逆になってしまう)。
+    angleOffset[i] += -ROTATION_DIRECTION * omega * deltaSeconds;
+    const angle = baseAngle[i] + angleOffset[i];
+    const i3 = i * 3;
+    posArray[i3] = Math.cos(angle) * r + randomX[i];
+    posArray[i3 + 2] = Math.sin(angle) * r + randomZ[i];
+  }
+  positionAttr.needsUpdate = true;
+}
+
+// main.js側: 最後の銀河俯瞰(enterGalaxyOverview)に到達したタイミングでtrueにし、
+// record.js側: トーンアームを置いた(placeTonearmOnRecord)タイミングでfalseに戻す
+// (=通常の剛体回転の「現状の仕様」へ復帰する)。
+export function setGalaxyDifferentialRotation(galaxy, active) {
+  if (!galaxy) return;
+  galaxy.diffRotationActive = !!active;
+  if (galaxy.diffRotationActive) {
+    galaxy.diffAngleOffset.fill(0); // 有効化のたびリセット(累積のズレを防ぐ)
+  }
 }
 
 // トーンアーム(record.js側)が針を置いたときなど、銀河の自転速度を通常のANGULAR_SPEEDに
