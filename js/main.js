@@ -45,9 +45,9 @@ const SAGITTARIUS_MESSAGE = { text: 'Shirley you said you were sagitarius\nbut y
 // ★ 追加: 宇宙ページのtripod(universe.axesGroup)先端に付いているX/Y/Zラベルをクリックした
 //   ときに表示するメッセージ。text/workともに後で実際の文言に差し替える(今は空のプレースホルダー)。
 const AXIS_TIP_MESSAGES = {
-  X: { text: '', work: '' },
-  Y: { text: '', work: '' },
-  Z: { text: '', work: '' },
+  X: { text: 'Gimme the pieces', work: 'The Cacther in the Rye' },
+  Y: { text: 'Life is a gift horse in my opinion', work: 'Teddy' },
+  Z: { text: 'When the horse arrived, it turned out indeed to be a superlative animal.', work: 'Raise High the Roof Beam, Carpenters' },
 };
 
 // 隠しボタン「i」(虚数単位)をクリックしたときに表示するメッセージ。
