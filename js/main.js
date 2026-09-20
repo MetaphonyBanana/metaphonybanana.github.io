@@ -28,7 +28,7 @@ import { createEquationAssembly, startPhase1, zoomToEquation, startPhase3 } from
 import { playOriginBurst } from './originBurst.js';
 import { createUniverse, enterUniverse, toggleUniverseEquation, updateUniverse, updateEquationHoverByPointer, revealTripodRing, liftTripod, startTripodRoofPulse, createUniverseProjectionMixer, unlockIh, setTripodAngularSpeed } from './universe.js';
 import { createSolarSystem, updateSolarSystem, generatePlanetTrails, ORBIT_CENTER } from './solarSystem.js';
-import { createGalaxy, updateGalaxy, revealGalaxy, setGalaxyArmEmphasis, ANGULAR_SPEED as GALAXY_ANGULAR_SPEED, ROTATION_DIRECTION as GALAXY_ROTATION_DIRECTION } from './galaxy.js';
+import { createGalaxy, updateGalaxy, revealGalaxy, setGalaxyArmEmphasis, setGalaxyDifferentialRotation, ANGULAR_SPEED as GALAXY_ANGULAR_SPEED, ROTATION_DIRECTION as GALAXY_ROTATION_DIRECTION } from './galaxy.js';
 import { createTripodRingSwap, updateTripodRingSwap, finishTripodRingSwap } from './tripodRingSwap.js';
 import {
   createRecordDisplay, startRecordDisplay, tryRecordClick, updateRecordDisplay,
@@ -41,6 +41,14 @@ const BILLIARD_CAMERA_TARGET = new THREE.Vector3(AXIS_LENGTH / 2, AXIS_LENGTH / 
 const BILLIARD_TRANSITION_DURATION = 1.3; // yzPanel.js のRIPPLE_SPEEDと揃えている(パネル対角線を走り抜ける時間)
 
 const SAGITTARIUS_MESSAGE = { text: 'Shirley you said you were sagitarius\nbut your only taurus bring your skates\nwhen you come over to my house', work: 'The Catcher in the Rye'}
+
+// ★ 追加: 宇宙ページのtripod(universe.axesGroup)先端に付いているX/Y/Zラベルをクリックした
+//   ときに表示するメッセージ。text/workともに後で実際の文言に差し替える(今は空のプレースホルダー)。
+const AXIS_TIP_MESSAGES = {
+  X: { text: '', work: '' },
+  Y: { text: '', work: '' },
+  Z: { text: '', work: '' },
+};
 
 // 隠しボタン「i」(虚数単位)をクリックしたときに表示するメッセージ。
 // 今は仮のプレースホルダーなので、実際の演出(別ページ遷移・特別なダイアログ等)に合わせて差し替えてください。
@@ -370,6 +378,16 @@ function enterGalaxyOverview() {
   //   telescopeモードに入った(=最後の俯瞰画面に到達した)このタイミングで、
   //   銀河の固定3本の腕を太く・明るく強調し始める。
   growGalaxyArms();
+
+  // ★ トーンアーム(ガラス製。record.js側で位置決めまで実装済み)は、以前は銀河出現と
+  //   同時に早々と表示していたが、「最後の銀河俯瞰時に出現していれば十分」とのご指示で
+  //   ここ(telescopeモード突入時)まで表示を遅らせるように変更した。
+  if (record.tonearm) record.tonearm.visible = true;
+
+  // ★ 追加(ご指示反映): 「銀河俯瞰時は、実際の銀河のように中心に近いほど角速度を
+  //   速くしたい。アームを置いたら現状の仕様(剛体回転)へ戻す」への対応。
+  //   アームを置く(placeTonearmOnRecord)側でfalseに戻す。
+  setGalaxyDifferentialRotation(galaxy, true);
 
   const startPos = camera.position.clone();
   const startFov = camera.fov;
@@ -725,6 +743,39 @@ Object.assign(transitionOverlay.style, {
 });
 document.body.appendChild(transitionOverlay);
 
+// ★ 追加: 宇宙ページのtripod先端のX/Y/Zラベルをクリックしたときに出す、画面固定位置の
+//   テキスト表示。dialogue.js(dialogue.show)は3Dオブジェクトに追従する吹き出しなので、
+//   「画面中央・上から70%」という完全固定の配置には向かないため、ここだけ専用の
+//   シンプルなDOM要素で表示する。
+const axisTipTextBox = document.createElement('div');
+Object.assign(axisTipTextBox.style, {
+  position: 'fixed',
+  left: '50%',
+  top: '70%',
+  transform: 'translate(-50%, -50%)',
+  maxWidth: '80vw',
+  padding: '0.6em 1em',
+  color: '#fff',
+  font: '400 1.1rem/1.6 serif',
+  textAlign: 'center',
+  whiteSpace: 'pre-line',
+  textShadow: '0 0 8px rgba(0,0,0,0.8)',
+  pointerEvents: 'none',
+  zIndex: '500',
+  display: 'none',
+});
+document.body.appendChild(axisTipTextBox);
+
+function showAxisTipText(message) {
+  if (!message || !message.text) return;
+  axisTipTextBox.textContent = message.work ? `${message.text}\n— ${message.work}` : message.text;
+  axisTipTextBox.style.display = 'block';
+}
+function hideAxisTipText() {
+  axisTipTextBox.style.display = 'none';
+}
+
+
 function fadeTransition({ fadeInDuration = 0.3, hold = 0.15, fadeOutDuration = 0.3, onMid, onDone } = {}) {
   transitionOverlay.style.transition = `opacity ${fadeInDuration}s ease`;
   transitionOverlay.style.opacity = '1';
@@ -777,6 +828,16 @@ renderer.domElement.addEventListener('click', (e) => {
           return;
         }
 
+        // ★ 追加: tripod先端のX/Y/Zラベル(universe.axisLabels)クリック→固定位置にテキスト表示。
+        //   tripodHitMesh(当たり判定用の大きな球)より先に判定しないと、ラベルへのクリックが
+        //   そちらに食われてしまうため、この位置(tripodHit判定より前)に置く。
+        const axisTipHit = raycaster.intersectObjects(universe.axisLabels)[0];
+        if (axisTipHit) {
+          const axisName = axisTipHit.object.userData.axisName;
+          showAxisTipText(AXIS_TIP_MESSAGES[axisName]);
+          return;
+        }
+
         // tripodクリック → 金のリングが地面に形成され、tripod自体が浮上し、
         // tripodが回転しながら粒子の軌跡(円錐)を永久に残し始める。
         // ★ 2026-09-12 変更(ご指示反映): ih.pngの出現/消滅は、ここでのクリック+タイマーでは
@@ -824,6 +885,7 @@ renderer.domElement.addEventListener('click', (e) => {
             return;
           }
         }
+        hideAxisTipText(); // ラベル以外をクリックしたら固定表示のテキストは閉じる
         return; // 宇宙ページ内では、ここまでの判定以外は無視
       }
 
@@ -856,6 +918,24 @@ renderer.domElement.addEventListener('click', (e) => {
           // 旧要素を即座に消灯し、カメラも切り替える。
           fadeTransition({
             onMid: () => {
+              // ★ 2026-09-18 追加(バグ修正): 「たまにuniverse開始時にカメラ位置が
+              //   おかしくなる(Yが524.4x付近などに固定される)」の根本原因。
+              //   p3.busyが立つ前に連打などで一瞬だけこの分岐を2回通ってしまうと、
+              //   fadeTransition(≒このonMid)が2回発火することがある。1回目は
+              //   setProjectionMix(0)(camera.positionをorthoPos、fovを2へ)の直後に
+              //   enterUniverse()が呼ばれ、まだuniverse.isActiveがfalseなので
+              //   camera.positionが正しくUNIVERSE_CAMERA_POSへ上書きされる。ところが
+              //   2回目は、setProjectionMix(0)は無条件でまた実行されてcamera.position
+              //   をorthoPos(≈524,524,524)へ戻してしまうのに、enterUniverse()側は
+              //   「if (universe.isActive) return;」という(正しい)多重発火防止が
+              //   既にあるため何もせず、camera.positionを正しい値へ戻す機会が
+              //   失われる。結果、animate()側の銀河同期回転がこのorthoPosを
+              //   UNIVERSE_CAMERA_TARGETまわりに回し続け、Y(=world Y軸回転で
+              //   変化しない成分)がorthoPosのY成分(≈524.4)に固定されたまま、という
+              //   ご報告の症状になっていた。
+              //   enterUniverse自身と同じ「universe.isActiveなら何もしない」という
+              //   ガードをここにも揃えることで、2回目以降の発火そのものを無害化する。
+              if (universe.isActive) return;
               axes.fadeOut(0.1); // オーバーレイが晴れる前に消え切るよう、ごく短時間に
               axisLabels.hide();
               const oldSprites = [
@@ -913,9 +993,9 @@ renderer.domElement.addEventListener('click', (e) => {
                   //   銀河本体には(内部バナナも含め)クリック対象は無く、以後この銀河
                   //   自体を拡大・縮小する操作はない(常にこのフルサイズのまま)。
                   revealGalaxy(galaxy);
-                  // ★ 2026-09-17 追加(ご指示反映): トーンアーム(ガラス製。record.js側で
-                  //   位置決めまで実装済み)も銀河と同じタイミングで表示する。
-                  record.tonearm.visible = true;
+                  // ★ トーンアーム(ガラス製)は、最後の銀河俯瞰(telescopeモード。
+                  //   enterGalaxyOverview)に到達したタイミングでのみ表示するように変更した
+                  //   (以前は銀河出現と同時に早々と表示していた)。
                   // universe開始時点のセリフ差し替え。
                   const axisHint2 = document.getElementById('axisHint');
                   if (axisHint2) axisHint2.textContent = 'What is the sound of two hands clapping?';
@@ -1259,11 +1339,19 @@ function animate() {
   //   setUniverseProjectionMix側が直接制御しているため競合するし、確定後(通常の
   //   透視図に切り替わった状態)は「銀河を背景として固定する」演出自体が終わっている
   //   フェーズなので、回転を続ける意味がない。
-  // ★ 2026-09-12 追加: この銀河同期回転ブロックで過去に実際に発生したバグ(変数宣言の
-  //   消失によるReferenceError)が、animate()全体を毎フレーム静かにクラッシュさせ、
-  //   render()が二度と呼ばれず「画面が固まる」という気づきにくい形の不具合になっていた
-  //   (エラーはconsoleには出るが、画面上は「PHASE3の視点で止まって見える」だけなので
-  //   気づきにくい)。再発した場合に画面全体を巻き込まないよう、try/catchで隔離する。
+  //   ★ 2026-09-18 訂正: 一度は「record.phase==='inactive'の間だけ」というガードを
+  //   試したが、record.phaseはenterUniverse完了とほぼ同時(startRecordDisplay)に
+  //   'mirror'になり、ユーザーが実際にcarouselを眺めている間ずっと'mirror'のまま
+  //   なので、このガードだと自動回転が最初から一切動かなくなってしまっていた
+  //   (「カメラが固定され、銀河だけが回っているように見える」というご指摘の症状)。
+  //   record/鏡tripodの表示(HOME_CAMERA_POS基準の小さいスケール)とuniverseの銀河・
+  //   tripod表示(UNIVERSE_CAMERA_POS基準の大きいスケール)は別々のカメラ位置を
+  //   同じ`camera`オブジェクトに対して指定するが、両者は同時に成立するものであり、
+  //   record.phaseの値では「今どちらの視点にすべきか」を判定できないと判明した
+  //   ため、このガードは撤去した。
+  //   本当の原因はcamera.position自体が(setProjectionMix(0)の多重発火により)
+  //   壊れていたことだったので、そちらをonMid側で修正済み(上記2026-09-18の
+  //   コメント参照)。
   try {
     if (universe.isActive && !projectionDragActive && !record.perspectiveActive && !overviewActive) {
       const relative = camera.position.clone().sub(UNIVERSE_CAMERA_TARGET);
@@ -1277,8 +1365,16 @@ function animate() {
   } catch (err) {
     console.error('universe camera auto-rotate failed:', err);
   }
-  updateRecordDisplay(record, delta, controls); // 鏡の反射撮影+スクロールに応じた画面切り替え+三角錐の自転(メインのrender()より前)
+  // ★ バグ修正: 以前はupdateRecordDisplay→updateTripodRingSwapの順で呼んでいたが、
+  //   record.mirrorVisualAnchorの position/visible/quaternion を「今フレーム分」確定させる
+  //   のはupdateTripodRingSwap側であり、updateRecordDisplay側(鏡の可視判定・cubeCameraの
+  //   位置合わせ・撮影)はそれを読むだけの下流の処理。順序が逆だったため、
+  //   updateRecordDisplayは常に「1フレーム前の(まだupdateTripodRingSwapが更新する前の)」
+  //   古いvisible/positionを見て動いてしまっていた
+  //   (可視になった直後の1フレームは、visible=falseのまま判定されて撮影自体がスキップされる、
+  //   など)。依存関係の順番通りに呼ぶよう入れ替える。
   updateTripodRingSwap(tripodRingSwap, camera); // 「二つのtripod・二つの円環」のクロスフェード+移動(record.viewMixCurrentに連動)
+  updateRecordDisplay(record, delta, controls); // 鏡の反射撮影+スクロールに応じた画面切り替え+三角錐の自転(メインのrender()より前)
   updateOverviewCameraHeight(delta); // ★ 2026-09-16追加: 銀河俯瞰(telescope)中、スクロール高さをなめらかに追従させる
   // ご指示「carouselとrecordは可視、不可視の関係」の反映: 画面がどちら向きかに応じて、
   // 互いの見た目(carousel側の粒子/ih、record側のbanana搭載mirrorGroup)を排他的に切り替える。
