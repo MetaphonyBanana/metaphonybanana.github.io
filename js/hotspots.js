@@ -94,13 +94,22 @@ function getStarburstTexture() {
     ctx.restore();
   }
 
-  const R = size * 0.5;
+  // ★ 修正: 以前はR = size*0.5(キャンバスの縁ぎりぎり)まで伸ばしていたため、横・縦の
+  //   スパイクが正方形の縁に接する形になり、Bloomでぼかした際に角ばりが出る原因になって
+  //   いた。縁に接しないよう少し短くする。
+  const R = size * 0.42;
   drawSpike(0, R, size * 0.05);              // 横(太め・長め)
   drawSpike(Math.PI / 2, R, size * 0.05);    // 縦(太め・長め)
   drawSpike(Math.PI / 4, R * 0.7, size * 0.022);      // 斜め(細め・短め)
   drawSpike(-Math.PI / 4, R * 0.7, size * 0.022);     // 斜め(細め・短め)
 
   const tex = new THREE.CanvasTexture(canvas);
+  // ★ 修正: generateMipmapsを無効化していなかったため、既定のミップマップ自動生成
+  //   (正方形ブロック単位での平均化)によって縮小時に角ばりがにじみ出ていた。
+  //   stars.js等の他のテクスチャと同様、明示的に無効化する。
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
   tex.needsUpdate = true;
   starburstTextureCache = tex;
   return tex;
@@ -120,6 +129,9 @@ export function createHotspots(scene) {
     const m = new THREE.Mesh(geo, mat);
     m.position.set(...h.pos);
     m.userData.texts = h.text;
+    // ★ 追加: main.js側で「テクスチャだけの発光にする(=Bloomを一切かけない)」対応の
+    //   ため、starburstのメッシュだけ判別できるようにタグ付けしておく。
+    if (isStarburst) m.userData.isStarburst = true;
 
     if (isStarburst) {
       const spriteMat = new THREE.SpriteMaterial({
