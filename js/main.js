@@ -5,6 +5,7 @@ import {
   HOME_CAMERA_POS, HOME_CAMERA_TARGET,
 } from './config.js';
 import { createSceneSetup } from './sceneSetup.js';
+import { attachScrollDrivenRain } from './waveSurfacePass.js';
 import { createStars } from './stars.js';
 import { createSagittarius } from './sagittarius.js';
 import { createArcherArt } from './archerArt.js';
@@ -18,6 +19,7 @@ import { createBilliardTable } from './billiardTable.js';
 import { createBananafish } from './bananafish.js';
 import { createHotspots } from './hotspots.js';
 import { createDialogue } from './dialogue.js';
+import { createCaptionBox, makeCaptionController, getSourceCaption } from './captions.js';
 import { createIntroSequence } from './introSequence.js';
 import { getAxisStationView, flyToAxisStation, UNIVERSE_CAMERA_POS, UNIVERSE_CAMERA_TARGET } from './config.js';
 import { createAxisStationOverlay } from './axisStationOverlay.js';
@@ -30,6 +32,7 @@ import { createUniverse, enterUniverse, toggleUniverseEquation, updateUniverse, 
 import { createSolarSystem, updateSolarSystem, generatePlanetTrails, ORBIT_CENTER } from './solarSystem.js';
 import { createGalaxy, updateGalaxy, revealGalaxy, setGalaxyArmEmphasis, setGalaxyDifferentialRotation, ANGULAR_SPEED as GALAXY_ANGULAR_SPEED, ROTATION_DIRECTION as GALAXY_ROTATION_DIRECTION } from './galaxy.js';
 import { createTripodRingSwap, updateTripodRingSwap, finishTripodRingSwap } from './tripodRingSwap.js';
+import { createTiltShift } from './tiltShift.js';
 import {
   createRecordDisplay, startRecordDisplay, tryRecordClick, updateRecordDisplay,
   applyScroll, SCROLL_MAX,
@@ -45,7 +48,7 @@ const SAGITTARIUS_MESSAGE = { text: 'Shirley you said you were sagitarius\nbut y
 // ★ 追加: 宇宙ページのtripod(universe.axesGroup)先端に付いているX/Y/Zラベルをクリックした
 //   ときに表示するメッセージ。text/workともに後で実際の文言に差し替える(今は空のプレースホルダー)。
 const AXIS_TIP_MESSAGES = {
-  X: { text: 'Gimme the pieces', work: 'The Cacther in the Rye' },
+  X: { text: 'Gimme the pieces.', work: 'The Catcher in the Rye' },
   Y: { text: 'Life is a gift horse in my opinion', work: 'Teddy' },
   Z: { text: 'When the horse arrived, it turned out indeed to be a superlative animal.', work: 'Raise High the Roof Beam, Carpenters' },
 };
@@ -94,7 +97,17 @@ function flyCameraLinear(camera, controls, targetPos, targetLookAt, duration, on
 }
 
 // ── シーン一式のセットアップ ─────────────────────
-const { scene, camera, renderer, controls, composer, lookTarget, excludeFromBloom, render, setProjectionMix } = createSceneSetup();
+const { scene, camera, renderer, controls, composer, lookTarget, excludeFromBloom, includeInRoundBloom, render, setProjectionMix, wavePass } = createSceneSetup();
+// 波面(雨紋+屈折)をスクロール操作に連動させる。
+// ※ この対応付け(一定速度で丁寧に操作するほど水面が落ち着く)は現時点の案であり、
+//   「スクロールで雨が降り出し静止で止む」等に変える場合はattachScrollDrivenRainの
+//   中身(waveSurfacePass.js側)だけを差し替えればよい。
+const waveScrollController = attachScrollDrivenRain({ field: wavePass });
+// ★ 追加: 最後の俯瞰スクロールで、カメラが最も低い間だけcarouselの範囲にピントを合わせ、
+//   その上下をぼかす「ティルトシフト」(tiltShift.js)。composerの後段にパスを差し込むだけで、
+//   strength=0の間はパス自体が無効化されるので、他の場面には一切影響しない。
+const tiltShift = composer ? createTiltShift(composer) : null;
+if (!tiltShift) console.warn('composerが取得できないため、ティルトシフトは無効です。');
 // ★ 2026-09-12 追加: OrbitControlsは既定で「右ボタンドラッグ=パン」を持っているが、
 //   右ボタンは全面的にこちらの独自の右ドラッグ処理(疑似正射影⇄透視図の切り替え。
 //   universe.isActive中のみ有効)専用にしたいので、OrbitControls側の右ボタン機能は
@@ -105,15 +118,28 @@ if (controls) controls.mouseButtons.RIGHT = null;
 const setUniverseProjectionMix = createUniverseProjectionMixer(camera);
 
 const starField = createStars(scene, 3000);
-// originBurst.jsのフラッシュと同じ考え方: Bloomに頼らず、テクスチャ自体の
-// 光暈(halo)だけで発光して見えるように点を十分大きく作る。Bloomは点が
-// 小さいと(UnrealBloomPassのミップ縮小アルゴリズムの弱点で)必ず四角さが
-// ぶり返すため、完全除外して"Bloomの土俵"に一切乗らないようにする。
+// ★ 変更: 以前はstars.js側で焼き込みテクスチャに光暈まで含めて作り、Bloomから完全除外する
+//   ことで「常に丸い」ことだけを担保していたが、実際の明るさに反応しない静的な発光では
+//   物足りないとのご指摘を受け、方針を変更した。
+//   → 本物のUnrealBloomPass(bloomComposer)からは引き続き除外する(小さい点だと
+//   低解像度ミップのせいで必ず光暈が四角くなるため)一方、新設した「丸いBloom」
+//   パイプライン(sceneSetup.js。閾値抽出+十分な解像度の分離ガウシアン)には含める。
+//   これで、実際の明るさ・強度パラメータに動的に反応しつつ、常に丸いままの発光になる。
 excludeFromBloom(starField.mesh);
+includeInRoundBloom(starField.mesh);
 
 const clock = new THREE.Clock();
 
 const hotspotMeshes = createHotspots(scene);
+// ★ 追加(ご質問反映): starburst(Phoebeの星)は、他の通常hotspotと違って既に
+//   canvasに焼き込んだ十字スパイクのスプライト(AdditiveBlending)を重ねてあり、
+//   それ単体で十分に「眩しい星」に見える作りになっている。この星の核メッシュに
+//   Bloomをかけると、核自体の小さな球がUnrealBloomPassの低解像度ミップのせいで
+//   四角い光暈を作ってしまう(hotspots.js側の修正=spikeを縁に接しないよう縮める+
+//   ミップマップ無効化、と合わせて、ここではBloom自体を完全に切ることで対応する)。
+//   核・スプライトどちらもm(核メッシュ)の子として一体なので、excludeFromBloom(m)一発で
+//   両方ともBloom専用パスから除外される→発光は完全にテクスチャだけに委ねられる。
+hotspotMeshes.filter((m) => m.userData.isStarburst).forEach((m) => excludeFromBloom(m));
 
 const finale = createFinale(scene);
 let finaleActive = false; // フィナーレ開始後はcameraBusy/controlsとは別に、全インタラクションを止める
@@ -260,7 +286,11 @@ renderer.domElement.addEventListener('wheel', (e) => {
 //     さらに狭めた(6→2)。
 const OVERVIEW_ELEVATION_MAX_DEG = 50;    // ご指定値。仰角を0°〜この角度まで動かす
 const OVERVIEW_HEIGHT_SMOOTHING = 3.0;    // 仮値。スクロールでの仰角変化をなめらかにする係数(record.jsのVIEW_MIX_SMOOTHINGと同じ流儀)
-const OVERVIEW_TRANSITION_DURATION = 1.2; // 仮値。銀河俯瞰(=telescopeの基準姿勢)へ最初に戻すフライトの秒数
+// ★ 追加(ご指示反映): 「銀河俯瞰モードに入るとき・左右ドラッグを解除したときのカメラの速度を
+//   5%まで大幅に減速」。下の2つの所要時間(フライト・fov復帰)を、この比率で割って引き伸ばす
+//   (0.05なら20倍の時間=ゆっくり)。1にすると元の速さ。
+const OVERVIEW_CAMERA_SPEED_RATIO = 0.05;
+const OVERVIEW_TRANSITION_DURATION = 1.2 / OVERVIEW_CAMERA_SPEED_RATIO; // 銀河俯瞰(=telescopeの基準姿勢)へ最初に戻すフライトの秒数(元1.2秒→24秒)
 const OVERVIEW_SCROLL_RANGE = 1200;       // 仮値。この累積スクロール量で仰角が0°⇔MAXまで振れる
 // ★ 2026-09-16 7回目の修正(ご指摘反映): 「デフォルトのfovが大きすぎるし、拡大限度も
 //   小さい」への対応。前回のtanベースの倍率計算は、結局「基準fovが広すぎる」問題を
@@ -268,10 +298,18 @@ const OVERVIEW_SCROLL_RANGE = 1200;       // 仮値。この累積スクロー�
 //   それぞれ直接の角度指定に戻し、基準を大きく狭め、最大ズームもより強くした。
 //   (前々回、fov=2という極端な値を「バグの原因では」と疑ったが、実際の原因は
 //   ドラッグ判定側にあったと判明したため、狭いfov自体は問題ない)
-const OVERVIEW_FOV_BASE = 35;             // 仮値。銀河俯瞰時の既定(ドラッグしていない)fov。以前(70)より大幅に狭めた
+const OVERVIEW_FOV_BASE = 35;             // 銀河俯瞰時の既定(ドラッグしていない)fov。
+// ★ 追加(ご指摘反映): 「視点が遠い(=ドラッグしていない基準fov)と明るすぎる」への対応。
+//   左右ドラッグでfovを望遠側へズームする操作に、カメラの絞り(露出)の変化を連動させる。
+//   ドラッグしていない基準状態(=fov広角・視点が遠い)ほど絞って暗く、目一杯ドラッグして
+//   ズームした状態(望遠)ほど絞りを開けて通常の明るさに戻す。fovと同じタイミング
+//   (俯瞰突入のフライト・ドラッグ中・ドラッグ解除で戻る動き)すべてに連動させることで、
+//   「遷移的な絞り変化」にしている。
+const OVERVIEW_EXPOSURE_FAR_MULT = 0.55;  // 仮値。基準fov(遠景)側の露出倍率。1より下げて絞る
+const OVERVIEW_EXPOSURE_ZOOM_MULT = 1.0;  // 目一杯ズームした側の露出倍率(通常の明るさ)
 const OVERVIEW_FOV_ZOOMED = 4;            // 仮値。目一杯ドラッグしたときの最大ズーム。以前より強めた
 const OVERVIEW_FOV_DRAG_DISTANCE = 400;   // 仮値。このぶん(px)左右ドラッグしたらズームが振り切る
-const OVERVIEW_FOV_RESET_DURATION = 0.6;  // 仮値。ドラッグを離したときにbase fovへ戻る速さ(早すぎず遅すぎず)
+const OVERVIEW_FOV_RESET_DURATION = 0.6 / OVERVIEW_CAMERA_SPEED_RATIO; // ドラッグを離したときにbase fovへ戻る秒数(元0.6秒→12秒)
 // ★ 2026-09-16 追加(ご指示反映): 最後の俯瞰画面で、レコード(=universe.goldenRing。
 //   carousel側へ戻された「下側のリング」)の右側に針(record.needle)を配置する演出を
 //   試していたが、位置が定まらず不自然だったため、2026-09-17に撤去した(下記の
@@ -282,6 +320,155 @@ const OVERVIEW_FOV_RESET_DURATION = 0.6;  // 仮値。ドラッグを離した�
 //   1本の境界線でよかったので、閾値を2つ持つのをやめてOVERVIEW_HIDE_SPLIT_DEG
 //   1つに統一した(仰角がこれ未満なら軌道を隠し、これ以上ならcarouselを隠す)。
 const OVERVIEW_HIDE_SPLIT_DEG = 8; // 仮値。見た目を見ながら調整してください
+
+// ── ティルトシフト(被写界深度風)の設定 ─────────────────────────
+// 「カメラが一番低い(仰角0°)間はcarouselにだけピントが合い、上下がぼける。スクロールで
+//   カメラが上がるにつれてぼけが解け、carouselが消える境界(OVERVIEW_HIDE_SPLIT_DEG)で
+//   ちょうどぼかし0になる」という対応にしてある(carousel消滅の瞬間にボケが残らない)。
+// 帯の位置・幅はcarouselの実寸から毎フレーム画面座標へ投影して求めるので、fov(ズーム)や
+// 画面サイズが変わっても「carouselの範囲」に追従する。
+// ★ ご指示反映: 「ティルトシフトの遷移は、カメラの高さ(仰角)と関係づける。一番高いところ
+//   (=OVERVIEW_ELEVATION_MAX_DEG、望遠鏡としての一番引いた視点)は常にクリアな『マクロ』の
+//   見え方、カメラが下がる(仰角が下がる)ほど銀河が『ミクロ化』したように強くボケる」という演出。
+//   ★ 修正: 「8°まではボケなしのまま→そこから急に変化」という段差(プラトー)をやめ、
+//   仰角0°(一番低い=ミクロ全開)〜OVERVIEW_ELEVATION_MAX_DEG(一番高い=マクロ全開)の
+//   全区間を、途中で一定区間止まることなく連続的にボケが変化するようにした。
+//   以前は`universe.goldenRing.visible`(carousel自体が表示されているか)にも依存していたが、
+//   これをやめて仰角だけの純粋な関数にした(carouselの表示/非表示という実装都合ではなく、
+//   カメラの高さという体験に紐づけるため)。carouselが非表示になった後も、投影計算自体は
+//   (Box3.setFromObjectがvisible=falseでも効くので)引き続き有効な値を返すため、実害はない。
+const TILT_SHIFT_CURVE = 1.6; // 1で仰角に対して線形。大きいほど下の方(ミクロ側)でボケが急に強まる
+const TILT_SHIFT_FLIGHT_EASE = (t) => t * t * (3 - 2 * t); // 立ち上がりのイージング(smoothstep)
+// ★ 修正(ご指摘反映): 以前はここにoverviewFlightT(基準姿勢へ戻るカメラフライトの進行度)を
+//   掛けていたため、「銀河俯瞰モードのカメラ速度を5%に落とす」変更でフライトが24秒かかるように
+//   なった影響を受け、ボケがスクロールに追従せず「フライトが終わるまで最大24秒待たされる」
+//   ものになっていた(=スクロールで遷移的に動いているように見えない原因)。
+//   ティルトシフトの強さは、カメラのフライト時間とは無関係に、常にスクロール量(仰角)だけで
+//   決まるようにし、俯瞰モードに入った瞬間の見た目の唐突さだけを、この短い固定時間の
+//   イントロで吸収する(スクロール速度やカメラ速度が何であっても常に一定の速さ)。
+const TILT_SHIFT_INTRO_DURATION = 0.6; // 俯瞰モードに入った瞬間だけのフェードイン秒数(固定。カメラ速度の影響を受けない)
+let tiltShiftIntroStart = null;        // 俯瞰モードに入った時刻(clock.getElapsedTime())。null=未計測
+
+// ── 最後の俯瞰モードでのcarousel縮小・移動(スケール感の強調) ────────────
+// ご指示: 「最後のスクロールモードの時は、carousel一式を半分のサイズにする。位置は数式の位置を
+//   銀河の中心へ」。俯瞰に入った時点の数式(universe.sprites[universe.equationIndex])のワールド位置Eを
+//   基準点にして、carousel一式(tripod・リング・粒子の軌跡・ih)を E を中心に縮小し、E が銀河の
+//   中心(record.galaxyCenter)へ来るように平行移動する。
+//     新しい位置 = 銀河中心 + s × (元の位置 − E)   /   新しい大きさ = 元の大きさ × s
+// 進行度は基準姿勢へのフライト(overviewFlightT)に連動させ、カメラが動くのと同時に縮みながら
+// 銀河の中心へ移る。各オブジェクトの「元の位置・大きさ」は俯瞰に入った瞬間に一度だけ記録し、
+// 以後は毎フレーム、その元の値から計算し直して上書きする(累積誤差が出ない)。
+// ★ 修正(ご指摘反映): 「カメラが引く(=仰角が上がる)ときに、その速さに合わせてゆっくり縮む」
+//   体験にするため、突入フライト(overviewFlightT。固定24秒で1回だけ進む)ではなく、
+//   スクロールによる仰角の進行度(overviewScrollCurrent/OVERVIEW_SCROLL_RANGE)に連動させる。
+//   これで「フライトが終わった後は縮小も止まる」ことがなくなり、ユーザーがスクロールし続ける
+//   限り(=カメラが引き続ける限り)縮小も追従してゆっくり進む。
+//
+// ★ バグ修正(ihの回転が止まる件): 以前はtripodAnchor等のposition/scaleを、突入時に一度だけ
+//   記録した「frozenなworldPos」から毎フレーム直接上書きしていた。この上書きは対象オブジェクトの
+//   現在位置を一切参照せず、常に同じ記録値から計算し直すため、ihSprite自身がuniverse.js側で
+//   受け続けている回転/公転アニメーション(そのフレームでのuniverse.js側の更新結果)を、
+//   このあとの強制上書きが毎回なかったことにしてしまい、突入時点の姿勢に固定されて見えていた。
+//   対応: 各オブジェクトのposition/rotationには一切触れず、専用のGroupへattach()で
+//   付け替える(attachはワールド位置を保ったまま親を差し替えるので見た目は変わらない)。
+//   以後はこのGroupのposition/scaleだけを動かして「pivotを中心に縮め、galaxyCenterへ寄せる」
+//   効果を出す。各オブジェクトの自転・公転はGroupのローカル空間の中でそのまま今まで通り
+//   動き続けるので、干渉しない。
+const CAROUSEL_OVERVIEW_SCALE = 0.5;
+let carouselRig = null;
+
+function captureCarouselRig() {
+  const eq = universe.sprites && universe.sprites[universe.equationIndex];
+  const pivot = new THREE.Vector3();
+  (eq || universe.tripodAnchor).getWorldPosition(pivot);
+  const targets = [universe.tripodAnchor, universe.goldenRing, universe.roofParticles, universe.ihSprite].filter(Boolean);
+  // 親(祖先)もtargetsに含まれているものは除外する(親を縮めれば子も一緒に縮むので、二重に縮めない)。
+  const topLevel = targets.filter((o) => {
+    for (let a = o.parent; a; a = a.parent) if (targets.includes(a)) return false;
+    return true;
+  });
+
+  const group = new THREE.Group();
+  group.position.copy(pivot); // 付け替えた瞬間、各objのlocal位置が「pivot基準の相対位置」になる
+  scene.add(group);
+  topLevel.forEach((obj) => group.attach(obj)); // ワールド位置を保ったまま親をgroupへ付け替え
+
+  return { group, pivot };
+}
+
+function updateCarouselScale() {
+  if (!overviewActive || !carouselRig) return;
+  const elevationT = THREE.MathUtils.clamp(overviewScrollCurrent / OVERVIEW_SCROLL_RANGE, 0, 1);
+  const s = THREE.MathUtils.lerp(1, CAROUSEL_OVERVIEW_SCALE, TILT_SHIFT_FLIGHT_EASE(elevationT));
+  // worldPos(obj) = galaxyCenter + s * (localPos(obj)) と同じ効果になるよう、
+  // group.position・group.scaleだけを動かす(localPos自体は各objの現在の自転/公転が
+  // 決めるので、ここでは一切上書きしない)。
+  carouselRig.group.position.copy(record.galaxyCenter);
+  carouselRig.group.scale.setScalar(s);
+}
+
+
+const _tsBoxA = new THREE.Box3();
+const _tsBoxB = new THREE.Box3();
+const _tsRingPos = new THREE.Vector3();
+const _tsCylinder = { center: new THREE.Vector3(), radius: 1, yMin: 0, yMax: 1 };
+
+// carousel(tripod一式+リング)を囲む円柱を求める。
+//   - 軸(x,z)と半径: リング(goldenRing)。tripodの底面外接円と同じ半径・同じ軸まわりで自転するので、
+//     回転してもブレない。
+//   - 高さ: tripodAnchor+goldenRingのワールドBox3のyの範囲(Y軸まわりの回転ではyの範囲は変わらない)。
+function computeCarouselCylinder() {
+  const ring = universe.goldenRing;
+  ring.getWorldPosition(_tsRingPos);
+  _tsBoxA.setFromObject(universe.tripodAnchor);
+  _tsBoxB.setFromObject(ring);
+  _tsBoxA.union(_tsBoxB);
+
+  const ringParams = ring.geometry && ring.geometry.parameters;
+  const ringRadius = ringParams && ringParams.radius
+    ? ringParams.radius * ring.getWorldScale(new THREE.Vector3()).x
+    : AXIS_LENGTH * Math.sin(THREE.MathUtils.degToRad(54.7356)); // record.jsのMIRROR_TRIPOD_RADIUSと同じ式
+
+  _tsCylinder.center.copy(_tsRingPos);
+  _tsCylinder.radius = ringRadius;
+  _tsCylinder.yMin = _tsBoxA.min.y;
+  _tsCylinder.yMax = _tsBoxA.max.y;
+  return _tsCylinder;
+}
+
+// 毎フレーム(カメラ更新の後・render()の前)に呼ぶ。
+function updateTiltShiftEffect() {
+  if (!tiltShift) return;
+
+  let strength = 0;
+  if (overviewActive) {
+    // ① スクロール(仰角=カメラの高さ)だけで決まる、ピント帯の強さ。カメラの速度・フライト時間・
+    //    carouselの表示/非表示には一切依存しない。仰角0(一番低い)〜MAX(一番高い)の全区間で
+    //    途切れなく連続的に変化し、0(マクロ)側で完全にボケが消え、MAXでは足踏みしない。
+    const elevationDeg = (overviewScrollCurrent / OVERVIEW_SCROLL_RANGE) * OVERVIEW_ELEVATION_MAX_DEG;
+    const elevationT = THREE.MathUtils.clamp(elevationDeg / OVERVIEW_ELEVATION_MAX_DEG, 0, 1); // 0=最低(ミクロ)〜1=最高(マクロ)
+    const scrollStrength = Math.pow(1 - elevationT, TILT_SHIFT_CURVE);
+    // ② 俯瞰モードに入った瞬間だけの短い(0.6秒固定)フェードイン。急に出現するのを避けるためだけのもので、
+    //    ①のようにスクロールで戻ってきても再生されない(tiltShiftIntroStartは俯瞰に入った時にしか更新しない)。
+    const introT = tiltShiftIntroStart === null
+      ? 1
+      : THREE.MathUtils.clamp((clock.getElapsedTime() - tiltShiftIntroStart) / TILT_SHIFT_INTRO_DURATION, 0, 1);
+    strength = scrollStrength * TILT_SHIFT_FLIGHT_EASE(introT);
+  }
+
+  tiltShift.setStrength(strength);
+  if (strength > 0.001) {
+    const cyl = computeCarouselCylinder();
+    tiltShift.setFocusFromCylinder(camera, cyl);
+    if (window.__tsDebug) {
+      // ★ デバッグ用(通常は何もしない): コンソールで window.__tsDebug = true とすると、
+      //   「投影で求めた実際の半幅」と「minHalf/maxHalfでクランプされた後の半幅」を出す。
+      //   この2つが同じ値ならminHalf/maxHalfは効いておらず、falloff/paddingを触るべき、
+      //   という判断に使える。
+      console.log('[tiltShift] cylinder=', cyl, 'passes uFocusHalf(clamped)=', tiltShift.passes[0].uniforms.uFocusHalf.value);
+    }
+  }
+}
 
 // UNIVERSE_CAMERA_TARGETを中心とした球面座標(半径・仰角・方位角)。仰角0°=このまま
 // (=UNIVERSE_CAMERA_POSそのもの)、仰角を上げるほどtargetの真上寄りへ弧を描いて
@@ -300,8 +487,11 @@ let overviewScrollTarget = 0;  // 0〜OVERVIEW_SCROLL_RANGE。0=仰角0°(基準
 let overviewScrollCurrent = 0; // 毎フレームtargetへなめらかに近づく実際の値(仰角の計算に使う)
 let overviewFovDragActive = false;
 let overviewFovDragStartX = 0;
-let overviewFovResetTween = null; // ドラッグ解除時のbaseへ戻すtween(次のドラッグ開始時にkillする)
+let overviewFovResetTween = null;      // ドラッグ解除時のbaseへ戻すtween(次のドラッグ開始時にkillする)
+let overviewExposureResetTween = null; // ↑と同じタイミングで、露出を絞り側へ戻すtween
+let overviewBaseExposure = 1;          // enterGalaxyOverview完了時に確定する「基準露出」。以後の絞り計算の元になる
 let overviewFlightInProgress = false; // enterGalaxyOverviewの基準姿勢フライト中かどうか
+let overviewFlightT = 0;              // 基準姿勢フライトの進行度(0〜1)。ティルトシフトの立ち上がりに使う
 const galaxyArmEmphasis = { t: 0 }; // 0=通常、1=固定3本の腕が太く・明るく強調された状態
 
 // 仰角(度)からカメラのワールド座標を計算する(半径・方位角は基準のまま固定=近づかない)。
@@ -328,10 +518,25 @@ function applyOverviewCameraHeight() {
 // ★ 突入直後の基準姿勢へ戻すフライト(enterGalaxyOverview)の最中は、position自体を
 //   flight側が管理しているのでここでは何もしない(でないと毎フレーム上書きし合って
 //   フライトのlerpが機能しなくなる)。
+// ★ 修正(ご指摘反映): 以前はenterGalaxyOverviewのフライト中(overviewFlightInProgress)は
+//   ここを完全にスキップしていたため、overviewScrollCurrent自体が更新されず、フライトが
+//   終わるまでスクロールした量が一切反映されなかった。フライトはOVERVIEW_TRANSITION_DURATION
+//   (カメラ速度5%化により24秒)かけて進むイージング(power2.inOut)なので、終盤は見た目上
+//   ほぼ動きが止まって「もう着いた」ように見えるが、実際にはonComplete(t=1)までスクロールが
+//   一切効かず、そこで初めてこの関数が動き出す。→ 見た目は止まっているのにスクロールしても
+//   何も起きない「長い待たされ感」の原因だった。
+//   対応: overviewScrollCurrentの更新自体はフライト中も常に行う(=スクロールした量は
+//   リアルタイムに反映され続ける)。フライト中だけ、その値をcamera.positionへ適用する
+//   (=見た目を動かす)処理をenterGalaxyOverview側のonUpdateに譲る(下記参照)。
+//   onUpdate側はstartPos(フライト開始位置)から「今のoverviewScrollCurrentに対応する位置」
+//   へflight.tで滑らかにブレンドするため、フライトが終わった瞬間(t=1)には既に
+//   「その時点でのスクロール量」と完全に一致した位置にいる。以後は別段の追いつき待ちが
+//   発生しない(=フライト終了=即・自由にスクロール操作できる状態、という設計にした)。
 function updateOverviewCameraHeight(deltaSeconds) {
-  if (!overviewActive || overviewFlightInProgress) return;
+  if (!overviewActive) return;
   const smoothing = 1 - Math.exp(-OVERVIEW_HEIGHT_SMOOTHING * deltaSeconds);
   overviewScrollCurrent = THREE.MathUtils.lerp(overviewScrollCurrent, overviewScrollTarget, smoothing);
+  if (overviewFlightInProgress) return; // 位置の反映はフライトのonUpdateに任せる(下記)
   applyOverviewCameraHeight();
 }
 
@@ -372,6 +577,8 @@ function calmGalaxyArms() {
 function enterGalaxyOverview() {
   if (overviewActive) return;
   overviewActive = true;
+  carouselRig = captureCarouselRig();
+  tiltShiftIntroStart = clock.getElapsedTime(); // ★ 追加: ここからTILT_SHIFT_INTRO_DURATION秒だけフェードイン // ★ 追加: 縮小・移動前の元の位置/大きさ(と数式の位置)をここで記録
   if (controls) controls.enabled = false; // telescopeモード中は専用のスクロール/ドラッグでのみ制御する
 
   // ★ 2026-09-17 追加(ご指示反映): 「最後の俯瞰視点になったときに変化」の反映。
@@ -391,7 +598,8 @@ function enterGalaxyOverview() {
 
   const startPos = camera.position.clone();
   const startFov = camera.fov;
-  const targetPos = overviewPositionForElevationDeg(0); // 仰角0°=UNIVERSE_CAMERA_POSと同じ
+  const startExposure = renderer.toneMappingExposure; // ★ 追加: 突入前の露出(=以後の基準値)
+  const targetExposure = startExposure * OVERVIEW_EXPOSURE_FAR_MULT;
   const flight = { t: 0 };
   overviewFlightInProgress = true;
   gsap.to(flight, {
@@ -399,13 +607,25 @@ function enterGalaxyOverview() {
     duration: OVERVIEW_TRANSITION_DURATION,
     ease: 'power2.inOut',
     onUpdate: () => {
-      camera.position.lerpVectors(startPos, targetPos, flight.t);
+      // ★ 修正: 固定の目的地(旧targetPos=仰角0°)ではなく、「今スクロールが指している仰角」の
+      //   位置を毎フレーム計算してブレンド先にする。updateOverviewCameraHeight()がフライト中も
+      //   overviewScrollCurrentを更新し続けているので、フライトの最中にスクロールしても、
+      //   その効き目がflight.tの重み(最初は小さく、終わりに向けて1に近づく)で少しずつ
+      //   反映され、フライトが終わる頃には完全にスクロール操作と一致した状態になる。
+      const elevationDeg = (overviewScrollCurrent / OVERVIEW_SCROLL_RANGE) * OVERVIEW_ELEVATION_MAX_DEG;
+      const basePos = overviewPositionForElevationDeg(elevationDeg);
+      camera.position.lerpVectors(startPos, basePos, flight.t);
       camera.fov = THREE.MathUtils.lerp(startFov, OVERVIEW_FOV_BASE, flight.t);
+      renderer.toneMappingExposure = THREE.MathUtils.lerp(startExposure, targetExposure, flight.t); // ★ 追加: fovと同時に絞りも遷移
       camera.updateProjectionMatrix();
       camera.lookAt(UNIVERSE_CAMERA_TARGET);
+      overviewFlightT = flight.t;
     },
     onComplete: () => {
       overviewFlightInProgress = false;
+      overviewFlightT = 1;
+      renderer.toneMappingExposure = targetExposure; // 誤差の丸め込み
+      overviewBaseExposure = startExposure; // ★ 追加: 以後のドラッグ絞り計算はこの値を基準にする
     },
   });
 }
@@ -425,8 +645,16 @@ function applyGalaxyOverviewScroll(deltaY) {
 // fov(光学ズーム)だけを調整する。位置は変えない。telescopeモード中(overviewActive)のみ有効。
 // ★ ドラッグしている間だけ拡大でき、ボタンを離すとbase fovへ戻る(=ドラッグ中でしか
 //   拡大できない仕様)。
+// ★ バグ修正: enterGalaxyOverview()の基準姿勢フライト(overviewFlightInProgress。
+//   OVERVIEW_TRANSITION_DURATION=約24秒)中は、そのonUpdateが毎フレーム無条件に
+//   camera.fov/renderer.toneMappingExposureを「フライトの進行度に応じた基準姿勢寄りの値」
+//   で上書きし続けている。このガードが無いと、フライト中にドラッグしてfovを変えても、
+//   次のフレームでフライト側にすぐ書き戻されてしまい、「ドラッグでズームしたと思ったら
+//   勝手に俯瞰へ戻される」という挙動になる(フライトが終わるとこの上書きが止まるので、
+//   あたかも「はじめの間だけの一時的なバグ」に見えていた)。フライト中はこのハンドラを
+//   まるごと無効化し、フライト完了後にだけドラッグズームを受け付けるようにする。
 renderer.domElement.addEventListener('pointermove', (e) => {
-  if (!overviewActive) return;
+  if (!overviewActive || overviewFlightInProgress) return;
   const bothDown = e.buttons === 3; // 左(1)+右(2)の同時押し
 
   if (!overviewFovDragActive) {
@@ -434,6 +662,7 @@ renderer.domElement.addEventListener('pointermove', (e) => {
     overviewFovDragActive = true;
     overviewFovDragStartX = e.clientX;
     if (overviewFovResetTween) overviewFovResetTween.kill(); // 戻り途中に再ドラッグしたら即座に手動制御へ戻す
+    if (overviewExposureResetTween) overviewExposureResetTween.kill(); // 絞りも同様
     return;
   }
 
@@ -446,6 +675,9 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   const dragged = Math.abs(e.clientX - overviewFovDragStartX);
   const zoomT = THREE.MathUtils.clamp(dragged / OVERVIEW_FOV_DRAG_DISTANCE, 0, 1);
   camera.fov = THREE.MathUtils.lerp(OVERVIEW_FOV_BASE, OVERVIEW_FOV_ZOOMED, zoomT);
+  // ★ 追加: fovのズームと同じ量(zoomT)で絞りも一緒に開けていく(遠景=絞る/望遠=開ける)。
+  renderer.toneMappingExposure = overviewBaseExposure
+    * THREE.MathUtils.lerp(OVERVIEW_EXPOSURE_FAR_MULT, OVERVIEW_EXPOSURE_ZOOM_MULT, zoomT);
   camera.updateProjectionMatrix();
 });
 window.addEventListener('pointerup', () => {
@@ -461,6 +693,15 @@ function endOverviewFovDrag() {
     duration: OVERVIEW_FOV_RESET_DURATION,
     ease: 'power2.out',
     onUpdate: () => camera.updateProjectionMatrix(),
+  });
+  // ★ 追加: fovが基準へ戻るのと同じ速さで、絞りも遠景側(暗い方)へ戻す。
+  if (overviewExposureResetTween) overviewExposureResetTween.kill();
+  const exposureProxy = { v: renderer.toneMappingExposure };
+  overviewExposureResetTween = gsap.to(exposureProxy, {
+    v: overviewBaseExposure * OVERVIEW_EXPOSURE_FAR_MULT,
+    duration: OVERVIEW_FOV_RESET_DURATION,
+    ease: 'power2.out',
+    onUpdate: () => { renderer.toneMappingExposure = exposureProxy.v; },
   });
 }
 
@@ -745,34 +986,31 @@ document.body.appendChild(transitionOverlay);
 
 // ★ 追加: 宇宙ページのtripod先端のX/Y/Zラベルをクリックしたときに出す、画面固定位置の
 //   テキスト表示。dialogue.js(dialogue.show)は3Dオブジェクトに追従する吹き出しなので、
-//   「画面中央・上から70%」という完全固定の配置には向かないため、ここだけ専用の
-//   シンプルなDOM要素で表示する。
-const axisTipTextBox = document.createElement('div');
-Object.assign(axisTipTextBox.style, {
-  position: 'fixed',
-  left: '50%',
-  top: '70%',
-  transform: 'translate(-50%, -50%)',
-  maxWidth: '80vw',
-  padding: '0.6em 1em',
-  color: '#fff',
-  font: '400 1.1rem/1.6 serif',
-  textAlign: 'center',
-  whiteSpace: 'pre-line',
-  textShadow: '0 0 8px rgba(0,0,0,0.8)',
-  pointerEvents: 'none',
-  zIndex: '500',
-  display: 'none',
-});
-document.body.appendChild(axisTipTextBox);
+//   「画面中央・上から70%」という完全固定の配置には向かない。captions.js側のキャプション
+//   ボックス(数式上のワンフレーズ等と同じ仕組み)を流用し、画面固定位置(50%,70%)に配置
+//   して使う(見た目・フェードの挙動を他のセリフ表示と揃えるため)。
+// work(出典)は、caption本体と同じくcaptions.js側の共有出典ボックス(getSourceCaption)
+// に表示する。
+const axisTipCaption = makeCaptionController(createCaptionBox({ leftPercent: 50, topPercent: 70, noWrap: true }));
+const AXIS_TIP_TEXT_DURATION = 10; // 表示してから自動で消えるまでの秒数
+let axisTipHideTimer = null;
 
 function showAxisTipText(message) {
   if (!message || !message.text) return;
-  axisTipTextBox.textContent = message.work ? `${message.text}\n— ${message.work}` : message.text;
-  axisTipTextBox.style.display = 'block';
+  if (axisTipHideTimer) { clearTimeout(axisTipHideTimer); axisTipHideTimer = null; }
+  axisTipCaption.setText(message.text);
+  const sourceCaption = getSourceCaption();
+  if (message.work) sourceCaption.setText(message.work);
+  else sourceCaption.hide();
+  axisTipHideTimer = setTimeout(() => {
+    axisTipHideTimer = null;
+    hideAxisTipText();
+  }, AXIS_TIP_TEXT_DURATION * 1000);
 }
 function hideAxisTipText() {
-  axisTipTextBox.style.display = 'none';
+  if (axisTipHideTimer) { clearTimeout(axisTipHideTimer); axisTipHideTimer = null; }
+  axisTipCaption.hide();
+  getSourceCaption().hide();
 }
 
 
@@ -906,6 +1144,12 @@ renderer.domElement.addEventListener('click', (e) => {
             duration: 1.6,
             onComplete: () => {
               // ズーム完了後の最初のクリックで②③④の自動展開を開始する
+              // ★ ご指示反映: 波面加工(雨紋+屈折)はphase3の間だけ適用する。
+              //   無効化していた間に凍結していた古い波が急に見えないよう、
+              //   有効化する瞬間にreset()してからenabled=trueにする。
+              wavePass.reset(renderer);
+              wavePass.enabled = true;
+              waveScrollController.reset(); // 前回分のemaSpeed/scrollEnergyを持ち越さないよう念のため
               startPhase3({ assembly: equationAssembly, camera, onComplete: () => {
                 console.log('Phase3(②③④)展開完了');
               } });
@@ -951,6 +1195,14 @@ renderer.domElement.addEventListener('click', (e) => {
               //   ここで非表示にする。
               hotspotMeshes.forEach((m) => { m.visible = false; });
               archer.visible = false;
+              // ★ ご指示反映: 波面加工はphase3専用なので、宇宙ページへ移る瞬間に無効化する。
+              wavePass.enabled = false;
+              // ★重要: スクロール連動でgsap.globalTimeline.timeScale()を動かしていたため、
+              //   ここで明示的に1へ戻す。戻さないと、phase3終了時点でたまたま無操作が
+              //   続いていた場合にtimeScaleがidleTimeScale(0.05=5%速度)近くまで
+              //   落ちたまま残ってしまい、宇宙ページ以降のアニメーション全体が
+              //   異常にゆっくりになってしまう(実際に発生していた不具合)。
+              waveScrollController.reset();
               // ★ 2026-09-11 追加(バグ調査): 「カメラの設定を変えても最終的な視点が変わらない」
               //   という報告への対応。Phase3(zoomToEquation/startPhase3)がcamera.position/
               //   quaternionをGSAPのtweenで動かしているが、universeページへ遷移する際にその
@@ -1321,6 +1573,7 @@ function animate() {
   // 止まってしまわないようtry/catchで隔離しておく
   try { zWave.update(clock.getElapsedTime()); } catch (err) { console.error('zWave.update failed:', err); }
   try { axes.update(clock.getElapsedTime()); } catch (err) { console.error('axes.update failed:', err); } // 軸ラインの「原点方向へ流れる光」アニメーション
+  try { waveScrollController.tickIdleDecay(); } catch (err) { console.error('waveScrollController.tickIdleDecay failed:', err); } // 波面: scrollEnergy(雨量)の減衰と再生速度をゆっくり戻す
   updateUniverse(universe, delta, camera); // 宇宙ページの三軸回転(固定軸まわりのカルーセル回転。isActiveがfalseの間は内部で即returnするので無害)
   updateSolarSystem(solarSystem, clock.getElapsedTime()); // 太陽系(group.visible=falseの間は内部で即returnするので無害)
   updateGalaxy(galaxy, delta); // tripod直下の巨大な銀河の自転(state==='hidden'の間は内部で即returnするので無害)
@@ -1426,6 +1679,8 @@ function animate() {
       dumpCamera('periodic');
     }
   }
+  updateCarouselScale(); // ★ 追加: 俯瞰中、carousel一式を半分に縮めて数式位置を銀河中心へ(ティルトシフトの帯計算より先に)
+  updateTiltShiftEffect(); // ★ 追加: 最後の俯瞰でカメラが低い間だけ、carouselにピントが合うティルトシフトをかける
   yzPanel.update(clock.getElapsedTime());
   bananaState.mesh.rotation.y += state === 'idle' ? 0.004 : 0;
   render();
