@@ -15,6 +15,21 @@ import * as THREE from 'three';
 // uProgress を 0 に戻す。position===aTargetになった星は今後 uProgress が
 // また動いても位置が変わらない(=固定される)ので、続けて「別の星の集団」を
 // 次の形(例: =)へ収束させる、という多段階の演出が同じ uProgress ひとつで実現できる。
+// ── 星本体は「芯」だけのシンプルな円(下のフラグメントシェーダー参照)。
+//   発光(光暈)はsceneSetup.js側の丸いBloomパイプラインに委ねる方針にしたため、
+//   以前ここにあった焼き込みテクスチャ用のグラデーション調整パラメータは廃止した。
+
+// ★ 変更: 以前はcanvasに焼き込んだ「芯+広い光暈」のグラデーションテクスチャを使い、
+//   Bloom専用パスから完全除外(excludeFromBloom)することで丸さを保っていた。
+//   しかし静的な焼き込みテクスチャでは、実際の明るさに反応して伸び縮みする
+//   UnrealBloomPassらしい発光感が出せず不満が残っていたため、方針を変更する。
+//   → 星本体(この点)は「芯」だけのシンプルな円にし、周囲の発光(光暈)は
+//   sceneSetup.js側に新設した専用の丸いBloomパイプライン(閾値抽出+十分な解像度の
+//   分離ガウシアン。UnrealBloomPassのような低解像度ミップを使わないため、
+//   どれだけ強くかけても輪郭が四角くならない)に完全に委ねる。
+//   この星はUnrealBloomPass本体(bloomComposer)からは今まで通り除外したまま、
+//   新しい丸いBloomパイプラインにだけ含める(sceneSetup.jsのincludeInRoundBloom参照)。
+
 export function createStars(scene, count = 3000) {
   const positions = new Float32Array(count * 3);
   const targets = new Float32Array(count * 3); // 収束先座標(未割当時はpositionと同じ値)
@@ -76,7 +91,7 @@ export function createStars(scene, count = 3000) {
       uTime: { value: 0 },
       uColor: { value: new THREE.Color(0x9ecbff) },
       uProgress: { value: 0 }, // 0=position(現在地)のまま、1=aTarget(収束先)に到着
-      uPsiFade: { value: 0 }   // 0=星のψのまま、1=本物のpsi.pngへ完全にクロスフェード済み(星側は非表示)
+      uPsiFade: { value: 0 },  // 0=星のψのまま、1=本物のpsi.pngへ完全にクロスフェード済み(星側は非表示)
     },
     vertexShader: `
             attribute float phase;
@@ -102,12 +117,10 @@ export function createStars(scene, count = 3000) {
                 vFormed = max(aFormed, travel);
                 vHide = aIsPsi * uPsiFade; // ψを構成する星だけ、本物のpsi.pngへの置き換え時にフェードアウト
                 vec4 mvPosition = modelViewMatrix * vec4(morphed, 1.0);
-                // 収束が進むほど点を小さく締める(=重なりによる巨大なブラー塊を防ぎ、ドット状にする)
+                // サイズは元の値に戻した(発光の見た目はテクスチャ側の
+                // グラデーション調整で作る方針にしたため)。
                 float shrink = mix(0.9, 0.2, vFormed);
-                float rawSize = (1.2 + vTwinkle * 1.3) * shrink * (300.0 / -mvPosition.z);
-                // 遠い星やformed後の縮小サイズがあまりに小さい(1〜2px程度)と、
-                // フラグメント側のdiscardで作っている円形マスクを描くだけの解像度が無く
-                // 「ただの正方形の1ピクセル」に見えてしまう。最小サイズを底上げして防ぐ。
+                float rawSize = (1.2 + vTwinkle * 3.3) * shrink * (300.0 / -mvPosition.z);
                 gl_PointSize = max(rawSize, 3.0);
                 gl_Position = projectionMatrix * mvPosition;
             }
@@ -118,18 +131,26 @@ export function createStars(scene, count = 3000) {
             varying float vFormed;
             varying float vHide;
             void main() {
-                vec2 c = gl_PointCoord - vec2(0.5);
-                float d = length(c);
-                if (d > 0.5) discard;
-                // 収束済みほど輪郭をシャープに(smoothstepの幅を狭めてにじみを減らす)
-                // vFormed=0のときedgeが0.5ちょうどになりsmoothstep(0.5,0.5,d)が
-                // edge0==edge1の未定義動作になるため、わずかに差をつけておく。
-                float edge = mix(0.499, 0.15, vFormed);
-                // 収束済みほど瞬きを抑えて明るさを安定させる(文字として読みやすくする)
-                float brightness = mix(0.35 + vTwinkle * 0.65, 0.9, vFormed);
-                float alpha = smoothstep(0.5, edge, d) * brightness * (1.0 - vHide);
+                // ★ 変更: 以前はここでテクスチャ(uStarTex)をサンプリングしていたが、
+                // 光暈をsceneSetup.js側の丸いBloomパイプラインに任せる方針にしたため、
+                // ここでは芯だけのシンプルな円マスクを自前で計算する。
+                float d = distance(gl_PointCoord, vec2(0.5));
+                float mask = 1.0 - smoothstep(0.0, 0.5, d);
+                // 収束済みほど輪郭を締める: 距離マスクに対してpowをかけると
+                // 裾野(にじみ部分)が急峻になり、シャープな小さいドットに近づく。
+                float sharpness = mix(1.0, 3.5, vFormed);
+                mask = pow(mask, sharpness);
+                // 収束済みほど瞬きを抑えて明るさを安定させる(文字として読みやすくする)。
+                // ここでのbrightnessは「色の強さ」であり、blend時の重み(alpha=mask)とは
+                // 別物として扱う。alphaをそのままmaskにしておくことで、なめらかな
+                // 円の形状(裾野の柔らかさ)を壊さずに保ちつつ、色をuColor*brightnessで
+                // 1.0超まで押し上げて(1chあたり255でクリップされる)、芯が白飛びするような
+                // 「発光の強さ」を表現できる。この明るさが丸いBloomパイプラインの
+                // 閾値抽出(luminosityThreshold)にそのまま効いてくる。
+                float brightness = mix(1.1 + vTwinkle * 0.8, 4.2, vFormed);
+                float alpha = mask * (1.0 - vHide);
                 if (alpha <= 0.001) discard;
-                gl_FragColor = vec4(uColor, alpha);
+                gl_FragColor = vec4(uColor * brightness, alpha);
             }
         `,
     transparent: true,
