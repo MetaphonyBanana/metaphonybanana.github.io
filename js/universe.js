@@ -309,15 +309,15 @@ function makeTripodHitMesh() {
 // tripodは回転し続けるので、結果として「軸線が今まさに掃いている最新位置」の周りに、
 // 過去に生成された粒子がリング状に取り巻く円錐が常に見える状態になる。
 //
-// 各粒子は生成された瞬間は透明(alpha=0)で、ROOF_FADE_DURATION秒かけて
-// ROOF_MAX_ALPHAまでゆっくり浮かび上がる(「透明度も変える」)。
-// また、生成される粒子の色は、tripodの累積回転角を1/6周期(60°)ごとに区切って
-// 黄緑↔オレンジを交互に切り替える。これにより、軸線本体の色(白系)+過去の軌跡の
-// 黄緑/オレンジの帯、という3色構成の円錐が常時見える形になる。
+// 各粒子は生成された瞬間からフル不透明(軸線と同じ色、ROOF_COLOR)で現れ、そのまま
+// その場に「滞留」する。tripodがちょうど1周してくるまでの時間を1粒子の寿命とし、
+// 寿命の最初の2/3(ROOF_HOLD_FRACTION)はフル不透明のまま留まり、残りの1/3
+// (ROOF_FADE_FRACTION)で透明度を上げていって(alphaを下げていって)寿命の終わりに
+// 完全に消える(=ちょうど同じタイミングでリングバッファ側も新しい粒子で上書きされる)。
 //
 // リングバッファは「ちょうど1周分」の容量にしてあるので、tripodが1周してくる頃には
 // ずっと前に生成した粒子の枠を新しい粒子で上書きする形になり、位置はほぼ同じまま
-// (毎周、同じ場所が改めてふわっと浮かび上がる)、メモリも増え続けない。
+// (消えた直後にまた同じ場所へ現れる)、メモリも増え続けない。
 const ROOF_SPAWN_ANGLE_STEP = THREE.MathUtils.degToRad(1); // 1本の脚が何度回転するごとに1粒子生成するか(仮値。以前の3倍の密度)
 const ROOF_POINTS_PER_LEG = Math.round((Math.PI * 2) / ROOF_SPAWN_ANGLE_STEP); // 1周ぶんの生成数/脚
 const ROOF_RING_CAPACITY = ROOF_POINTS_PER_LEG * 3; // 3脚ぶん(=1周ぶんの総容量)
@@ -338,17 +338,46 @@ const ROOF_VISIBILITY_BOOST = 1.5;  // 仮値。この演出だけをさらに�
 const ROOF_PARTICLE_SIZE = AXIS_LENGTH * 0.16
   * Math.max(1, UNIVERSE_CAMERA_DISTANCE / ROOF_REFERENCE_DISTANCE)
   * ROOF_VISIBILITY_BOOST;
-export const ROOF_FADE_DURATION = 1.5;           // 1粒子が生成されてからフル不透明になるまでの秒数(仮値)
+export const ROOF_FADE_DURATION = 1.5;           // (現在は未使用。以前のフェードイン用の名残)
 const ROOF_MAX_ALPHA = 0.9;                      // フル不透明時の上限(0.75→0.9。仮値。さらに目立たせたければ1.0まで上げてよい)
-const ROOF_SIXTH = (Math.PI * 2) / 6;            // 「1/6周」= 60°
-const ROOF_COLOR_GREEN = new THREE.Color(0xa8e05f);  // 黄緑(仮値)
-const ROOF_COLOR_ORANGE = new THREE.Color(0xff8c1a); // オレンジ(仮値)
+// ★ 変更(ご指示反映): 「carouselの屋根のパーティクルを軸と同じ色と質感にしてほしい」
+//   への対応。以前は生成時の累積回転角を1/6周(60°)ごとに区切って黄緑↔オレンジを
+//   交互に切り替えていたが、軸線(AXIS_COLOR、config.js)と同じ単色に統一する。
+
+// ★ 変更(ご指示反映): 「carouselの屋根のパーティクルを軸と同じ色と質感にしてほしい」
+//   への対応。以前は生成時の累積回転角を1/6周(60°)ごとに区切って黄緑↔オレンジを
+//   交互に切り替えていたが、軸線(AXIS_COLOR、config.js)と同じ単色に統一する。
+const ROOF_COLOR = new THREE.Color(AXIS_COLOR);
+// ★ 追加: 「軸から発生し、その位置で滞留し、1/3周期で透明度を上げて消滅させる」の反映。
+//   1粒子の寿命(=tripodがちょうど1周してくる時間。1/TRIPOD_ANGULAR_SPEEDに比例)のうち、
+//   最初の2/3はフル不透明のまま留まり(滞留)、残りの1/3で透明度を上げていき(フェードアウト)
+//   ちょうど1周し終えたタイミングで完全に消える。
+const ROOF_HOLD_FRACTION = 2 / 3; // 寿命のうち滞留する割合
+const ROOF_FADE_FRACTION = 1 - ROOF_HOLD_FRACTION; // 寿命のうちフェードアウトする割合(=1/3)
+
+// ★ 変更(ご指示反映): 「遷移的な消滅感がない/発光がだんだん減っていく感じ・煌めきが欲しい」
+//   への対応。
+//   1) フェードアウト中はalphaだけでなく粒のサイズ自体も収縮させる(aSizeScale)。
+//      サイズが変わらないままalphaだけ下がるより、「小さくなりながら消える」方が
+//      画面上で小さく見える距離でも消滅がずっと分かりやすい。
+//   2) 各粒子に固有の位相(aSeed)を持たせ、uTimeで駆動するsin波でごくわずかに
+//      明滅させる(煌めき)。
+//   3) 加算合成(AdditiveBlending)に戻した。Bloomが素直に効くので、フェードアウト時に
+//      「発光そのものがだんだん弱まって消えていく」質感になる(前回、軸線と質感を
+//      揃えるために通常合成にしていたが、今回のご要望を優先してこちらに戻した。
+//      色(軸と同じROOF_COLOR)自体は変えていない)。
+const ROOF_FADE_SIZE_MIN = 0.15; // フェードアウト完了時点でのサイズ倍率(0にすると点が急に消える感じになるため、わずかに残す)
+const ROOF_TWINKLE_SPEED = 3.2;   // きらめきの速さ(仮値)
+const ROOF_TWINKLE_STRENGTH = 0.35; // きらめきによる明るさの振れ幅(0〜1。仮値)
 
 const ROOF_VERTEX_SHADER = /* glsl */ `
   uniform float uSize;
   uniform float uPixelRatio;
+  uniform float uTime;
   attribute vec3 aColor;
   attribute float aAlpha;
+  attribute float aSizeScale;
+  attribute float aSeed;
   varying vec3 vColor;
   varying float vAlpha;
   void main() {
@@ -356,10 +385,13 @@ const ROOF_VERTEX_SHADER = /* glsl */ `
     vec4 viewPosition = viewMatrix * modelPosition;
     vec4 projectedPosition = projectionMatrix * viewPosition;
     gl_Position = projectedPosition;
-    gl_PointSize = uSize * uPixelRatio;
+    gl_PointSize = uSize * uPixelRatio * aSizeScale;
     gl_PointSize *= (1.0 / -viewPosition.z);
     vColor = aColor;
-    vAlpha = aAlpha;
+    // きらめき: 粒子ごとの位相(aSeed)をずらしたsin波で明るさをわずかに明滅させる
+    float twinkle = 1.0 - ${ROOF_TWINKLE_STRENGTH.toFixed(3)} * 0.5
+      + ${ROOF_TWINKLE_STRENGTH.toFixed(3)} * 0.5 * sin(uTime * ${ROOF_TWINKLE_SPEED.toFixed(3)} + aSeed * 6.2831853);
+    vAlpha = aAlpha * twinkle;
   }
 `;
 const ROOF_FRAGMENT_SHADER = /* glsl */ `
@@ -372,18 +404,22 @@ const ROOF_FRAGMENT_SHADER = /* glsl */ `
   }
 `;
 
-// scene直下(ワールド空間に固定)に追加する前提。position/aColor/aAlphaは
+// scene直下(ワールド空間に固定)に追加する前提。position/aColor/aAlpha/aSizeScale/aSeedは
 // startTripodRoofPulse呼び出し後、updateUniverse側で少しずつ書き込んでいく
 // (作成時点では全て「まだ生成されていない」= alpha0の空の状態)。
 function makeRoofParticles() {
   const positions = new Float32Array(ROOF_RING_CAPACITY * 3);
   const colors = new Float32Array(ROOF_RING_CAPACITY * 3);
   const alphas = new Float32Array(ROOF_RING_CAPACITY); // 全て0で初期化(=まだ何も見えない)
+  const sizeScales = new Float32Array(ROOF_RING_CAPACITY).fill(1);
+  const seeds = new Float32Array(ROOF_RING_CAPACITY);
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
   geometry.setAttribute('aAlpha', new THREE.BufferAttribute(alphas, 1));
+  geometry.setAttribute('aSizeScale', new THREE.BufferAttribute(sizeScales, 1));
+  geometry.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1));
 
   const material = new THREE.ShaderMaterial({
     vertexShader: ROOF_VERTEX_SHADER,
@@ -391,10 +427,11 @@ function makeRoofParticles() {
     uniforms: {
       uSize: { value: ROOF_PARTICLE_SIZE },
       uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+      uTime: { value: 0 },
     },
     transparent: true,
     depthWrite: false,
-    blending: THREE.AdditiveBlending,
+    blending: THREE.AdditiveBlending, // ★ 変更: 発光がだんだん弱まって消える質感のため加算合成に戻した(Bloomが効く)
   });
 
   const points = new THREE.Points(geometry, material);
@@ -406,7 +443,7 @@ function makeRoofParticles() {
 // 1本の脚ぶん、ワールド座標のapex→tipの間に1粒子ぶんの位置をランダムに決めて
 // リングバッファのslotへ書き込む(位置・色・alpha=0・経過時間リセット)。
 const _roofSpawnPos = new THREE.Vector3();
-function spawnRoofParticle(universe, worldOrigin, worldTip, color) {
+function spawnRoofParticle(universe, worldOrigin, worldTip) {
   const slot = universe.roofWriteIndex;
   universe.roofWriteIndex = (universe.roofWriteIndex + 1) % ROOF_RING_CAPACITY;
 
@@ -418,11 +455,17 @@ function spawnRoofParticle(universe, worldOrigin, worldTip, color) {
 
   const posAttr = universe.roofParticles.geometry.attributes.position;
   const colorAttr = universe.roofParticles.geometry.attributes.aColor;
+  const sizeScaleAttr = universe.roofParticles.geometry.attributes.aSizeScale;
+  const seedAttr = universe.roofParticles.geometry.attributes.aSeed;
   posAttr.setXYZ(slot, _roofSpawnPos.x, _roofSpawnPos.y, _roofSpawnPos.z);
-  colorAttr.setXYZ(slot, color.r, color.g, color.b);
+  colorAttr.setXYZ(slot, ROOF_COLOR.r, ROOF_COLOR.g, ROOF_COLOR.b);
+  sizeScaleAttr.setX(slot, 1); // 滞留中はフルサイズから開始
+  seedAttr.setX(slot, Math.random() * Math.PI * 2); // きらめきの位相をランダムに(粒子ごとにバラす)
+  sizeScaleAttr.needsUpdate = true;
+  seedAttr.needsUpdate = true;
   posAttr.needsUpdate = true;
   colorAttr.needsUpdate = true;
-  universe.roofSpawnElapsed[slot] = 0; // フェードインをここから開始
+  universe.roofSpawnElapsed[slot] = 0; // 寿命(滞留→フェードアウト)の計測をここから開始
 }
 
 // ── ih(tripodクリックのシーケンス最後に出現) ────────────────────
@@ -699,7 +742,6 @@ export function createUniverse(scene) {
     roofWriteIndex: 0,         // ← リングバッファの次の書き込み位置
     roofSpawnElapsed: new Float32Array(ROOF_RING_CAPACITY).fill(-1), // ← 各slotの生成からの経過秒数。-1=未生成
     roofLegSpawnAngle: [0, 0, 0], // ← 各脚ごとの「前回生成からの累積回転角」
-    roofColorAngle: 0,             // ← 色帯切り替え用の累積回転角(2πで折り返す)
     ihSprite,           // ← tripodクリックで出現するih
     ihRevealed: false,  // ← 出現済みフラグ(二重フェードイン防止)
     // ★ 2026-09-12 追加: 「左右同時ドラッグ(疑似正射影⇄透視図の切り替え)を
@@ -850,12 +892,6 @@ export function updateUniverse(universe, deltaSeconds, camera) {
 
     const rotationStep = Math.abs(rotationDelta);
 
-    // 色帯(1/6周=60°ごとに黄緑⇔オレンジを切り替え)。生成される新しい粒子の色を決めるだけで、
-    // 過去に生成済みの粒子の色は変わらない(=円周上に交互の帯として固定される)。
-    universe.roofColorAngle = (universe.roofColorAngle + rotationStep) % (Math.PI * 2);
-    const bandIndex = Math.floor(universe.roofColorAngle / ROOF_SIXTH) % 2;
-    const spawnColor = bandIndex === 0 ? ROOF_COLOR_GREEN : ROOF_COLOR_ORANGE;
-
     // 3本の脚それぞれについて、「前回の生成からどれだけ回転したか」を個別に積算し、
     // ROOF_SPAWN_ANGLE_STEPを超えるたびにワールド座標を取って1粒子生成する
     // (1フレームでの回転量がステップ幅を超えるほど速い場合に備え、whileで複数回に分けて処理する)。
@@ -865,21 +901,46 @@ export function updateUniverse(universe, deltaSeconds, camera) {
       while (universe.roofLegSpawnAngle[legIndex] >= ROOF_SPAWN_ANGLE_STEP) {
         universe.roofLegSpawnAngle[legIndex] -= ROOF_SPAWN_ANGLE_STEP;
         universe.axesGroup.localToWorld(_roofWorldTip.copy(tip));
-        spawnRoofParticle(universe, _roofWorldOrigin, _roofWorldTip, spawnColor);
+        spawnRoofParticle(universe, _roofWorldOrigin, _roofWorldTip);
       }
     });
 
-    // 全slotのフェードイン(生成からの経過秒数→alpha)を毎フレーム更新する。
+    // 全slotの寿命管理(生成からの経過秒数→alpha)を毎フレーム更新する。
+    // 寿命 = tripodがちょうど1周してくる時間(2π/TRIPOD_ANGULAR_SPEED)。
+    // 最初のROOF_HOLD_FRACTION(2/3)はフル不透明のまま滞留し、残りのROOF_FADE_FRACTION
+    // (1/3)で透明度を上げていき(alphaを下げていき)、寿命に達したら完全に消える
+    // (=ちょうど同じタイミングでリングバッファ側も新しい粒子で上書きされる)。
     // ROOF_RING_CAPACITYは「薄くてよい」程度の個数なので、全走査してもコストは小さい。
+    const lifetime = (Math.PI * 2) / Math.max(TRIPOD_ANGULAR_SPEED, 1e-6);
+    const holdDuration = lifetime * ROOF_HOLD_FRACTION;
+    const fadeDuration = lifetime * ROOF_FADE_FRACTION;
     const alphaAttr = universe.roofParticles.geometry.attributes.aAlpha;
+    const sizeScaleAttr = universe.roofParticles.geometry.attributes.aSizeScale;
     for (let i = 0; i < ROOF_RING_CAPACITY; i++) {
       if (universe.roofSpawnElapsed[i] < 0) continue; // 未生成のslotはずっと透明のまま
       universe.roofSpawnElapsed[i] += deltaSeconds;
-      const progress = Math.min(universe.roofSpawnElapsed[i] / ROOF_FADE_DURATION, 1);
-      alphaAttr.array[i] = progress * ROOF_MAX_ALPHA;
+      const elapsed = universe.roofSpawnElapsed[i];
+      let alpha;
+      let sizeScale;
+      if (elapsed < holdDuration) {
+        alpha = ROOF_MAX_ALPHA; // 滞留中: フル不透明・フルサイズのまま
+        sizeScale = 1;
+      } else {
+        const fadeProgress = Math.min((elapsed - holdDuration) / fadeDuration, 1);
+        alpha = ROOF_MAX_ALPHA * (1 - fadeProgress); // フェードアウト: 透明度を上げていく
+        // ★ 追加: alphaだけでなくサイズも一緒に収縮させる(「小さくなりながら消える」)。
+        //   画面上で粒子が小さく見える距離でも、alphaだけの変化より遥かに消滅が分かりやすい。
+        sizeScale = 1 - fadeProgress * (1 - ROOF_FADE_SIZE_MIN);
+      }
+      alphaAttr.array[i] = alpha;
+      sizeScaleAttr.array[i] = sizeScale;
     }
     alphaAttr.needsUpdate = true;
+    sizeScaleAttr.needsUpdate = true;
   }
+
+  // ★ 追加: きらめき(ROOF_VERTEX_SHADER内のtwinkle計算)を駆動するための経過時間。
+  universe.roofParticles.material.uniforms.uTime.value += deltaSeconds;
 
   // ih(押し出しメッシュ)の周回・上下バウンス+フェードのopacity反映(表示中の間、続ける)。
   // ★ 2026-09-12 変更(ご指示反映): tripodRingSwap.js側のsetIhFadeが毎フレーム更新する
@@ -1002,10 +1063,10 @@ export function toggleUniverseEquation(universe) {
 //   - TRIPOD_LIFT_HEIGHT / TRIPOD_LIFT_DURATION(tripodの浮上)も仮値。
 //   - ROOF_SPAWN_ANGLE_STEP(何度おきに1粒生成するか、密度)/ ROOF_PARTICLE_JITTER(太さ)/
 //     ROOF_PARTICLE_SIZE(ROOF_REFERENCE_DISTANCE・ROOF_VISIBILITY_BOOST経由でUNIVERSE_CAMERA_
-//     DISTANCEに連動して自動調整) / ROOF_FADE_DURATION(フェードインの速さ)/
-//     ROOF_MAX_ALPHA(最大不透明度)/ ROOF_COLOR_GREEN / ROOF_COLOR_ORANGE(色帯の2色)も仮値。
-//     生成間隔・色帯の周期(1/6周)はANGULAR_SPEEDと連動しているので、ANGULAR_SPEEDを
-//     変えると自動的に一緒に変わる。
+//     DISTANCEに連動して自動調整)/ ROOF_MAX_ALPHA(最大不透明度)も仮値。
+//     ROOF_HOLD_FRACTION/ROOF_FADE_FRACTION(滞留2/3・フェードアウト1/3の内訳)も仮値。
+//     色は軸線と同じ(ROOF_COLOR=AXIS_COLOR)。1粒子の寿命はTRIPOD_ANGULAR_SPEEDと連動
+//     している(1周分の時間)ので、ANGULAR_SPEEDを変えると自動的に一緒に変わる。
 //   - IH_WORLD_HEIGHT / IH_ORBIT_RADIUS / IH_ABOVE_RING_MARGIN / IH_ORBIT_SPEED /
 //     IH_BOB_AMPLITUDE / IH_BOB_SPEED(ih)も仮値。IH_ORBIT_RADIUSは
 //     「リングより少し内側」、IH_ABOVE_RING_MARGINは「リング(現在の高さ)からどれだけ
