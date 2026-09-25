@@ -28,10 +28,8 @@ import {
 // こうすることで、Phase1のi・ħの静止位置(MASTER_BBOX.i/hbarから直接計算できる)と、
 // ②③④での位置を同じ物差しで比較・補間できる。
 
-// 新規5アセット(2026-08-16: i_on_hは使わないことにしたので除外。
-// 個別に計測したi・hの着地位置が正しければ、合成グリフに差し替えなくても
-// 違和感のない着地になる。むしろi_on_h.pngは別アセットゆえの微妙なズレ(誤差)が
-// 目立ってしまうとのフィードバックがあったため)。
+// PHASE3_ASSETS: 5アセット構成(合成グリフではなく、i・hを個別スプライトのまま
+// 重ねて表示する方式。詳細はtransitionToStage4のコメント参照)。
 // ── 2026-08-16 再計測: 元画像(2pi.png/carousel_equation.png/final.png)から
 // 白文字・透過背景で切り抜き直したため、canvas(切り抜きPNGのピクセルサイズ)を
 // 実測値に更新した。以前の値は元画像が失われる前の暫定値。
@@ -157,8 +155,8 @@ const STAGE_RAW_CENTERS = {
     denom: { x: 1851.0, y: 1923.5 }, // Carousel
   },
   stage4: { // (iがhに乗ったもの)/Carousel ← final.png実測
-    // 2026-08-16 再々測(重要な修正): 以前の`merged`は「i_on_h」全体を1個の
-    // バウンディングボックスとして1点だけ実測した値だった。これをiとhの共通の
+    // 2026-08-16 再々測(重要な修正): 以前は「iとhの合成」を1個のバウンディング
+    // ボックスとして1点だけ実測した値を使っていた。これをiとhの共通の
     // 着地点として使うと、hの着地位置とiの着地位置の違い(=iが実際にどれだけ
     // 移動してhに飛び乗るか)が完全に無視されてしまい、iの飛び乗り位置が
     // おかしく見える原因になっていた。
@@ -219,6 +217,84 @@ function localOffsetToWorld(rx, ry, vertexWorld, frame) {
 // Ĥ・ħ・iなど他の記号と同じ白トーンに揃える(phase1.js側のSYMBOL_COLOR_OVERRIDES.hbarと同値)。
 const PHASE3_COLOR = 0xffffff;
 
+// HBARの上線(バー)が外れて分数の横線として現れる瞬間だけ使う、一時的な赤フラッシュ色。
+// ★重要: 通常のsRGB色(0〜1に収まる値)はUnrealBloomPassの輝度しきい値(TUNE.bloomThreshold)
+// を超えないため、いくら赤くしても「色は変わるが発光(Bloom)はしない」状態になる
+// (このシーンのBloomは、しきい値を超えた明るいピクセルだけを抽出して滲ませる方式のため)。
+// 確実にBloomへ乗せるには、白熱電球のように輝度を1.0より大きくした「HDR色」にする必要がある。
+// r成分を大きく超過させ、g/bはわずかに残して「白飛びした赤」ではなく「赤い発光」に見えるようにする。
+// ★調整: 当初(3.2, 0.15, 0.15)にしていたが、白っぽく/ピンクっぽく見えるとの指摘。
+//   原因は2つ考えられる: ①g/bをわずかに残すと、その分だけ確実に赤の純度(彩度)が下がる
+//   (発光してもしなくても常に赤味が薄まる方向)。②HDRの超過量(r=3.2)が大きすぎると、
+//   ACESFilmicToneMapping(sceneSetup.js側で設定)は明るい領域ほど彩度を落として
+//   白へ寄せる特性があるため、明るくするほど逆に赤が薄まり白く見えてしまう。
+//   → g/bを0にして純度を最大化しつつ、rの超過量も抑えて(Bloomの閾値さえ超えれば
+//   光るはずなので)トーンマッピングの白飛び域に入らないようにした。
+//   まだ白っぽい場合は、このrをさらに下げる方向で試してほしい(下げても発光自体は
+//   閾値さえ超えていれば消えない。上げるほど逆に白く/ピンクに寄っていく)。
+const BAR_DETACH_FLASH_COLOR = new THREE.Color(5.4, 0, 0);
+// 通常時の白(0xffffff = r,g,b各1.0)。バー本体が普段まとっている明るさに戻すための着地点。
+const PHASE3_COLOR_NORMALIZED = new THREE.Color(PHASE3_COLOR);
+
+// hbar.png内の「横棒(マクロン)」部分の実測ピクセル座標(画像原寸そのもの、y=0が画像上端)。
+// アルファ値を閾値10で二値化し、行ごとの横幅プロファイルから「周囲の縦棒(幅約124px)より
+// 局所的に幅広い(576〜594px)帯」として検出・目視確認済み(赤枠オーバーレイで確認)。
+const HBAR_BAR_PIXEL_BOX = { x0: 107, x1: 701, y0: 238, y1: 296 };
+
+// hbarSpriteの子として、横棒だけを切り出して重ねる「発光専用オーバーレイ」を作る。
+// ★ 方式変更: 以前は「切り出した矩形をhbarSpriteのローカル単位空間(-0.5〜0.5)上の
+//   どこに置くか」を自前で計算していたが、hbarSpriteのsprite.centerが場面によって
+//   (0.5,0.5)以外になる区間があったり等、前提が崩れるとズレる壊れやすい方式だった。
+//   今回は、hbar.png(既にブラウザに読み込み済みのImage)からcanvasでバー部分だけを
+//   切り抜いた「元画像と同じキャンバスサイズ・同じ位置」の透過テクスチャを作り、
+//   hbarSprite自身と全く同じcenterを持つ子として、position=(0,0,*)・scale=(1,1,1)の
+//   まま(=一切座標計算せず)重ねる。キャンバスサイズが同じなので、hbarSpriteの
+//   scale/position/centerがどんな値であっても、子は常にhbarSprite本体とピクセル単位で
+//   完全に重なる(新しい画像アセットの追加も不要)。
+function ensureHbarBarGlowOverlay(hbarSprite) {
+  if (hbarSprite.userData.barGlowOverlay) return hbarSprite.userData.barGlowOverlay;
+
+  const map = hbarSprite.material.map;
+  const img = map.image;
+  if (!img || !img.complete || !img.naturalWidth) {
+    console.warn('ensureHbarBarGlowOverlay: hbar.pngがまだ読み込み中です。Phase3開始時点では読み込み済みのはずなので、呼び出しタイミングを確認してください。');
+  }
+  const imgW = img.naturalWidth;
+  const imgH = img.naturalHeight;
+  const { x0, x1, y0, y1 } = HBAR_BAR_PIXEL_BOX;
+
+  // 元画像と同じサイズの透過canvasを作り、バーの矩形部分「だけ」同じ位置に描き写す。
+  const canvas = document.createElement('canvas');
+  canvas.width = imgW;
+  canvas.height = imgH;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+
+  const barTexture = new THREE.CanvasTexture(canvas);
+  barTexture.colorSpace = THREE.SRGBColorSpace;
+  barTexture.generateMipmaps = false;
+  barTexture.minFilter = THREE.LinearFilter;
+  barTexture.magFilter = THREE.LinearFilter;
+
+  const overlay = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: barTexture,
+    transparent: true,
+    opacity: 0,
+    depthTest: false,
+    depthWrite: false,
+    color: new THREE.Color(0xffffff),
+  }));
+  overlay.renderOrder = 9999; // 透明オブジェクトの描画順に埋もれないよう、確実に最前面にする固定値
+  overlay.visible = false;
+  overlay.center.copy(hbarSprite.center); // hbarSprite本体と同じ基準点を使う(念のための保険)
+  overlay.position.set(0, 0, 0.01); // hbarSpriteのローカル原点と同じ(zだけz-fighting回避にわずかに手前)
+  overlay.scale.set(1, 1, 1); // hbarSpriteのscaleをそのまま継承させる(独自スケールは持たせない)
+
+  hbarSprite.add(overlay);
+  hbarSprite.userData.barGlowOverlay = overlay;
+  return overlay;
+}
+
 const phase3TextureLoader = new THREE.TextureLoader();
 
 function makePhase3Sprite(key) {
@@ -262,14 +338,13 @@ export function createPhase3Assets(scene) {
 // ── 各ステージ遷移の尺(秒)。仮値、見ながら調整してください ──
 const STAGE_TRANSITION = {
   toStage2: {
-    moveLeft: 2.4,   // ⑴ i・hbarが左へ移動(見た目はまだ変化しない) 
+    moveLeft: 4.4,   // ⑴ i・hbarが左へ移動(見た目はまだ変化しない) ※元の速度の1/4
     riseMorph: 4.0,  // ⑵ hbarが上昇しながらhへクロスフェード ※元の速度の1/4
-    barGrow: 2.2,    // ⑵ バーがscale.xで0→実寸に伸びる ※元の速度の1/4
+    barGrow: 3.2,    // ⑵ バーがscale.xで0→実寸に伸びる ※元の速度の1/4
     denomFade: 4.0,  // ⑵ 2πがフェードインする ※元の速度の1/4
   },
   toStage3: { moveDuration: 1.2, spinDuration: 4.8 }, // ⑴bar伸長+2π→分母中心+h→分子中心 → ⑵分母が回転してCarouselへ(順番に発生。回転は1/4速度に減速)
   toStage4: { hMove: 0.7, gapBeforeHop: 2, hop: 0.8, merge: 0.6 },  // ⑴hが先に歩いて着地 → (2秒静止) → ⑵iがジャンプして乗る → ⑶最終微調整
-  toStage2FromStage4: { fadeOut: 0.6, fadeIn: 0.8 }, // ④→②の循環(クロスフェードのみ、簡易)
 };
 
 // ── ①→②(2段階) ──────────────────────────────
@@ -299,11 +374,14 @@ function transitionToStage2({ assembly, frame, onComplete }) {
   const { moveLeft, riseMorph, barGrow, denomFade } = STAGE_TRANSITION.toStage2;
   const barTargetWidth = fractionBarWorldWidth(BAR_WIDTH_PX.stage2, 'stage2', 'barTwoPi');
 
-  const tl = gsap.timeline({ onComplete });
-
-  // hbarが上昇を始める(riseMorph、時刻moveLeft)より前に、3秒だけワンフレーズを表示する。
-  // moveLeft(⑴の尺、既定4.4秒)の間に収まる長さなので、hbarが上がり始める前に必ず消え終わる。
-  tl.call(() => { showWearItAWhilePhrase(assembly.completePhraseCaption); }, null, 0);
+  // ★ 変更: 全体を一時停止(paused:true)で組み立てておき、ユーザーの最初のスクロール操作を
+  //   トリガーに「①フレーズ表示+バー発光(hbarはまだ静止したまま)」→「②本編(moveLeft以降の
+  //   移動)を再生開始」という順序にする。
+  //   従来はキャプション表示もバー発光もtl内の固定時刻(0、およびmoveLeft)に自動で始めていたため、
+  //   発光がちょうどhbarSpriteが動いている最中に重なってしまい、見た目のタイミングが噛み合って
+  //   いなかった(ずれて見える一因)。発光をhbarSpriteが完全に静止している「スクロール待ちの間」に
+  //   行うことで、この噛み合わせのズレを解消する。
+  const tl = gsap.timeline({ onComplete, paused: true });
 
   // ⑴ i・hbarが左へ移動(テクスチャはまだ変化しない)
   tl.to(iSprite.position, { x: iTarget.x, y: iTarget.y, z: iTarget.z, duration: moveLeft, ease: 'power2.inOut' }, 0);
@@ -345,7 +423,62 @@ function transitionToStage2({ assembly, frame, onComplete }) {
   denomSprite.position.copy(denomTarget);
   denomSprite.visible = true;
   denomSprite.material.opacity = 0;
-  tl.to(denomSprite.material, { opacity: 1, duration: denomFade, ease: 'power1.out' }, moveLeft + riseMorph * 0.5 + barGrow * 0.5);
+  const denomFadeStart = moveLeft + riseMorph * 0.5 + barGrow * 0.5;
+  tl.to(denomSprite.material, { opacity: 1, duration: denomFade, ease: 'power1.out' }, denomFadeStart);
+
+  // ★ ご指示反映: 「You can wear it a while」を、2π(分母)のフェードインが完了した
+  //   タイミングで消す。showWearItAWhilePhrase自体の内部タイマーに任せず、
+  //   completePhraseCaption.hide()を直接呼んで強制的に閉じる。
+  //   (captions.js側にhide()相当のメソッドが無い場合はここが効かないので、
+  //   captions.jsを見せてもらえれば確実な形に直す)
+  tl.call(() => {
+    const cap = assembly.completePhraseCaption;
+    if (cap && typeof cap.hide === 'function') {
+      cap.hide();
+    } else {
+      console.warn('completePhraseCaption.hide()が見つからないため、2π完了時のキャプション消去をスキップしました。captions.jsのAPIを確認してください。');
+    }
+  }, null, denomFadeStart + denomFade);
+
+  // ── ①バー発光(hbarが動き出す"前"、静止中に1回だけ)→発光が終わったら
+  //   「You can wear it a while」表示 → ②上で組み立てた本編タイムライン(tl)を再生開始、
+  //   という順序をスクロールで駆動する。
+  const barGlowOverlay = ensureHbarBarGlowOverlay(hbarSprite);
+  function flashBarGlowOnce(onDone) {
+    barGlowOverlay.visible = true;
+    barGlowOverlay.material.opacity = 0;
+    barGlowOverlay.material.color.copy(BAR_DETACH_FLASH_COLOR);
+    gsap.timeline()
+      .to(barGlowOverlay.material, { opacity: 1, duration: 0.35, ease: 'power1.out' })
+      .to(barGlowOverlay.material.color, {
+        r: PHASE3_COLOR_NORMALIZED.r,
+        g: PHASE3_COLOR_NORMALIZED.g,
+        b: PHASE3_COLOR_NORMALIZED.b,
+        duration: 0.45,
+        ease: 'power1.in',
+      }, '<') // 発光開始と同時に赤→白の冷却を始める(光ってから消えるまでの間ずっと白へ近づいていく)
+      .to(barGlowOverlay.material, { opacity: 0, duration: 0.4, ease: 'power1.in' })
+      .call(() => {
+        barGlowOverlay.visible = false;
+        if (onDone) onDone();
+      });
+  }
+
+  function beginMainTimeline() {
+    flashBarGlowOnce(() => {
+      showWearItAWhilePhrase(assembly.completePhraseCaption);
+      tl.play();
+    });
+  }
+
+  // wheel/touchmoveのどちらが先に来ても、もう片方のリスナーも一緒に外して二重発火を防ぐ。
+  function onScrollTrigger() {
+    window.removeEventListener('wheel', onScrollTrigger);
+    window.removeEventListener('touchmove', onScrollTrigger);
+    beginMainTimeline();
+  }
+  window.addEventListener('wheel', onScrollTrigger, { passive: true });
+  window.addEventListener('touchmove', onScrollTrigger, { passive: true });
 }
 
 // ── ②→③(2段階。ご指摘により分離): ────────────────────────
@@ -473,29 +606,22 @@ function transitionToStage3({ assembly, frame, onComplete }) {
   }, moveDuration); // ← ⑴の終了時刻から開始(=完全に順番。同時発生させない)
 }
 
-// ── ③→④: 「h」が先に歩いて着地し、そのあと「i」がジャンプしてhの上に飛び乗り、
-// iħ→i_on_hへ融合する。
-// ★2026-08-16 全面書き直し(重要な修正): 従来は「iとhを同じ着地点(merged、
-//   i_on_h全体を1点として実測した値)へ向けて同時に歩み寄らせる」実装だったが、
-//   これだとhの本当の目的地とiの本当の目的地の違い=iが実際にどれだけ移動して
-//   hに飛び乗るか、が完全に無視されてしまい、iの飛び乗り位置がおかしく見えて
-//   いた。final.pngを2値化してconnected component解析したところ、iのループ
-//   (ドット無し、hのアセンダー右上にある渦巻き)とhの本体(アセンダー+ボウル)は
-//   インクが繋がっておらず別々の連結成分に分離できたため、それぞれのbbox中心を
-//   個別に実測し直した(STAGE_RAW_CENTERS.stage4.h / .i、詳細はそちらのコメント
-//   参照)。今回はその実測値を使い、要望通り
+// ── ③→④: 「h」が先に歩いて着地し、そのあと「i」がジャンプしてhの上に飛び乗る。
+// ★2026-08-16 全面書き直し(重要な修正): 従来は「iとhを同じ着地点(mergedとして
+//   1点だけ実測した値)へ向けて同時に歩み寄らせる」実装だったが、これだとhの本当の
+//   目的地とiの本当の目的地の違い=iが実際にどれだけ移動してhに飛び乗るか、が
+//   完全に無視されてしまい、iの飛び乗り位置がおかしく見えていた。final.pngを
+//   2値化してconnected component解析したところ、iのループ(ドット無し、hの
+//   アセンダー右上にある渦巻き)とhの本体(アセンダー+ボウル)はインクが繋がって
+//   おらず別々の連結成分に分離できたため、それぞれのbbox中心を個別に実測し直した
+//   (STAGE_RAW_CENTERS.stage4.h / .i、詳細はそちらのコメント参照)。今回はその
+//   実測値を使い、要望通り
 //     ⑴ hが先に(直線的に)歩いて自分の着地点(stage4実測のh位置)へ到着
 //     ⑵ 少し遅れてiが放物線を描いてジャンプし、hのアセンダー上の着地点
 //       (stage4実測のi位置)へ飛び乗る
-//   の順で動かす。両者が着地したら、h+i全体のbbox中心(mergedGlyph)に置いた
-//   i_on_h.png(実際に繋がった筆致のアート)へクロスフェードする。h_v2.png単体と
-//   i.png単体をただ重ねるだけでは、final.pngのような「iのループがhのアセンダーへ
-//   一本の線として繋がる」形は再現できない(別々に描かれた字形なので)ため、
-//   着地の瞬間だけi_on_h.pngへ差し替えてfinal.pngの見た目に忠実に寄せる…という
-//   設計にしていたが、2026-08-16: i_on_h.pngは個別のiSprite/hSpriteとは別途
-//   切り抜いたアセットのため、実測値同士のわずかな誤差が「着地の瞬間だけ絵柄が
-//   すり替わる」ことでかえって目立ってしまう、とのフィードバックがあり撤去。
-//   iSprite・hSpriteをそのまま着地させ、個別のスプライトのまま重ねて表示する。 ──
+//   の順で動かす。着地後は合成グリフへの差し替えは行わず、iSprite・hSpriteを
+//   そのまま個別スプライトとして重ねて表示する(合成アセットは実測値同士の
+//   わずかな誤差で着地の瞬間だけ絵柄がすり替わって見えてしまうため不採用)。──
 function transitionToStage4({ assembly, frame, onComplete }) {
   const p3 = assembly.phase3;
   const vertexWorld = assembly.__phase3VertexWorld;
@@ -539,69 +665,13 @@ function transitionToStage4({ assembly, frame, onComplete }) {
     },
   }, hopStartTime);
 
-  // 両者が着地する時刻。i_on_hへの融合クロスフェードは行わない
+  // 両者が着地する時刻。合成グリフへの差し替え(クロスフェード)は行わない
   // (iSprite・hSpriteはそのまま不透明で残り、着地位置で重なって見える)。
   const landTime = hopStartTime + hop;
 
   // Carousel・バーはstage3とほぼ同じ位置なので、わずかな最終微調整だけ
   tl.to(carouselSprite.position, { x: toDenomPos.x, y: toDenomPos.y, z: toDenomPos.z, duration: merge, ease: 'power2.out' }, landTime);
   tl.to(barSprite.position, { x: barTarget.x, y: barTarget.y, z: barTarget.z, duration: merge, ease: 'power2.out' }, landTime);
-}
-
-// ── ④→②(循環): Phase4で式を再クリックしたときに使う想定。
-// 2026-08-16: i_on_hを廃止したので、stage4で見えているのはhSprite・iSpriteその
-// ものになった。これらをstage2位置へ移すには、①一旦フェードアウト(今の位置のまま)
-// →②見えなくなったところで位置だけ差し替え→③新しい位置でフェードイン、という
-// 順序にしないと「移動が一瞬で見える(ジャンプ)」になってしまうので、その順で行う。──
-function transitionStage4ToStage2({ assembly, frame, onComplete }) {
-  const p3 = assembly.phase3;
-  const vertexWorld = assembly.__phase3VertexWorld;
-  const hPos = stagePartWorld('stage2', 'h', vertexWorld, frame);
-  const denomPos = stagePartWorld('stage2', 'denom', vertexWorld, frame);
-  const barPos = stagePartWorld('stage2', 'bar', vertexWorld, frame);
-  const iTarget = stagePartWorld('stage2', 'i', vertexWorld, frame);
-
-  const carouselSprite = p3.sprites.carousel;
-  const barWide = p3.sprites.barWide;
-  const barTwoPi = p3.sprites.barTwoPi;
-  const twoPiSprite = p3.sprites.twoPi;
-  const hSprite = p3.sprites.h2;
-  const iSprite = assembly.sprites.i;
-
-  const { fadeOut, fadeIn } = STAGE_TRANSITION.toStage2FromStage4;
-
-  twoPiSprite.position.copy(denomPos);
-  twoPiSprite.rotation.z = 0;
-  twoPiSprite.scale.x = phase3SymbolWorldSize('twoPi').width;
-  setSpriteMirrored(twoPiSprite, false); // ④→②で再利用するときも鏡映状態を必ずリセットしておく
-  twoPiSprite.visible = true;
-  twoPiSprite.material.opacity = 0;
-
-  barTwoPi.position.copy(barPos);
-  barTwoPi.scale.x = fractionBarWorldWidth(BAR_WIDTH_PX.stage2, 'stage2', 'barTwoPi');
-  barTwoPi.visible = true;
-  barTwoPi.material.opacity = 0;
-
-  const tl = gsap.timeline({ onComplete });
-  // stage4で見えているh・i(今の位置のまま)と、carousel/barWideを一緒にフェードアウト。
-  tl.to([hSprite.material, iSprite.material, carouselSprite.material, barWide.material], {
-    opacity: 0, duration: fadeOut, ease: 'power1.in',
-  }, 0);
-  tl.call(() => {
-    carouselSprite.visible = false;
-    barWide.visible = false;
-    // 見えなくなったところで、h・iをstage2の位置へ再配置する(ジャンプが見えない)。
-    hSprite.position.copy(hPos);
-    iSprite.position.copy(iTarget);
-  }, null, fadeOut);
-  // 2π・barTwoPiは新規登場なので少し早めにクロスフェード開始してOK。
-  tl.to([twoPiSprite.material, barTwoPi.material], {
-    opacity: 1, duration: fadeIn, ease: 'power1.out',
-  }, fadeOut * 0.5);
-  // h・iはstage2位置へ移ってから(=fadeOut完了後)フェードイン開始。
-  tl.to([hSprite.material, iSprite.material], {
-    opacity: 1, duration: fadeIn, ease: 'power1.out',
-  }, fadeOut);
 }
 
 // ステージ間の「静止時間」(秒)。ご要望により、2π出現後に2秒設ける。
@@ -682,42 +752,6 @@ export function startPhase3({ assembly, camera, onStageChange, onComplete }) {
   });
 }
 
-// ── Phase4想定: ④の状態で式を再クリックするたびに②へ戻り、以後②→③→④を繰り返す。
-// (③→④、④→②のみ実装。②→③はtransitionToStage3を再利用) ──
-export function cyclePhase3Stage({ assembly, camera, onStageChange, onComplete }) {
-  const p3 = assembly.phase3;
-  if (!p3 || p3.busy) return;
-  if (p3.stage !== 'stage4') return; // ②③の途中では割り込ませない(単純化)
-  p3.busy = true;
-
-  const frame = computeScreenFrame(camera);
-  transitionStage4ToStage2({
-    assembly, frame,
-    onComplete: () => {
-      p3.stage = 'stage2';
-      if (onStageChange) onStageChange('stage2');
-      holdThen(STAGE_TRANSITION_HOLD.afterStage2, () => {
-        transitionToStage3({
-          assembly, frame,
-          onComplete: () => {
-            p3.stage = 'stage3';
-            if (onStageChange) onStageChange('stage3');
-            transitionToStage4({
-              assembly, frame,
-              onComplete: () => {
-                p3.stage = 'stage4';
-                p3.busy = false;
-                if (onStageChange) onStageChange('stage4');
-                if (onComplete) onComplete();
-              },
-            });
-          },
-        });
-      });
-    },
-  });
-}
-
 // TODO(Phase3):
 //   - STAGE_RAW_CENTERS/STAGE_EQUALS_RAWは3枚の完成画像から実測した値。「=」を共通原点に
 //     PHASE3_IMAGE_SCALEで画像ごとの縮小率を補正しているので、Ĥ・ψ・derivativeとの
@@ -730,5 +764,3 @@ export function cyclePhase3Stage({ assembly, camera, onStageChange, onComplete }
 //     Spriteではなく PlaneGeometry への変更が必要
 //     (SpriteはmodelMatrixの列ベクトルの長さでスケールを再計算するため、negative scale.x
 //     では鏡映できない点に注意。setSpriteMirrored()のコメント参照)。
-//   - transitionStage4ToStage2は簡易クロスフェード。「iがhから飛び降りる」逆再生モーションに
-//     差し替えたい場合はtransitionToStage4のhopアニメーションを参考に。
