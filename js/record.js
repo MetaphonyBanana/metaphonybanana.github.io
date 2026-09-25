@@ -1,1023 +1,1357 @@
 import * as THREE from 'three';
-import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
-import { AXIS_LENGTH, AXIS_COLOR, UNIVERSE_CAMERA_POS, UNIVERSE_CAMERA_TARGET, UNIVERSE_CAMERA_DIR, UNIVERSE_CAMERA_DISTANCE } from './config.js';
-import { makeTextSprite } from './axisLabels.js';
-
-// ── 宇宙ページ用の疑似正射影(narrow FOV) ─────────────────────
-//   ズーム量はconfig.js側のUNIVERSE_CAMERA_DISTANCEで調整する(小さいほど拡大)。
-//   ここではfovだけ固定で指定する。
-const UNIVERSE_PSEUDO_ORTHO_FOV_DEG = 2; // 仮値。見た目を見ながら調整してください
-
-// ── 宇宙ページの右ドラッグ用: 疑似正射影 ⇄ 通常の透視図(UNIVERSE_CAMERA_POS基準) ──
-//   ★ 2026-09-12 追加: 以前はmain.jsの右ドラッグ処理がsceneSetup.jsの
-//   setProjectionMix(ホーム画面用。HOME_CAMERA_POS/HOME_FOV基準)をそのまま流用して
-//   いたため、右ドラッグするとカメラがUNIVERSE_CAMERA_POSとは無関係な位置・fovへ
-//   飛んでしまっていた(「謎の画角」の原因のひとつ)。
-//   ここではUNIVERSE_CAMERA_TARGET/DIR/DISTANCEを基準に同じ考え方(dolly zoom。
-//   fovを変えた分だけ距離を変えて、画面上の見た目の大きさをなるべく保つ)で
-//   やり直す。DIRはmix=0でもmix=1でも共通なので、「見ている角度(UNIVERSE_CAMERA_POSの
-//   角度)」は一切変わらず、距離だけがドラッグ量に応じて変化する。
-//
-//   ★ 2026-09-12 再変更(ご指示反映): 「あの位置(距離)のまま、fovだけ広角にして
-//   迫力を出したい(対象は小さめに写ってよい)」とのことなので、距離とfovを分離した。
-//   PERSPECTIVE_REFERENCE_FOV_DEGは「距離を決めるためだけ」に使う基準値(=見え方が
-//   気に入っていた元のfov=50のときの距離を再現するためのもの。これ自体は画面には
-//   出ない)。実際にcamera.fovへセットするのはUNIVERSE_PERSPECTIVE_FOV_DEGの方で、
-//   これを広角(大きい値)にすると、距離はそのままなのに画角だけ広がる → 対象が
-//   相対的に小さく、周辺がより歪んで写る(=広角レンズで迫力を出す見た目)。
-const UNIVERSE_PERSPECTIVE_REFERENCE_FOV_DEG = 50; // 距離を決めるための基準fov(位置決め専用。変更しない)
-const UNIVERSE_PERSPECTIVE_FOV_DEG = 90; // 実際に使う広角fov(仮値。大きいほど広角・迫力が出る。見た目を見ながら調整してください)
-
-export function createUniverseProjectionMixer(camera) {
-  const orthoDistance = UNIVERSE_CAMERA_DISTANCE; // mix=0(既定の疑似正射影)での距離
-  const orthoHalfFovRad = THREE.MathUtils.degToRad(UNIVERSE_PSEUDO_ORTHO_FOV_DEG / 2);
-  const referenceHalfFovRad = THREE.MathUtils.degToRad(UNIVERSE_PERSPECTIVE_REFERENCE_FOV_DEG / 2);
-  // 「気に入っていた元の位置」を再現するための距離。UNIVERSE_PERSPECTIVE_FOV_DEGでは
-  // なく、常に基準fov(50)から逆算する(=表示fovを広角にしても、この距離は動かない)。
-  const perspectiveDistance = orthoDistance * (Math.tan(orthoHalfFovRad) / Math.tan(referenceHalfFovRad));
-
-  // mix: 0(既定の疑似正射影・UNIVERSE_CAMERA_POSそのもの)〜1(同じ角度・同じ距離のまま、fovだけ広角の透視図まで進む)。
-  return function setUniverseProjectionMix(mix) {
-    const m = THREE.MathUtils.clamp(mix, 0, 1);
-    const distance = THREE.MathUtils.lerp(orthoDistance, perspectiveDistance, m);
-    camera.fov = THREE.MathUtils.lerp(UNIVERSE_PSEUDO_ORTHO_FOV_DEG, UNIVERSE_PERSPECTIVE_FOV_DEG, m);
-    camera.position.copy(UNIVERSE_CAMERA_TARGET).addScaledVector(UNIVERSE_CAMERA_DIR, distance);
-    camera.updateProjectionMatrix();
-    camera.lookAt(UNIVERSE_CAMERA_TARGET);
-    return m;
-  };
-}
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { HOME_CAMERA_POS, HOME_CAMERA_TARGET, AXIS_LENGTH, UNIVERSE_CAMERA_POS, UNIVERSE_CAMERA_TARGET } from './config.js';
+import { TRIPOD_ANGULAR_SPEED } from './universe.js';
+import { ORBIT_RADIUS_BASE, setOrbitRadius, setOrbitCenter, growOrbitToFull } from './solarSystem.js';
+import { GALAXY_RADIUS, setGalaxyInnerRadius, createStarPointsMaterial, setGalaxySpinBoost, setGalaxyDifferentialRotation } from './galaxy.js';
+import { createCaptionBox, makeCaptionController } from './captions.js';
 
 // ══════════════════════════════════════════════════════════════
-// ── 「宇宙ページ」: Phase3以降、画面クリックで遷移する別シーン ──────────
+// ── 「レコードプレーヤー(操作パネル)」演出 ───────────────────
 // ══════════════════════════════════════════════════════════════
 //
 // 仕様(ご指示より):
-//   - 三軸は「三脚(アンブレラ)」状に組み替えた: 三軸の交点である"頂点"(=原点)は
-//     ワールドの高さ軸(world Y)の上に固定し、X/Y/Zそれぞれの終端点は高さ0(y=0)の
-//     平面上に120°間隔で配置する。3終端は対称配置なので「頂点→終端」の3本の長さは
-//     自動的にすべて等しくなる(=軸の長さは自然に揃う)。
-//   - 回転軸はその「高さ軸(world Y)」そのもの。頂点はこの軸の上に乗っているため、
-//     このまわりに回してもワールド座標としての頂点自体は動かず、終端3点だけが
-//     カルーセルのようにぐるっと回る。固定のワールド軸なので、カメラ向きに依存せず
-//     毎フレームcomputeScreenFrame(camera)する必要もない(ジオメトリも増やしていない)。
-//   - X/Y/Zの終端点にはaxisLabels.jsのmakeTextSprite()を再利用してラベルを貼ってある。
-//     Spriteは常にカメラの方を向くので、三脚がぐるぐる回っても文字は常に読める。
-//   - 方程式画像は、頂点(原点)からさらに「高さ軸の正方向」へ掲げる。
-//   - 画面クリックのたびに、2枚用意した方程式画像を交互にクロスフェードで切り替える(従来通り)。
-//   - マウスが方程式画像に近づくほど、画像の色がじわっと変化する遊び要素を追加した
-//     (updateEquationHoverByPointer。詳細は該当セクション参照)。
-//   - 視点はenterUniverse時に宇宙ページ専用のカメラ位置(UNIVERSE_CAMERA_POS / UNIVERSE_CAMERA_TARGET。
-//     config.js側でHOME_CAMERA_POS / HOME_CAMERA_TARGETとは独立して定義)へ合わせるが、
-//     以後カメラのcontrolsは無効化しない(=自由に動かせる)。
+//   1) カメラの背後に、鏡素材の三角錐(頂点の高さ・底面の外接円半径は既存tripod=universe.jsの
+//      ものと同じ式を流用。底面は正三角形)を置く。頂点にバナナを乗せる。カメラの位置は常に
+//      固定(pan/zoom無効。回転=見回すことだけできる)。
+//   2) スクロールでtripod/リング/鏡tripodの入れ替え演出を進める(下スクロール=鏡側へ、
+//      上スクロール=元に戻る)。
+//      ★ 2026-09-11時点の実装: カメラのposition・向き(OrbitControlsのtarget)は、この演出
+//      が続く間ずっと一切動かさない(UNIVERSE_CAMERA_TARGET/POSに固定したまま)。以前は
+//      controls.targetをスクロール量に応じてUNIVERSE_CAMERA_TARGET⇔鏡(mirrorLookTarget)
+//      の間で補間していたが、それが原因で入れ替え完了後もカメラが動き続け、背景の銀河まで
+//      一緒に動いてしまうバグがあった。見た目の変化は、カメラ側ではなくtripodRingSwap.js側で
+//      tripod・リング・鏡tripod自体の位置を動かすことだけで表現する。
+//   3) 鏡三角錐は、carousel側のtripod(universe.js)と「回転周期・位置を共有」する。
+//   4) 鏡クリック → 別ページ(prism.html)へ遷移。
 //
-// main.js側の想定される呼び出し方:
-//   import {
-//     createUniverse, enterUniverse, toggleUniverseEquation,
-//     updateUniverse, updateEquationHoverByPointer,
-//     revealTripodRing, liftTripod, startTripodRoofPulse,
-//   } from './universe.js';
-//   const universe = createUniverse(scene);              // 起動時に1回
-//   // Phase3完了後、画面クリックを検知したら:
-//   if (!universe.isActive) {
-//     enterUniverse(universe, { camera, controls, onComplete: () => {} });
-//   } else {
-//     toggleUniverseEquation(universe);
-//   }
-//   // 毎フレームのレンダーループ内(cameraは不要):
-//   updateUniverse(universe, deltaSeconds);
-//   // pointermoveハンドラ内で(isActiveでない間は内部で即returnするので呼びっぱなしでよい):
-//   updateEquationHoverByPointer(universe, camera, e.clientX, e.clientY);
-//   // クリック処理内(宇宙ページがアクティブな時のみ判定すればOK):
-//   //   raycaster.intersectObject(universe.tripodHitMesh, true)[0] がヒットしたら、
-//   //   revealTripodRing / liftTripod / startTripodRoofPulse をまとめて呼ぶ
-//   //   (金のリング→円錐状の粒子、の順で出現する一連の演出)。ihはこの後、
-//   //   tripodRingSwap.js側がリングの位置(下限にいるか)を見て自動的に出し入れする
-//   //   (setIhFade。詳細はtripodRingSwap.js参照)。
+// ★ 2026-09-11時点の設計変更(ご指示より):
+//   銀河は「先に巨大に表示させておき、右ドラッグで俯瞰後、スクロールで縮小させる」という
+//   新しい流れに変わったため、以前あった
+//     5) バナナクリックで銀河出現をスクロールで操作できるようにする(galaxy-scrub)
+//     6) 銀河クリックで針が出現し、中心へ向かう
+//     7) 針が規定位置に到達したら太陽系(solarSystem)を召喚する
+//   の3つはこのファイルの責務ではなくなった。5)は「それ以外の銀河の動き」として削除。
+//   6)7)については、その後いったん(針+太陽軌道・太陽系軌道の召喚として)実装したが、
+//   針(トーンアーム)の形・位置・動きがすべて不自然だったため2026-09-17に針自体を
+//   全削除した。7)の「太陽系召喚」部分だけはrevealSolarSystem()として残してあり、
+//   今後新しく作り直すトーンアームが盤面に接触したタイミングで呼び出す想定。
+//   右ドラッグ→俯瞰→スクロールでの銀河縮小そのものは別途(main.js側などで)実装される想定。
 //
-// ★ 太陽系(solarSystem.js)・銀河(galaxy.js)は方針転換により廃止した。このファイルは
-//   それらに依存していない(importもしていない)。
+// TRIPOD_*まわりの数値(角度・長さ)はuniverse.jsのものをそのままコピーしている
+// (「コピーでよい」とのご指示のため。値を変える場合は両方直す必要がある点に注意)。
 
-// ── 方程式画像(白背景・黒インクのフラット1枚絵)を、
-//    黒背景シーンに映えるテクスチャへ変換する ────────────────────
-// ★ 2026-09-14 変更(ご指示反映): 元はS_equation.png/righthand.pngという巨大な
-//   ラスター画像(前者は8000px幅)だったが、ih.svgと同じ要領で輪郭をトレースし、
-//   S_equation.svg/righthand.svgに置き換えた。ベクターなのでファイル自体は数KBまで
-//   軽くなったが、下記の処理はcanvasに一度ラスタライズしてから明度→アルファ変換する
-//   方式のままにしてある(SVGもPNGと同様、<img>のsrcに指定すればブラウザが自動で
-//   ラスタライズしてくれるため、この関数自体は無改造でそのまま動く)。
-// 明度からアルファを合成し直す: 黒(インク部分)→不透明、白(背景)→透明。
-// RGBは白に塗り替えておくことで、SpriteMaterial.color(トーン)で好きな色に染められる
-// ようにする。
-// ★ CANVAS_MAX_WIDTHは「元画像が重いから縮小する」という意味はもう無い
-//   (ベクターなので好きな解像度で描き直せる)が、canvasへのラスタライズ・
-//   getImageData自体のコストは解像度に比例するため、テクスチャとして必要十分な
-//   解像度に留める目的で引き続き残してある。
-const CANVAS_MAX_WIDTH = 2400;
-
-export function loadInkTexture(url) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      const scale = Math.min(1, CANVAS_MAX_WIDTH / img.naturalWidth);
-      const w = Math.max(1, Math.round(img.naturalWidth * scale));
-      const h = Math.max(1, Math.round(img.naturalHeight * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
-      let imageData;
-      try {
-        imageData = ctx.getImageData(0, 0, w, h);
-      } catch (err) {
-        console.error('loadInkTexture: getImageData失敗', err);
-        reject(err);
-        return;
-      }
-      const data = imageData.data;
-      for (let i = 0; i < data.length; i += 4) {
-        const luminance = (data[i] + data[i + 1] + data[i + 2]) / 3;
-        data[i] = 255;
-        data[i + 1] = 255;
-        data[i + 2] = 255;
-        data[i + 3] = 255 - luminance; // 黒(0)→不透明(255)、白(255)→透明(0)
-      }
-      ctx.putImageData(imageData, 0, 0);
-      const texture = new THREE.CanvasTexture(canvas);
-      texture.colorSpace = THREE.SRGBColorSpace;
-      texture.needsUpdate = true;
-      resolve({ texture, aspect: w / h });
-    };
-    img.onerror = (err) => {
-      console.error('loadInkTexture: 画像読み込み失敗', err);
-      reject(err);
-    };
-    img.src = url;
-  });
-}
-
-// ── 表示する2枚の方程式画像。クリックのたびにこの順で交互に切り替わる ──────
-const EQUATION_IMAGES = [
-  { key: 'standard', url: new URL('./data/S_equation.svg', import.meta.url).href },      // iħ∂ψ/∂t = Ĥψ
-  { key: 'carousel', url: new URL('./data/righthand.svg', import.meta.url).href },   // i(h/Carousel)∂ψ/∂t = Ĥψ
-];
-
-const EQUATION_WORLD_WIDTH = 7;      // 画像の表示幅(ワールド単位、仮値)
-const EQUATION_HEIGHT_ABOVE_APEX = AXIS_LENGTH * 0.15; // 頂点(原点)からさらに外側へどれだけ離すか(仮値)
-const EQUATION_CROSSFADE_DURATION = 0.9; // クリックで画像を切り替えるときのクロスフェード秒数
-
-// ── カメラの「平衡感覚」を固定するための首振り角度の制限 ──────────────
-// OrbitControls自体はcamera.upを軸にazimuth(水平)/polar(上下)にしか回転しないため、
-// 原理上ロール(横に傾く)はしない。ただしpolar角度に制限が無いと、真上・真下(極)を
-// 跨いで回り込めてしまい、その瞬間に見た目上「天地がひっくり返った」ように感じられる
-// (これが体感上の「平衡感覚が狂う」の正体)。移動・首振り自体は制限せず、
-// 「極を跨げない」よう上下の角度だけ制限することで、水平線が常に安定して見えるようにする。
-const MIN_POLAR_ANGLE = THREE.MathUtils.degToRad(8);   // ほぼ真上の手前で止める(仮値)
-const MAX_POLAR_ANGLE = THREE.MathUtils.degToRad(172); // ほぼ真下の手前で止める(仮値)
-
-// ── 三脚(アンブレラ)状の頂点・終端の座標を決める ──────────────────
-// 「頂点(原点)は高さ軸(world Y)の上に固定」「終端3点は高さ0の平面上に120°間隔」という
-// 条件を、頂点からの傾き角(TRIPOD_ANGLE_FROM_VERTICAL_DEG)ひとつで決める。
-// 対称配置になるので、頂点→終端の距離(=軸の長さ)は3本とも自動的にAXIS_LENGTHで揃う。
-const TRIPOD_ANGLE_FROM_VERTICAL_DEG = 54.7356 // 高さ軸から各軸線をどれだけ傾けるか。きれいな角度を採用(仮値、調整可)
+// ── 鏡の三角錐(頂点位置の式のみ、コピー元: universe.js) ──────────
+const TRIPOD_ANGLE_FROM_VERTICAL_DEG = 54.7356;
 const TRIPOD_ANGLE_FROM_VERTICAL = THREE.MathUtils.degToRad(TRIPOD_ANGLE_FROM_VERTICAL_DEG);
-// ↓ 金のリング(makeGoldenRing)・円錐状の粒子(makeRoofParticles)の半径として、
-//   このファイル内で使う。(以前はsolarSystem.js側の太陽系の公転半径とも揃えていたが、
-//   太陽系は廃止したのでその用途は無くなった。exportはこのまま残してある)
-export const TRIPOD_RADIUS = AXIS_LENGTH * Math.sin(TRIPOD_ANGLE_FROM_VERTICAL); // 終端3点の、高さ軸からの水平距離
-const APEX_HEIGHT   = AXIS_LENGTH * Math.cos(TRIPOD_ANGLE_FROM_VERTICAL); // 頂点(原点)の高さ
-// 終端3点・金のリングが乗る「地面」のワールドY。以前はmakeGoldenRing内に0を直書きしていたが、
-// tripodRingSwap.js・main.js(銀河の配置)など他ファイルからも同じ基準を参照したいため定数化した。
-export const TRIPOD_GROUND_Y = 0;
+const MIRROR_TRIPOD_RADIUS = AXIS_LENGTH * Math.sin(TRIPOD_ANGLE_FROM_VERTICAL); // 底面(正三角形)の外接円半径(=既存tripodの終端3点と同じ式)
+export const MIRROR_APEX_HEIGHT = AXIS_LENGTH * Math.cos(TRIPOD_ANGLE_FROM_VERTICAL); // 頂点の高さ(=既存tripodと同じ式。tripodRingSwap.js側がring Bの高さ計算に使うためexport)
+const MIRROR_ENV_RESOLUTION = 256;                     // キューブカメラの解像度(仮値。重ければ下げる)
+// cubeCameraをmirrorVisualAnchor.positionからどれだけ上にオフセットして置くか(=ピラミッドの
+// だいたい中間の高さに撮影点を置くため。仮値)。createRecordDisplay内での初期配置と、
+// updateRecordDisplay内での毎フレーム追従の両方で同じ値を使う。
+const CUBE_CAMERA_Y_OFFSET = MIRROR_APEX_HEIGHT * 0.5;
+const _cubeCameraOffset = new THREE.Vector3(0, CUBE_CAMERA_Y_OFFSET, 0); // 毎フレームのnew Vector3()を避けるための使い回し用
+const MIRROR_TARGET_PAGE = 'prism2.html';               // 鏡クリックで遷移する先
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
 
-// ★ 2026-09-18 追加(ご指摘反映): リングの「下限」(carousel側の着地点)を、
-//   以前はtripodRingSwap.js側だけで閉じたローカル定数(RING_DOWN_Y)として持っていたが、
-//   ihの高さもこの値を直接基準にしたいため、ここ(universe.js)へ一元化した。
-//   tripodRingSwap.js側はこれをimportして使う(ローカル定義は削除済み)。
-//   ★ ここが調整箇所です: RING_DOWN_DROPを大きくするほどリングの下限は低く、
-//   小さくするほど高くなります(以前16→今回14に。「リングの下限をほんの少し高く」
-//   というご指示への対応)。
-export const RING_DOWN_DROP = 14; // 仮値。TRIPOD_GROUND_Yからどれだけ下げるか
-export const RING_DOWN_Y = TRIPOD_GROUND_Y - RING_DOWN_DROP;
+// ── 頂点のバナナ(コピー元: galaxy.js のmakeBananaMesh) ────────────
+const BANANA_RADIUS = 1.2;
+const BANANA_HIT_RADIUS = 2.6;
+export const BANANA_HEIGHT_ABOVE_APEX = AXIS_LENGTH * 0.15; // 頂点よりさらに少し上に乗せる(仮値)
 
-// 三軸の交点(頂点)。高さ軸(world Y)上に固定。
-const ORIGIN = new THREE.Vector3(0, APEX_HEIGHT, 0);
+// ══════════════════════════════════════════════════════════════
+// ▼▼▼ バナナクリック演出: ①戴冠 → ②バルジ出現 → ③太陽系(8惑星)出現 ▼▼▼
+//     (トーンアーム自体は撤去済み。今後新しく作り直し、盤面接触タイミングで
+//      revealSolarSystem()を呼ぶ形に差し替える想定)
+// ══════════════════════════════════════════════════════════════
 
-// 高さ0の平面上、高さ軸まわりの角度angleDegの位置に終端点を置く。
-function tipOnGroundPlane(angleDeg) {
-  const a = THREE.MathUtils.degToRad(angleDeg);
-  return new THREE.Vector3(TRIPOD_RADIUS * Math.cos(a), 0, TRIPOD_RADIUS * Math.sin(a));
-}
+// ── GLBローダー(banana.glb / crown.glb は record.js と同じ階層のdata/配下に置く想定) ──
+// ★ import.meta.urlを基準にすることで、index.html(ページ)がどの階層にあっても
+//   record.js自身から見た相対位置(js/data/...)で正しく解決されるようにしてある。
+//   単なる文字列('./data/banana.glb'など)をそのままGLTFLoader.load()に渡すと、
+//   fetch系のURL解決はスクリプトの場所ではなく「ページ(index.html)の場所」基準に
+//   なってしまうため、index.htmlと同じ階層に置いたファイルしか見つからない、という
+//   問題が起きる(実際に報告があった不具合の原因)。
+const BANANA_GLB_PATH = new URL('./data/banana.glb', import.meta.url).href;
+const CROWN_GLB_PATH = new URL('./data/crown.glb', import.meta.url).href;
+const gltfLoader = new GLTFLoader();
 
-// X/Y/Zの終端。120°ずつずらして三脚状に配置(どの角度をどの軸にするかに意味はなく、見た目の割り当て)。
-const AXIS_TIPS = {
-  X: tipOnGroundPlane(0),
-  Y: tipOnGroundPlane(120),
-  Z: tipOnGroundPlane(240),
-};
-
-// 回転軸=「高さ軸(world Y)」そのもの。頂点(ORIGIN)はこの軸の直上(x=0, z=0)にあるため、
-// このまわりに回転させても頂点自体は動かない ── 終端3点だけがカルーセルのようにぐるっと回る。
-// 固定のワールド軸なので、カメラの向きに依存せず毎フレーム計算し直す必要もない。
-const ROTATION_AXIS_DIR = new THREE.Vector3(0, 1, 0);
-
-// 頂点からさらに高さ軸の正方向。方程式画像はこの向きに掲げる。
-const APEX_OUTWARD_DIR = new THREE.Vector3(0, 1, 0);
-
-// ↓ 太陽系の主軌道(solarSystem.js)・レコードプレーヤー(record.js)側が「三脚頂点からさらに
-//   外側」を共有アンカーとして参照するためexportしてある(以前のRECORD_ANCHOR復活)。
-export const RECORD_ANCHOR = ORIGIN.clone().addScaledVector(APEX_OUTWARD_DIR, EQUATION_HEIGHT_ABOVE_APEX);
-
-// ── 頂点→各終端の3本の軸線を作る(以前のcreateRotatingAxes()と同じ、追加の辺はなし) ──
-function makeAxisLine(tip) {
-  const geo = new THREE.BufferGeometry().setFromPoints([ORIGIN, tip]);
-  const mat = new THREE.LineBasicMaterial({ color: AXIS_COLOR, transparent: true, opacity: 0 });
-  return new THREE.Line(geo, mat);
-}
-
-// ── 金のリング(tripodクリックで、ihと一緒にフェードイン) ─────────────
-// tripodの終端3点が描く円(=カルーセルの外周、高さ0・半径TRIPOD_RADIUS)をなぞる、
-// 金色の細いリング。実際の軸線は回転で位置が変わるが、このリングは終端が通る円周上に
-// 固定して置くだけなので、tripodの自転(updateUniverseの回転)に合わせて動かす必要はない
-// (円は回転対称なので、動かなくても「ぐるぐる回る三脚の外周をなぞっている」ように見える)。
-const RING_COLOR = 0xd4af37;                  // 仮値(金色。金属質になったので少し落ち着いた色味に)
-const RING_TUBE_RADIUS = AXIS_LENGTH * 0.018; // リングの太さ(仮値)
-const RING_FADE_DURATION = 1.4;               // フェードインの秒数(仮値)
-
-// ★ 2026-09-17 修正(ご指摘反映): 「新たに発生するリングは鏡tripodと同じように
-//   鏡面のリアルな金のリングで下側」への対応。以前はMeshBasicMaterial(単色・
-//   反射なし)だったが、鏡tripodと同じ考え方の金属質のマテリアル
-//   (MeshStandardMaterial。metalness・roughness)に変更した。envMapは生成時点では
-//   まだ存在しない(鏡のCubeCameraはrecord.js側で後から作られる)ため、ここでは
-//   nullのまま作っておき、record.js側のcreateRecordDisplayが
-//   universe.goldenRing.material.envMap = (鏡と同じrenderTarget.texture) を後から
-//   設定する(新たにCubeCameraを増やすと重くなるため、既存の1つを使い回すため)。
-const RING_METALNESS = 1;
-const RING_ROUGHNESS = 0.0; // 仮値。鏡(0.05)ほどは滑らかにせず、金属らしい艶にした
-// ★ 2026-09-19 追加(ご指摘反映):「鏡tripodがほとんど何も映らない」への対応。
-//   原因は、鏡・このリングどちらが使っているenvMap(record.js側のCubeCamera)も、
-//   THREE.WebGLRenderer.render()を直接呼ぶだけの「素の」撮影だという点にあった。
-//   このプロジェクトの見た目の明るさ・賑やかさの大部分はcomposer側のBloom
-//   (UnrealBloomPass。main.js冒頭のexcludeFromBloom等を参照)が担っているが、
-//   CubeCamera.update()はcomposerを一切経由しないため、Bloom適用前の、実際よりずっと
-//   暗く・素っ気ない状態のシーンを撮影してしまう。これがそのままenvMapとして使われる
-//   ため、反射面(鏡・このリング)が「ほとんど何も映っていない」ように見えていた
-//   (Bloomは元から存在するので、これは今回に限らず以前から起きていた現象のはず)。
-//   Bloom込みで撮り直す(=CubeCameraをもう1系統composerで撮る)のは重くなりすぎるため、
-//   代わりに反射側のenvMapIntensityを底上げすることで、最終的な(Bloom込みの)画面に
-//   合成されたときの見え方を補っている。
-//   ★ ここが調整箇所です: 反射がまだ物足りない場合はこの値をさらに上げてください。
-export const REFLECTIVE_ENV_MAP_INTENSITY = 3.0; // 仮値。以前は鏡・リングとも未設定(既定の1)だった
-function makeGoldenRing() {
-  const geometry = new THREE.TorusGeometry(TRIPOD_RADIUS, RING_TUBE_RADIUS, 16, 128);
-  const material = new THREE.MeshStandardMaterial({
-    color: RING_COLOR,
-    metalness: RING_METALNESS,
-    roughness: RING_ROUGHNESS,
-    envMap: null,
-    envMapIntensity: REFLECTIVE_ENV_MAP_INTENSITY,
-    transparent: true,
-    opacity: 0,
+function loadGLTFScene(path) {
+  return new Promise((resolve, reject) => {
+    gltfLoader.load(path, (gltf) => resolve(gltf.scene), undefined, reject);
   });
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.rotation.x = Math.PI / 2; // Torusは既定でXY平面上の輪になるので、水平(XZ平面)へ寝かせる
-  mesh.position.set(0, TRIPOD_GROUND_Y, 0); // 終端3点と同じ高さ
-  mesh.visible = false;          // tripodクリックまで隠しておく
-  return mesh;
 }
 
-// ── tripodクリック判定用の当たり判定 ────────────────────────
-// 実際の軸線は細く、そのままだとクリックで狙いにくいため、このプロジェクトの他の
-// 隠しボタン(banana・sunなど)と同じ「ほぼ透明の大きめのメッシュ」方式にする。
-// tripod全体(頂点〜終端3点)をちょうど包む球を、頂点と終端の中間の高さに置く。
-const TRIPOD_HIT_RADIUS = Math.max(APEX_HEIGHT, TRIPOD_RADIUS) * 1.15; // 仮値
-function makeTripodHitMesh() {
-  const geometry = new THREE.SphereGeometry(TRIPOD_HIT_RADIUS, 16, 16);
-  const material = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.001, depthWrite: false, depthTest: false });
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.position.set(0, APEX_HEIGHT / 2, 0); // 頂点(y=APEX_HEIGHT)と終端(y=0)のちょうど中間(仮値)
-  return mesh;
+// ── ①戴冠(5秒): crown.glbがバナナの上空からtweenで落下し、着地する ─────
+const CORONATION_TEXT = 'I wanted to speak between any two points by way of a foolish circle!\n― Metaphony';
+const CORONATION_DURATION = 10.0;             // ①戴冠にかける秒数
+const CROWN_DROP_START_HEIGHT = AXIS_LENGTH * 0.6; // バナナの上、どれだけ高い位置から降ってくるか(仮値)
+const CROWN_SCALE = 0.2; // 仮値。実際のcrown.glbのサイズを見て調整してください
+let coronationCaption = null; // 遅延生成(#axisHint等とは別の、画面下75%専用の要素)
+
+function getCoronationCaption() {
+  if (!coronationCaption) {
+    // captions.jsのcreateCaptionBoxを流用。画面下75%・水平中央に固定。改行されずに
+    // 必ず1行で表示されるようnoWrap指定(引用文+出典の "― Metaphony" もまとめて1行になる)。
+    coronationCaption = makeCaptionController(createCaptionBox({ leftPercent: 50, topPercent: 75, noWrap: true }));
+  }
+  return coronationCaption;
 }
 
-// ── tripodが回転しながら残していく粒子の軌跡(「常時見える円錐」) ─────────
-// 以前の「axesGroupの子にして一緒に回す」方式とは逆で、今回は粒子を
-// **ワールド空間に固定**する。tripodの3本の脚それぞれについて、実際に今いる
-// ワールド座標を一定の回転角おきに記録し、そこに新しい粒子を1個ずつ生成していく
-// (=「その位置からリアルタイムで粒子を生成する」)。生成された粒子はもう動かない。
-// tripodは回転し続けるので、結果として「軸線が今まさに掃いている最新位置」の周りに、
-// 過去に生成された粒子がリング状に取り巻く円錐が常に見える状態になる。
-//
-// 各粒子は生成された瞬間は透明(alpha=0)で、ROOF_FADE_DURATION秒かけて
-// ROOF_MAX_ALPHAまでゆっくり浮かび上がる(「透明度も変える」)。
-// また、生成される粒子の色は、tripodの累積回転角を1/6周期(60°)ごとに区切って
-// 黄緑↔オレンジを交互に切り替える。これにより、軸線本体の色(白系)+過去の軌跡の
-// 黄緑/オレンジの帯、という3色構成の円錐が常時見える形になる。
-//
-// リングバッファは「ちょうど1周分」の容量にしてあるので、tripodが1周してくる頃には
-// ずっと前に生成した粒子の枠を新しい粒子で上書きする形になり、位置はほぼ同じまま
-// (毎周、同じ場所が改めてふわっと浮かび上がる)、メモリも増え続けない。
-const ROOF_SPAWN_ANGLE_STEP = THREE.MathUtils.degToRad(1); // 1本の脚が何度回転するごとに1粒子生成するか(仮値。以前の3倍の密度)
-const ROOF_POINTS_PER_LEG = Math.round((Math.PI * 2) / ROOF_SPAWN_ANGLE_STEP); // 1周ぶんの生成数/脚
-const ROOF_RING_CAPACITY = ROOF_POINTS_PER_LEG * 3; // 3脚ぶん(=1周ぶんの総容量)
-const ROOF_PARTICLE_JITTER = AXIS_LENGTH * 0.02; // 脚の線からのランダムなブレ幅(仮値。太さの演出)
-// ★ 2026-09-12 修正(ご指示反映):「背景(銀河)のせいで屋根の粒子が見えない」への対応。
-//   下のROOF_VERTEX_SHADERにある gl_PointSize *= (1.0 / -viewPosition.z) は、カメラからの
-//   距離に反比例して点を小さくする(通常の遠近感)ための処理。ところが宇宙ページのカメラは
-//   疑似正射影化のためconfig.js側のUNIVERSE_CAMERA_DISTANCEを非常に大きい値(距離約1000)に
-//   設定しているため、この除算の分母が以前(距離約85)の10倍以上になり、粒子がほぼ見えない
-//   サイズまで縮んでしまっていた。UNIVERSE_CAMERA_DISTANCEに比例してuSize側を底上げする
-//   ことで、カメラ距離を今後さらに調整しても見かけの大きさが保たれるようにした。
-//   ROOF_VISIBILITY_BOOSTは「もう少し目立たせて」の上乗せぶん(仮値。ブラー/発光は
-//   AdditiveBlending+Bloom(main.js側、除外リストに入れていない)がそのまま効くので、
-//   まずは粒子自体が見えるサイズに戻すだけで十分目立つはず。それでも足りなければこの値を
-//   さらに上げるか、下のROOF_MAX_ALPHAを上げてみてください)。
-const ROOF_REFERENCE_DISTANCE = 85; // 旧UNIVERSE_CAMERA_POSの距離感(この比率を基準に補正する)
-const ROOF_VISIBILITY_BOOST = 1.5;  // 仮値。この演出だけをさらに目立たせたい場合はここを上げる
-const ROOF_PARTICLE_SIZE = AXIS_LENGTH * 0.16
-  * Math.max(1, UNIVERSE_CAMERA_DISTANCE / ROOF_REFERENCE_DISTANCE)
-  * ROOF_VISIBILITY_BOOST;
-export const ROOF_FADE_DURATION = 1.5;           // 1粒子が生成されてからフル不透明になるまでの秒数(仮値)
-const ROOF_MAX_ALPHA = 0.9;                      // フル不透明時の上限(0.75→0.9。仮値。さらに目立たせたければ1.0まで上げてよい)
-const ROOF_SIXTH = (Math.PI * 2) / 6;            // 「1/6周」= 60°
-const ROOF_COLOR_GREEN = new THREE.Color(0xa8e05f);  // 黄緑(仮値)
-const ROOF_COLOR_ORANGE = new THREE.Color(0xff8c1a); // オレンジ(仮値)
+// ── ②バルジ(棒状バー+コア)。galaxy.jsの本体バルジ(撤去済み)・
+//    bar_bulge_preview.html由来の形状をそのまま流用する。
+//    ★ 2026-09-16 設計変更(ご指示反映): 以前は「戴冠演出中だけ一瞬現れる、バナナの
+//    位置に乗る豆粒サイズのecho」で、演出終了後は(mirrorVisualAnchorごと)消える
+//    仕様だった。今回、「太陽系軌道の半分ほどのサイズで、出現させたまま(=銀河本体の
+//    一部として永続表示)。位置は銀河中心。見た目はプレビューと同じでよい」との
+//    ご指示を受け、galaxy.starsGroup(銀河本体の自転グループ)の子として銀河中心
+//    (ローカル原点)に配置し直し、戴冠演出中に一度フェードインしたらそのまま
+//    ずっと表示され続ける(mirrorVisualAnchorの可視状態に一切連動しない)ように
+//    変更した。バー/コアの各比率(HALF_WIDTH/HEIGHT比・CONCENTRATION_POWER等)は
+//    プレビューと同じ値をそのまま踏襲している。 ──
+const BULGE_REVEAL_FADE_DURATION = 3.0;   // ②バナナ消滅+バルジ出現にかける秒数(ご指示通り3秒)
+// ★ 2026-09-17 変更(ご指示反映): 「バルジの登場は、バナナの縮小と合わせて、拡大させながら
+//   登場にして」への対応。以前はBANANA_TO_BULGE_GAPだけ待ってから、opacityだけを
+//   0→1にフェードしていたが、(a)バナナの縮小開始と同時にバルジも出現を始める
+//   (間を置かない)、(b)opacityだけでなくscaleもBULGE_REVEAL_START_SCALE→1へ
+//   一緒にtweenして「拡大しながら」見えるようにした(下記startBulgeReveal参照)。
+const BULGE_REVEAL_START_SCALE = 0; // 仮値。0=完全に無から拡大してくる見え方
+// ★ 2026-09-16 変更(ご指示反映): 「バナナの消滅は回転とスケーリングで小さくして
+//   ほしい」への対応。bananaMesh.visible=falseで瞬時に消していたのを、自転しながら
+//   縮小して消える演出に変更した。
+const BANANA_VANISH_DURATION = 0.6; // 仮値(秒)。回転・縮小にかける時間
+const BANANA_VANISH_SPINS = 2;      // 仮値。消えるまでに何回転させるか
+const BANANA_VANISH_EASE = 'power1.in'; // 仮値。だんだん加速しながら消える感じ
+const BULGE_BAR_HALF_LENGTH = ORBIT_RADIUS_BASE / 2; // ご指定「太陽系軌道の半分ほど」の直接反映
+const BULGE_BAR_HALF_WIDTH  = BULGE_BAR_HALF_LENGTH * 0.32;
+const BULGE_BAR_HALF_HEIGHT = BULGE_BAR_HALF_LENGTH * 0.22;
+const BULGE_BAR_TILT = THREE.MathUtils.degToRad(25); // 仮値(galaxy.js側のBAR_TILT_DEGと同じ角度)
+// ★ ご指示により、galaxy.js側にあった「元の」バー+コア分布の式(1.8で一様寄りに)へ戻した。
+//   以前ここは境界ぼかし(BULGE_EDGE_BLUR)とセットで2.3まで強めていたが、その調整は撤去。
+const BULGE_BAR_CONCENTRATION_POWER = 1.8;  // 1.0で一様分布、大きいほど中心へ偏る(galaxy.js側の元の値)
+const BULGE_BAR_COLOR = 0xf4e04d;           // バナナと同じ色
+const BULGE_CORE_FRACTION = 0.18;           // BULGE_PARTICLE_COUNTのうちコアに割り当てる割合(仮値)
+const BULGE_CORE_RADIUS_RATIO = 0.22;       // コア半径 = BULGE_BAR_HALF_LENGTH × この比率(仮値)
+const BULGE_CORE_CONCENTRATION_POWER = 2.6; // コアはバーより強めに中心へ偏らせる(仮値。galaxy.js側と同じ値)
+const BULGE_CORE_COLOR = 0xfff6c9;          // バー本体よりやや明るい白味がかった黄色(仮値)
+// ★ 2026-09-17 大幅見直し(ご指摘反映): 「近くで見るとパーティクルが銀河のそれと違って
+//   巨大なドットにしか見える」問題への対応。原因は、バルジがテクスチャなしの素の
+//   PointsMaterialで、sizeがワールド単位・粒子数900という低密度だったこと
+//   (テクスチャなしのPointsは円ではなくベタ塗りの正方形として描かれ、カメラが
+//   近づくとその正方形が画面いっぱいに見える)。対応として:
+//   (a) galaxy.js側と同じシェーダー(円形ソフトフォールオフ+縁のフェード)を
+//       createStarPointsMaterialで共有し、質感を銀河本体と揃える。
+//   (b) 粒を大幅に小さくしつつ粒子数を増やし、「大きい粒が少し」ではなく
+//       「小さい粒がたくさん」で光の塊を表現する(密度で見せる)。
+//   (c) カメラが極端に近づいたときのための画面上サイズの上限(uMaxPixelSize)と、
+//       さらに近づいたら透明にフェードするnearFadeを追加。太陽系がバルジ付近を
+//       周回する際に画面いっぱいの色面になる事故を構造的に防ぐ。
+//   ★ この見直しにより、直前(2026-09-17 1回目)の「Bloomのにじみが強すぎる」対応
+//     (BULGE_BLOOM_INTENSITYを0.15→0.06に弱めた件)は、粒自体が縮小されたことで
+//     にじみの絶対量も下がっているはずだが、値は前回のまま残してある。見ながら
+//     必要なら調整してください。
+const BULGE_BLOOM_INTENSITY = 0.06;         // 0〜1。Bloomの強さを弱める(0=完全オフ、1=通常と同じ強さ。仮値)
+const BULGE_PARTICLE_COUNT = 6000;          // 900→6000(仮値。粒を小さくした分、密度で光の塊に見せる)
+const BULGE_BAR_POINT_SIZE = BULGE_BAR_HALF_LENGTH * 0.022;  // 以前の0.12から大幅に縮小(仮値)
+const BULGE_CORE_POINT_SIZE = BULGE_BAR_HALF_LENGTH * 0.016; // 以前の0.09から大幅に縮小(仮値)
+// 画面上の最大サイズ(px)。sizeAttenuationはシェーダー側で常に効くが、極端接近時の
+// 保険としてクランプする(仮値。frontend次第でuPixelRatio込みなのでpx基準)。
+const BULGE_MAX_PIXEL_SIZE = 48;
+// この距離(ワールド単位)より近づくと、粒のアルファがフェードして消え始める。
+// ORBIT_RADIUS_BASE(太陽系軌道の基準半径)基準にしておくと、太陽系が周回で
+// 接近する距離感と自然に対応する(仮値)。
+const BULGE_NEAR_FADE_START = ORBIT_RADIUS_BASE * 0.15;
+const BULGE_NEAR_FADE_RANGE = ORBIT_RADIUS_BASE * 0.35;
+// バー/コアそれぞれの外縁を、galaxy.js側と同じ考え方でソフトにフェードさせる比率
+// (中心からの相対半径[0,1]のうち、このぶんの幅を1→0へかける。仮値)。
+const BULGE_EDGE_FADE = 0.35;
+// ★ 2026-09-16 追加(ご指示反映): 「出現の際に銀河に穴をあけて、バルジから腕が
+//   生えてるように見せたい」への対応。bar_bulge_preview.html側のGALAXY_INNER_RADIUS_RATIO
+//   と同じ考え方(バーの半長に対する比率)で、銀河円盤側にあける穴の半径を決める。
+const GALAXY_HOLE_RADIUS_RATIO = 0.9; // 仮値。プレビューと同じ値
+const GALAXY_HOLE_RADIUS = BULGE_BAR_HALF_LENGTH * GALAXY_HOLE_RADIUS_RATIO;
 
-const ROOF_VERTEX_SHADER = /* glsl */ `
-  uniform float uSize;
-  uniform float uPixelRatio;
-  attribute vec3 aColor;
-  attribute float aAlpha;
-  varying vec3 vColor;
-  varying float vAlpha;
-  void main() {
-    vec4 modelPosition = modelMatrix * vec4(position, 1.0);
-    vec4 viewPosition = viewMatrix * modelPosition;
-    vec4 projectedPosition = projectionMatrix * viewPosition;
-    gl_Position = projectedPosition;
-    gl_PointSize = uSize * uPixelRatio;
-    gl_PointSize *= (1.0 / -viewPosition.z);
-    vColor = aColor;
-    vAlpha = aAlpha;
+// concentrationPower: 1.0で一様分布、大きいほど中心(r=0)寄りに偏る。tiltはバーの
+// 長軸をY軸まわりにどれだけ傾けるか(コアは呼び出し側でtilt=0を渡して球形にする)。
+// ★ galaxy.js側の元の式そのまま(境界ぼかしの裾は付けず、r∈[0,1]でそのまま打ち切る)。
+function sampleBulgeEllipsoidPosition(halfLength, halfWidth, halfHeight, concentrationPower, tilt) {
+  const theta = Math.random() * Math.PI * 2;
+  const phi = Math.acos(2 * Math.random() - 1);
+  const r = Math.pow(Math.random(), (1 / 3) * concentrationPower);
+
+  const x0 = r * Math.sin(phi) * Math.cos(theta) * halfLength;
+  const y0 = r * Math.cos(phi) * halfHeight;
+  const z0 = r * Math.sin(phi) * Math.sin(theta) * halfWidth;
+
+  const cosT = Math.cos(tilt);
+  const sinT = Math.sin(tilt);
+  const x = x0 * cosT - z0 * sinT;
+  const z = x0 * sinT + z0 * cosT;
+
+  return { x, y: y0, z };
+}
+
+function sampleBulgeBarPosition() {
+  return sampleBulgeEllipsoidPosition(
+    BULGE_BAR_HALF_LENGTH, BULGE_BAR_HALF_WIDTH, BULGE_BAR_HALF_HEIGHT,
+    BULGE_BAR_CONCENTRATION_POWER, BULGE_BAR_TILT
+  );
+}
+
+function sampleBulgeCorePosition() {
+  const coreRadius = BULGE_BAR_HALF_LENGTH * BULGE_CORE_RADIUS_RATIO;
+  // コアはほぼ球形(バーほど扁平にしない)。傾き付与は不要なので直接生成する。
+  const theta = Math.random() * Math.PI * 2;
+  const phi = Math.acos(2 * Math.random() - 1);
+  const r = Math.pow(Math.random(), (1 / 3) * BULGE_CORE_CONCENTRATION_POWER) * coreRadius;
+  return {
+    x: r * Math.sin(phi) * Math.cos(theta),
+    y: r * Math.cos(phi) * 0.85, // ほんの少しだけ扁平(仮値)
+    z: r * Math.sin(phi) * Math.sin(theta),
+  };
+}
+
+// galaxy.js側のsmoothstep相当(0除算を避けるための下限つき)。バー/コアそれぞれの
+// 外縁を、中心からの相対半径(0〜1)ベースでソフトにフェードさせるために使う。
+function edgeSmoothstep(edge0, edge1, x) {
+  const t = Math.min(Math.max((x - edge0) / (edge1 - edge0), 0), 1);
+  return t * t * (3 - 2 * t);
+}
+
+function makeBulgePlaceholder() {
+  // バー本体とコアを別のPointsにして、色・粒の大きさを分けて重ねる
+  // (galaxy.js本体のバルジと同じ考え方)。フェード演出(startBulgeReveal)
+  // が両方まとめて透明度を操作できるよう、group.userData.materialsに
+  // 両方のShaderMaterialをまとめておく。
+  //
+  // ★ 2026-09-17 見直し(ご指摘反映): 以前はテクスチャなしの素のPointsMaterialで
+  //   粒が大きく粒子数も少なかったため、近づくと「巨大な正方形のドット」に見えていた。
+  //   galaxy.js側と同じcreateStarPointsMaterial(円形ソフトフォールオフ・縁のフェード・
+  //   近接時のサイズ上限とアルファフェード)を使い、粒を小さく・数を増やして密度で
+  //   見せるようにした。
+  const coreCount = Math.floor(BULGE_PARTICLE_COUNT * BULGE_CORE_FRACTION);
+  const barCount = BULGE_PARTICLE_COUNT - coreCount;
+
+  const barPositions = new Float32Array(barCount * 3);
+  const barColors = new Float32Array(barCount * 3);
+  const barScales = new Float32Array(barCount);
+  const barAlphas = new Float32Array(barCount);
+  const barColor = new THREE.Color(BULGE_BAR_COLOR);
+  for (let i = 0; i < barCount; i++) {
+    const p = sampleBulgeBarPosition();
+    barPositions[i * 3] = p.x;
+    barPositions[i * 3 + 1] = p.y;
+    barPositions[i * 3 + 2] = p.z;
+    barColors[i * 3] = barColor.r;
+    barColors[i * 3 + 1] = barColor.g;
+    barColors[i * 3 + 2] = barColor.b;
+    // 中心からの相対半径(長軸基準の概算)で外縁をソフトにフェード。
+    const relRadius = Math.min(Math.hypot(p.x, p.y, p.z) / BULGE_BAR_HALF_LENGTH, 1);
+    const edge = 1 - edgeSmoothstep(1 - BULGE_EDGE_FADE, 1, relRadius);
+    barAlphas[i] = edge;
+    const sizeJitter = Math.random() * 0.7 + 0.3;
+    barScales[i] = sizeJitter * (1 - 0.5 * (1 - edge));
   }
-`;
-const ROOF_FRAGMENT_SHADER = /* glsl */ `
-  varying vec3 vColor;
-  varying float vAlpha;
-  void main() {
-    float strength = 1.0 - smoothstep(0.0, 0.5, distance(gl_PointCoord, vec2(0.5)));
-    if (strength <= 0.0 || vAlpha <= 0.0) discard;
-    gl_FragColor = vec4(vColor, strength * vAlpha);
-  }
-`;
-
-// scene直下(ワールド空間に固定)に追加する前提。position/aColor/aAlphaは
-// startTripodRoofPulse呼び出し後、updateUniverse側で少しずつ書き込んでいく
-// (作成時点では全て「まだ生成されていない」= alpha0の空の状態)。
-function makeRoofParticles() {
-  const positions = new Float32Array(ROOF_RING_CAPACITY * 3);
-  const colors = new Float32Array(ROOF_RING_CAPACITY * 3);
-  const alphas = new Float32Array(ROOF_RING_CAPACITY); // 全て0で初期化(=まだ何も見えない)
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
-  geometry.setAttribute('aAlpha', new THREE.BufferAttribute(alphas, 1));
-
-  const material = new THREE.ShaderMaterial({
-    vertexShader: ROOF_VERTEX_SHADER,
-    fragmentShader: ROOF_FRAGMENT_SHADER,
-    uniforms: {
-      uSize: { value: ROOF_PARTICLE_SIZE },
-      uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
-    },
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
+  const barGeo = new THREE.BufferGeometry();
+  barGeo.setAttribute('position', new THREE.BufferAttribute(barPositions, 3));
+  barGeo.setAttribute('aColor', new THREE.BufferAttribute(barColors, 3));
+  barGeo.setAttribute('aScale', new THREE.BufferAttribute(barScales, 1));
+  barGeo.setAttribute('aAlpha', new THREE.BufferAttribute(barAlphas, 1));
+  // galaxy.js側の共有シェーダーがaArmWeightを参照するが、バルジには「腕」の概念が
+  // ないので全て0(=常にuArmThickenStrength/uArmBrightenStrengthの影響を受けない)。
+  barGeo.setAttribute('aArmWeight', new THREE.BufferAttribute(new Float32Array(barCount), 1));
+  const barMat = createStarPointsMaterial({
+    size: BULGE_BAR_POINT_SIZE,
+    nearFadeStart: BULGE_NEAR_FADE_START,
+    nearFadeRange: BULGE_NEAR_FADE_RANGE,
+    maxPixelSize: BULGE_MAX_PIXEL_SIZE,
   });
+  barMat.uniforms.uAlpha.value = 0; // フェードイン前は非表示(startBulgeRevealが0→1にtween)
+  const barPoints = new THREE.Points(barGeo, barMat);
+  barPoints.raycast = () => {}; // クリック対象ではないので無効化(galaxy.js側と同じ扱い)
 
-  const points = new THREE.Points(geometry, material);
-  points.visible = false; // startTripodRoofPulseまで隠しておく
-  points.frustumCulled = false; // ワールド全体に散らばるため、カリングで消えないようにする
-  return points;
-}
+  const corePositions = new Float32Array(coreCount * 3);
+  const coreColors = new Float32Array(coreCount * 3);
+  const coreScales = new Float32Array(coreCount);
+  const coreAlphas = new Float32Array(coreCount);
+  const coreColor = new THREE.Color(BULGE_CORE_COLOR);
+  const coreRadius = BULGE_BAR_HALF_LENGTH * BULGE_CORE_RADIUS_RATIO;
+  for (let i = 0; i < coreCount; i++) {
+    const p = sampleBulgeCorePosition();
+    corePositions[i * 3] = p.x;
+    corePositions[i * 3 + 1] = p.y;
+    corePositions[i * 3 + 2] = p.z;
+    coreColors[i * 3] = coreColor.r;
+    coreColors[i * 3 + 1] = coreColor.g;
+    coreColors[i * 3 + 2] = coreColor.b;
+    const relRadius = Math.min(Math.hypot(p.x, p.y, p.z) / coreRadius, 1);
+    const edge = 1 - edgeSmoothstep(1 - BULGE_EDGE_FADE, 1, relRadius);
+    coreAlphas[i] = edge;
+    const sizeJitter = Math.random() * 0.7 + 0.3;
+    coreScales[i] = sizeJitter * (1 - 0.5 * (1 - edge));
+  }
+  const coreGeo = new THREE.BufferGeometry();
+  coreGeo.setAttribute('position', new THREE.BufferAttribute(corePositions, 3));
+  coreGeo.setAttribute('aColor', new THREE.BufferAttribute(coreColors, 3));
+  coreGeo.setAttribute('aScale', new THREE.BufferAttribute(coreScales, 1));
+  coreGeo.setAttribute('aAlpha', new THREE.BufferAttribute(coreAlphas, 1));
+  coreGeo.setAttribute('aArmWeight', new THREE.BufferAttribute(new Float32Array(coreCount), 1));
+  const coreMat = createStarPointsMaterial({
+    size: BULGE_CORE_POINT_SIZE, // バーより粒は小さく、密集させて「光の塊」に見せる
+    nearFadeStart: BULGE_NEAR_FADE_START,
+    nearFadeRange: BULGE_NEAR_FADE_RANGE,
+    maxPixelSize: BULGE_MAX_PIXEL_SIZE,
+  });
+  coreMat.uniforms.uAlpha.value = 0;
+  const corePoints = new THREE.Points(coreGeo, coreMat);
+  corePoints.raycast = () => {};
 
-// 1本の脚ぶん、ワールド座標のapex→tipの間に1粒子ぶんの位置をランダムに決めて
-// リングバッファのslotへ書き込む(位置・色・alpha=0・経過時間リセット)。
-const _roofSpawnPos = new THREE.Vector3();
-function spawnRoofParticle(universe, worldOrigin, worldTip, color) {
-  const slot = universe.roofWriteIndex;
-  universe.roofWriteIndex = (universe.roofWriteIndex + 1) % ROOF_RING_CAPACITY;
-
-  const s = Math.random();
-  _roofSpawnPos.copy(worldOrigin).lerp(worldTip, s);
-  _roofSpawnPos.x += (Math.random() - 0.5) * ROOF_PARTICLE_JITTER;
-  _roofSpawnPos.y += (Math.random() - 0.5) * ROOF_PARTICLE_JITTER;
-  _roofSpawnPos.z += (Math.random() - 0.5) * ROOF_PARTICLE_JITTER;
-
-  const posAttr = universe.roofParticles.geometry.attributes.position;
-  const colorAttr = universe.roofParticles.geometry.attributes.aColor;
-  posAttr.setXYZ(slot, _roofSpawnPos.x, _roofSpawnPos.y, _roofSpawnPos.z);
-  colorAttr.setXYZ(slot, color.r, color.g, color.b);
-  posAttr.needsUpdate = true;
-  colorAttr.needsUpdate = true;
-  universe.roofSpawnElapsed[slot] = 0; // フェードインをここから開始
-}
-
-// ── ih(tripodクリックのシーケンス最後に出現) ────────────────────
-// 金のリング(半径TRIPOD_RADIUS。高さはtripodRingSwap.js側で動く)のすこし内側・かつ
-// リングより高い位置(IH_ABOVE_RING_MARGIN)を、回転木馬の馬車のように上下にバウンス
-// しながら周回させる。
-//
-// ★ ご指示反映(2026-09-14、3回目の修正):
-//   以前は「同じ絵(ih)をごくわずかにずらして何枚も重ねる」印刷レリーフ的な手法で
-//   厚みを表現していたが、これは中身が「厚みゼロの板を何枚も並べただけ」だったため、
-//   真横から見ると各板の見える面積が実質ゼロになり、「横から見ると消える」という
-//   欠陥があった。ご用意いただいたih.svg(文字の輪郭そのものをベクターパスで持つ
-//   ファイル)をSVGLoaderで読み込み、THREE.ExtrudeGeometryで実際にZ方向へ押し出した
-//   本物の立体にする方式に変更した。側面にも実ポリゴンがあるので、真横からでも
-//   ちゃんと厚みのある物体として見える。
-//   向きはカメラを追わず、「円の外側(=惑星でいう遠心力方向)」へ固定する
-//   (updateIhOrbitPosition内でlookAtにより毎フレーム計算)。lookAtで常に「前面」が
-//   外側(=カメラにほぼ正対する側)を向くため、押し出しの「裏面」が見える機会は
-//   実質無く、前後で見た目を変える処理は不要。
-// ★ プロパティ名はuniverse.ihSpriteのまま(main.js側の参照を変えずに済むように)残してあるが、
-//   実体はもうTHREE.Spriteではない点に注意。
-const IH_SVG_URL = new URL('./data/ih.svg', import.meta.url).href;
-// ★ 2026-09-18 修正(ご指摘反映): 「ihを8割ぐらいに小さくして」への対応。以前の8.4から
-//   さらに0.8倍(=もとの56%)に縮小した。幅はSVGの比率から自動計算。
-const IH_WORLD_HEIGHT = 8.4 * 0.8;
-const IH_THICKNESS = IH_WORLD_HEIGHT * 10; // 押し出しの厚み(ExtrudeGeometryのdepth。ワールド単位、仮値。見ながら調整)
-const IH_ORBIT_RADIUS = TRIPOD_RADIUS * 0.85; // リングより「すこし内側」を周回する半径(仮値)
-// ★ 2026-09-12 修正(ご指示反映):「ihの高さがおかしいのでリングの上に配置して。ただし
-//   下振れの時にリングより低くならないよう少し高めに」への対応。ih側は絶対値ではなく
-//   「リングの下限(RING_DOWN_Y)からの相対的な底上げ量」IH_ABOVE_RING_MARGINで決めている。
-//   下のIH_BOB_AMPLITUDEぶん上下にバウンスしてもリングを下回らないよう、
-//   IH_ABOVE_RING_MARGIN > IH_BOB_AMPLITUDE にしてある。
-// ★ 2026-09-17 修正(ご指摘反映): 「carouselのihの位置が上にあるので下げて」への対応。
-//   IH_ABOVE_RING_MARGIN(=リングからの浮かせ量)が0.35と大きめだったため0.15へ下げた。
-// ★ 2026-09-18 修正(ご指摘反映): 「ihの出現位置がリングの出現位置(=当時の
-//   universe.goldenRing.position.y)を基準にしていて高い」への対応。goldenRingは
-//   戴冠演出が終わるまでTRIPOD_GROUND_Y(=0)に隠れたまま動かないため、実際に画面に
-//   見えているリング(record.crossfadeRing)の下限より高い位置がihの基準になって
-//   しまっていた。updateIhOrbitPosition側の参照をuniverse.goldenRing.position.yから
-//   固定値RING_DOWN_Y(リングの下限。上で定義)へ変更したので、以後はここの値が
-//   「リングの下限からの浮かせ量」として素直に機能する。
-//   ★ ここが調整箇所です: この値を大きくするほどリングの下限から高く浮き、小さくするほど
-//   リングに近づきます。IH_BOB_AMPLITUDE(バウンス振幅)より必ず大きい値にしてください
-//   (小さくするとバウンスの下振れでリングに埋まって見えてしまいます)。
-const IH_ABOVE_RING_MARGIN = AXIS_LENGTH * 0.35; // リングの下限からどれだけ上に配置するか(仮値)
-const IH_ORBIT_SPEED = 0.35;        // 周回の角速度(ラジアン/秒、仮値)
-const IH_BOB_AMPLITUDE = AXIS_LENGTH * 0.12; // 上下バウンスの振幅(仮値。IH_ABOVE_RING_MARGINより必ず小さくすること)
-const IH_BOB_SPEED = 1.6;           // 上下バウンスの速さ(ラジアン/秒、仮値)
-
-// Groupの直下は最初は空のまま(setIhFadeで表示に切り替わるまで隠しておく)。実体の
-// メッシュ(ExtrudeGeometryで押し出したih.svg由来のポリゴン)は非同期読み込み完了後に
-// 子として追加する(下記のSVGLoader.load参照)。
-function makeIhObject() {
   const group = new THREE.Group();
+  group.add(barPoints, corePoints);
   group.visible = false;
+  // ★ createStarPointsMaterialはShaderMaterialなので、フェード演出は
+  //   m.opacity(素のPointsMaterial時代の名残)ではなくm.uniforms.uAlpha.valueを
+  //   操作する必要がある。呼び出し側(startBulgeReveal)を書き換えずに済むよう、
+  //   ここではuserData.materialsに「ShaderMaterialそのもの」を渡し、呼び出し側の
+  //   `.opacity = x` 代入は使わず `.uniforms.uAlpha.value = x` に統一している
+  //   (該当箇所は本ファイル内のstartBulgeRevealを参照)。
+  group.userData.materials = [barMat, coreMat];
   return group;
 }
 
-// ihの周回位置・向きを、経過秒数(universe.ihElapsed)から計算してmeshへ反映する。
-// setIhFade(非表示→表示に切り替わった瞬間の位置合わせ)とupdateUniverse(毎フレーム)の両方から呼ぶ。
-const _ihOutwardTarget = new THREE.Vector3();
-function updateIhOrbitPosition(universe) {
-  const angle = universe.ihElapsed * IH_ORBIT_SPEED;
-  const x = IH_ORBIT_RADIUS * Math.cos(angle);
-  const z = IH_ORBIT_RADIUS * Math.sin(angle);
-  const y = RING_DOWN_Y + IH_ABOVE_RING_MARGIN + IH_BOB_AMPLITUDE * Math.sin(universe.ihElapsed * IH_BOB_SPEED);
-  universe.ihSprite.position.set(x, y, z);
+// ══════════════════════════════════════════════════════════════
+// ▼▼▼ ①戴冠 → ②バルジ出現 → ③太陽系(8惑星)出現 ▼▼▼
+// ══════════════════════════════════════════════════════════════
+// ★ 2026-09-17 撤去(ご指示反映): 針(トーンアーム)のメッシュ・付け根位置・回転による
+//   追従計算(旧NEEDLE_*一式・makeNeedleMesh/computeNeedlePivot/mountNeedleAtPivot/
+//   setNeedleRadius)と、その軌跡を描いていた「溝」(旧GROOVE_*一式・makeGrooveLine/
+//   resetGroove/appendGroovePoint)は、形・位置・動きが実物のトーンアームとして
+//   何もかも不自然だったため全削除した。オブジェクト自体もcreateRecordDisplay側から
+//   削除済み(needle/groove変数・returnの両方)。
+//   トーンアーム自体は今後、別途新しく作り直す予定。新しい実装が完成したら、
+//   トーンアームが盤面(金のリング)に触れたタイミングで下のrevealSolarSystem(record)
+//   を呼ぶ形に差し替えてください(内容は「リング接触時に太陽系を召喚する」処理その
+//   ものなので、トーンアームの見た目に関係なく再利用できるはずです)。
+//   ★ 暫定措置: 新しいトーンアームができるまでの間、バルジのフェードインが終わった
+//     直後にrevealSolarSystem(record)を直接呼び、太陽系が即座に召喚されるように
+//     してある(startBulgeReveal内を参照)。
+const RING_CONTACT_RADIUS = ORBIT_RADIUS_BASE; // 太陽系の主軌道半径として召喚する半径(仮値。ゴールドリングの実寸に合わせて調整)
+const SOLAR_SYSTEM_GROW_DURATION = 3.2; // ③太陽系がリング半径から本来の大きさへ広がる秒数(仮値)
 
-  // 固定方向: カメラを追わず、「円の外側」(=中心軸から見た放射方向。惑星でいう遠心力の向き)へ
-  // 常に固定する。放射方向は角度(x, z)だけで決まり、高さ(y)には依存しない。
-  _ihOutwardTarget.set(x * 2, y, z * 2); // 現在位置よりさらに外側の点をlookAtのターゲットにする
-  universe.ihSprite.up.set(0, 1, 0);
-  universe.ihSprite.lookAt(_ihOutwardTarget);
+// 金のリング(crossfadeRing。バナナと同じ高さで拡大する戴冠演出用リング)の「半径」との
+// 接触判定用。crossfadeRingはXZ中心が原点なので、
+// ここでは「対象(太陽/将来のトーンアーム接触点)の現在半径(=galaxyCenterからの
+// XZ距離)」がRING_CONTACT_RADIUS以下になったかどうかだけを見ればよい
+// (真上から見た接触判定)。トーンアーム自体の見た目が変わっても、この関数自体は
+// そのまま使える汎用の判定なので残してある。
+function hasTouchedGoldenRing(currentRadius) {
+  return currentRadius <= RING_CONTACT_RADIUS;
 }
 
-// ── 終端点のラベル(X/Y/Z) ────────────────────────
-// axisLabels.jsのmakeTextSprite()を再利用。Spriteは常にカメラを向くので、
-// 三脚がぐるぐる回っても文字は常に読める向きのまま保たれる。
-const AXIS_LABEL_OFFSET = 1.6;      // 終端よりどれだけ外側にラベルを置くか(線とかぶらないように)
-const AXIS_LABEL_WORLD_SIZE = 2.2;  // ラベルの表示サイズ(ワールド単位)
-
-function makeAxisTipLabel(name, tip) {
-  const sprite = makeTextSprite(name, {
-    canvasWidth: 128,
-    canvasHeight: 128,
-    worldWidth: AXIS_LABEL_WORLD_SIZE,
-    worldHeight: AXIS_LABEL_WORLD_SIZE,
-  });
-  const dir = tip.clone().sub(ORIGIN).normalize();
-  sprite.position.copy(tip).addScaledVector(dir, AXIS_LABEL_OFFSET);
-  sprite.material.opacity = 0; // 軸線・数式と一緒にフェードインさせる(enterUniverse側)
-  sprite.userData.axisName = name; // ← 追加: クリック判定(main.js側)でX/Y/Zを区別するため
-  return sprite;
-}
-
-function createRotatingAxes() {
-  const group = new THREE.Group();
-  const xAxis = makeAxisLine(AXIS_TIPS.X);
-  const yAxis = makeAxisLine(AXIS_TIPS.Y);
-  const zAxis = makeAxisLine(AXIS_TIPS.Z);
-  group.add(xAxis, yAxis, zAxis);
-
-  const xLabel = makeAxisTipLabel('X', AXIS_TIPS.X);
-  const yLabel = makeAxisTipLabel('Y', AXIS_TIPS.Y);
-  const zLabel = makeAxisTipLabel('Z', AXIS_TIPS.Z);
-  group.add(xLabel, yLabel, zLabel);
-
-  return {
-    group,
-    lines: [xAxis, yAxis, zAxis],
-    labels: [xLabel, yLabel, zLabel],
-  };
-}
-
-// ── ワンセットの方程式スプライトを作る(まだテクスチャ未ロード、opacity=0) ──
-function makeEquationSprite() {
-  const material = new THREE.SpriteMaterial({
-    map: null,
-    color: EQUATION_COLOR_DEFAULT.clone(),
-    transparent: true,
-    depthWrite: false,
-    opacity: 0,
-  });
-  const sprite = new THREE.Sprite(material);
-  // 原点から、重心と反対側(APEX_OUTWARD_DIR)へさらに掲げる。
-  sprite.position.copy(ORIGIN).addScaledVector(APEX_OUTWARD_DIR, EQUATION_HEIGHT_ABOVE_APEX);
-  sprite.visible = false;
-  return sprite;
-}
-
-// ── マウス接近で色が変化する遊び ────────────────────────
-// カーソルが方程式画像(のスクリーン投影位置)へ近づくほど、白 → 虹色(スペクトル)へ
-// じわっと変化する。単純な2色補間ではなく、距離(t)をそのままHSLの色相(hue)に
-// マッピングしているので、「近づくほど色が濃くなる」だけでなく「近づく過程で
-// 赤→橙→…→紫、とスペクトルを掃引していく」ように見える。
-export const EQUATION_COLOR_DEFAULT = new THREE.Color(0xffffff);
-const EQUATION_HOVER_RADIUS_PX = 240;   // この距離(px)以内に近づくほど色が変わり始める(仮値)
-const EQUATION_SPECTRUM_HUE_FAR = 0;    // 半径のふち(t=0側)での色相。赤(仮値)
-const EQUATION_SPECTRUM_HUE_NEAR = 300; // 一番近づいたとき(t=1)の色相。紫寄り(仮値。0-360で赤に戻らないよう300止まり)
-const EQUATION_SPECTRUM_SATURATION = 0.85;
-const EQUATION_SPECTRUM_LIGHTNESS = 0.6;
-
-const _hoverColor = new THREE.Color();
-const _hoverSpectrum = new THREE.Color();
-const _hoverProjected = new THREE.Vector3();
-
-// main.jsのpointermoveハンドラから毎回呼ぶ想定。宇宙ページが非アクティブ、または
-// 表示中の方程式スプライトがまだ無い間は何もしない。
-export function updateEquationHoverByPointer(universe, camera, clientX, clientY) {
-  if (!universe || !universe.isActive) return;
-  const sprite = universe.sprites[universe.equationIndex];
-  if (!sprite || !sprite.visible) return;
-
-  sprite.getWorldPosition(_hoverProjected);
-  _hoverProjected.project(camera);
-  const screenX = (_hoverProjected.x * 0.5 + 0.5) * window.innerWidth;
-  const screenY = (1 - (_hoverProjected.y * 0.5 + 0.5)) * window.innerHeight;
-
-  const dist = Math.hypot(clientX - screenX, clientY - screenY);
-  const t = THREE.MathUtils.clamp(1 - dist / EQUATION_HOVER_RADIUS_PX, 0, 1);
-
-  const hue = THREE.MathUtils.lerp(EQUATION_SPECTRUM_HUE_FAR, EQUATION_SPECTRUM_HUE_NEAR, t) / 360;
-  _hoverSpectrum.setHSL(hue, EQUATION_SPECTRUM_SATURATION, EQUATION_SPECTRUM_LIGHTNESS);
-  // t=0(遠い)では白のまま、t=1(近い)に近づくほどスペクトル色が濃く乗る
-  _hoverColor.copy(EQUATION_COLOR_DEFAULT).lerp(_hoverSpectrum, t);
-  sprite.material.color.copy(_hoverColor);
-}
-
-// scene: このシーン専用のTHREE.Sceneでも、既存sceneの続きに追加でもよい
-// (main.js側で「Phase3までの要素は隠す/別レイヤーに逃がす」判断をしてから使う想定)。
-export function createUniverse(scene) {
-  // ★ tripod/ring対応スワップ演出(record.jsのmirrorGroupと位置を入れ替える)のための
-  //   ラッパー。axesGroup自体はこれまで通りliftTripod・自転(rotateOnWorldAxis)で
-  //   ローカルに動く/回るだけにしておき、スワップ演出はこのtripodAnchor(の.position)
-  //   だけを動かすことで、既存のlift・回転ロジックと競合しないようにしてある。
-  const tripodAnchor = new THREE.Group();
-  scene.add(tripodAnchor);
-
-  const { group: axesGroup, lines: axisLines, labels: axisLabels } = createRotatingAxes();
-  tripodAnchor.add(axesGroup);
-
-  const goldenRing = makeGoldenRing();
-  scene.add(goldenRing);
-
-  const tripodHitMesh = makeTripodHitMesh();
-  scene.add(tripodHitMesh);
-
-  // tripodが回転しながら残していく粒子の軌跡。ワールド空間に固定するので、
-  // axesGroupの子ではなくsceneに直接追加する。
-  const roofParticles = makeRoofParticles();
-  scene.add(roofParticles);
-
-  const ihSprite = makeIhObject();
-  scene.add(ihSprite);
-  new SVGLoader().load(
-    IH_SVG_URL,
-    (data) => {
-      const material = new THREE.MeshBasicMaterial({
-        color: 0xffffff, transparent: true, opacity: 0, side: THREE.DoubleSide,
-      });
-
-      const meshes = [];
-      for (const path of data.paths) {
-        const shapes = SVGLoader.createShapes(path);
-        for (const shape of shapes) {
-          const geometry = new THREE.ExtrudeGeometry(shape, {
-            depth: IH_THICKNESS,
-            bevelEnabled: false,
-            curveSegments: 12,
-          });
-          geometry.translate(0, 0, -IH_THICKNESS / 2); // Z方向の中心を0に揃える(前後に半分ずつ)
-          meshes.push(new THREE.Mesh(geometry, material));
-        }
-      }
-      if (meshes.length === 0) {
-        console.error('createUniverse: ih.svgからパスを読み取れませんでした');
-        return;
-      }
-
-      const combined = new THREE.Group();
-      meshes.forEach((m) => combined.add(m));
-
-      // SVGは左上原点・Y下向きの座標系なので、bboxを使って中心を原点に据え、
-      // 高さがIH_WORLD_HEIGHTになるようスケール(Yはこの時点で反転もかねる)する。
-      const box = new THREE.Box3().setFromObject(combined);
-      const size = box.getSize(new THREE.Vector3());
-      const center = box.getCenter(new THREE.Vector3());
-      meshes.forEach((m) => {
-        m.position.x -= center.x;
-        m.position.y -= center.y;
-      });
-      const scale = size.y === 0 ? 1 : IH_WORLD_HEIGHT / size.y;
-      combined.scale.set(scale, -scale, scale); // Y方向だけ符号を反転(SVGのY下向き→ワールドのY上向き)
-
-      ihSprite.userData.material = material;
-      ihSprite.add(combined);
+// ③本編: リングに接触した(=今は暫定的に、バルジ出現直後に即時呼ばれる)ら太陽系を召喚する。
+// トーンアーム実装後は、トーンアームが盤面に接触したタイミングでこの関数を呼ぶだけでよい。
+function revealSolarSystem(record) {
+  const { solarSystem, galaxyCenter } = record;
+  // ▼ 太陽系(8惑星)の召喚: リング接触とみなす半径(RING_CONTACT_RADIUS)からスタートし、
+  //   本来の大きさまで広がる。
+  setOrbitCenter(solarSystem, galaxyCenter);
+  setOrbitRadius(solarSystem, RING_CONTACT_RADIUS);
+  solarSystem.group.visible = true;
+  solarSystem.sunTrailRecording = true; // 太陽自身の軌跡もこの瞬間から記録開始
+  solarSystem.sunTrailLastRecorded = -Infinity;
+  growOrbitToFull(solarSystem, { duration: SOLAR_SYSTEM_GROW_DURATION });
+  // ▲ ここまで
+  // ★ 2026-09-17 再訂正(ご指摘反映): 「太陽が到達して消える金のリング」は、
+  //   もともと上(バナナと同じ高さ)にあるcrossfadeRing自身(=拡大したリングその
+  //   もの)。新設した別リングではない。crossfadeRingはcarousel本来のリング
+  //   (universe.goldenRing)とは無関係なので、消してもcarousel側は一切影響を
+  //   受けない。
+  //   hideCrossfadeRingのフェードが実際に完了した後(onComplete)でrecord.onSequenceComplete
+  //   を呼ぶ(tripod⇔鏡tripodの表示をcarousel側へ確定させる後始末はfinishTripodRingSwapが行う)。
+  hideCrossfadeRing(record.crossfadeRing, {
+    onComplete: () => {
+      // ★ 2026-09-15 追加(ご指示反映): 「リングが消滅すると同時にcarousel一式(数式・ih・
+      //   下側のリング)に交換してほしい。以後、リング・鏡tripod・バナナは二度と登場させない」
+      //   への対応。tripod⇔鏡tripodの切り替え(tripodRingSwap.js)は、以後もう
+      //   scroll駆動では使わない片道切符の演出だったので、ここで「終了」を通知して
+      //   carousel側へ強制的に戻してもらう。実体(finishTripodRingSwap呼び出し)は
+      //   main.js側でこのフックに差し込まれている(createRecordDisplay時点ではまだ
+      //   tripodRingSwapのインスタンスが存在しないため)。
+      if (record.onSequenceComplete) record.onSequenceComplete();
     },
-    undefined,
-    (err) => console.error('createUniverse: ih.svgの読み込みに失敗', err)
+  }); // ★ 太陽がリングに到達したので、拡大しておいた金のリング(crossfadeRing)を消す
+  record.phase = 'done';
+}
+
+// ①②③本編: バナナクリックで最初に呼ぶ。戴冠(5秒)→バナナ消滅+バルジ出現(3秒)→revealSolarSystem。
+function playCoronationSequence(record) {
+  if (record.coronationStarted) return; // 二重発火防止
+  record.coronationStarted = true;
+  // ★ バグ修正: 演出中はmirrorVisualAnchor(バナナ・王冠・バルジの親)がスクロールで
+  //   非表示に戻されないよう、tripodRingSwap.js側に強制表示を依頼する。
+  record.coronationLockVisible = true;
+
+  const { bananaMesh, crownGroup, bulge, galaxy } = record;
+  const caption = getCoronationCaption();
+
+  // ① 戴冠(5秒): crown.glbをバナナの上空からtweenで落下させる(mirrorVisualAnchor内のローカル座標)。
+  crownGroup.position.copy(bananaMesh.position).add(new THREE.Vector3(0, CROWN_DROP_START_HEIGHT, 0));
+  crownGroup.visible = true;
+  caption.setText(CORONATION_TEXT);
+  // ★ ご指摘反映: テキスト表示と同時に、バナナと同じ高さにある既存のリング
+  //   (crossfadeRing)自身を「太陽系のらせん軌道(=ORBIT_RADIUS_BASE。
+  //   revealSolarSystem側が太陽系召喚に使うRING_CONTACT_RADIUSと同じ値)」の
+  //   サイズまで拡大しておく。新しいリングを追加で発生させるのではなく、この
+  //   もとからあるリング自身を拡大する。太陽系が実際に召喚された時点
+  //   (revealSolarSystem内)で、この拡大したリングを消す。
+  growCrossfadeRing(record.crossfadeRing, { targetRadius: ORBIT_RADIUS_BASE, duration: CORONATION_DURATION });
+
+  gsap.to(crownGroup.position, {
+    y: bananaMesh.position.y + BANANA_RADIUS * 0.6, // バナナの上に軽く乗る高さ(仮値)
+    duration: CORONATION_DURATION,
+    ease: 'bounce.out',
+  });
+
+  setTimeout(() => {
+    caption.hide();
+    startBulgeReveal();
+  }, CORONATION_DURATION * 1000);
+
+  // ② バルジ出現(3秒でフェードイン)。バナナは消滅。
+  //   ★ 2026-09-17 変更(ご指示反映): 「バルジの登場は、バナナの縮小と合わせて、
+  //     拡大させながら登場にして」への対応。以前は「消滅→(間)→出現」という
+  //     順番待ちだったが、バナナの縮小開始と同時にバルジも出現を始め、opacityと
+  //     scaleを一緒にtweenして「拡大しながら」現れるようにした。
+  //   ★ 2026-09-17 撤去: 以前はここで針(トーンアーム)も一緒に出現・移動させていた
+  //     (関数名もstartBulgeAndNeedleだった)が、針の実装ごと撤去したためバルジのみに
+  //     なった(関数名もstartBulgeRevealに変更)。
+  function startBulgeReveal() {
+    crownGroup.visible = false; // 王冠もバナナと一緒に役目を終える(仮の挙動。残したい場合は消さない)
+    gsap.to(bananaMesh.rotation, {
+      y: bananaMesh.rotation.y + Math.PI * 2 * BANANA_VANISH_SPINS,
+      duration: BANANA_VANISH_DURATION,
+      ease: BANANA_VANISH_EASE,
+    });
+    gsap.to(bananaMesh.scale, {
+      x: 0, y: 0, z: 0,
+      duration: BANANA_VANISH_DURATION,
+      ease: BANANA_VANISH_EASE,
+      onComplete: () => {
+        bananaMesh.visible = false;
+        // 次にまた表示することがあれば元の見た目に戻るよう、回転・スケールを戻しておく。
+        bananaMesh.rotation.set(0, 0, 0);
+        bananaMesh.scale.set(1, 1, 1);
+      },
+    });
+
+    // バナナの縮小と同時にバルジも出現を開始する(間を置かない)。
+    bulge.visible = true;
+    bulge.scale.setScalar(BULGE_REVEAL_START_SCALE);
+    bulge.userData.materials.forEach((m) => { m.uniforms.uAlpha.value = 0; });
+    // ★ 2026-09-16 追加(ご指示反映): バルジ出現と同時に、銀河円盤側の中心に
+    //   穴をあけて「バルジから腕が生えている」ように見せる。瞬時の切り替え
+    //   (アニメーションなし)だが、バルジのフェードインが3秒あるので、円盤が
+    //   一瞬で欠けること自体はバルジの光に紛れて目立ちにくいはず。
+    setGalaxyInnerRadius(galaxy, GALAXY_HOLE_RADIUS);
+    // bulgeは今はバー+コアの2つのPointsを子に持つGroup。両方のopacityを
+    // 同じ進行度から一斉に動かすため、単一のtween変数を経由させる
+    // (バラバラのタイミングでフェードすると、コアだけ先に見えてしまう等
+    // 不自然になるのを避けるため)。scaleも同じtに合わせて拡大させる。
+    const bulgeReveal = { t: 0 };
+    gsap.to(bulgeReveal, {
+      t: 1,
+      duration: BULGE_REVEAL_FADE_DURATION,
+      onUpdate: () => {
+        bulge.userData.materials.forEach((m) => { m.uniforms.uAlpha.value = bulgeReveal.t; });
+        bulge.scale.setScalar(THREE.MathUtils.lerp(BULGE_REVEAL_START_SCALE, 1, bulgeReveal.t));
+      },
+    });
+
+    // ★ 2026-09-17 追加(暫定措置): 針(トーンアーム)を撤去したことで、以前は
+    //   「針が銀河中心へゆっくり近づき、金のリングに触れたら太陽系召喚」という
+    //   時間のかかる演出だったが、その置き換えとなるトーンアームはまだ未実装。
+    //   新しいトーンアームが完成するまでの間、バルジのフェードインが終わったら
+    //   直接revealSolarSystem(record)を呼び、太陽系がすぐに召喚されるようにして
+    //   ある。トーンアーム実装時は、このsetTimeout呼び出しを、トーンアームが
+    //   盤面に接触した瞬間のコールバックに置き換えてください。
+    setTimeout(() => {
+      revealSolarSystem(record); // ③
+    }, BULGE_REVEAL_FADE_DURATION * 1000);
+  }
+}
+// ══════════════════════════════════════════════════════════════
+// ▲▲▲ バナナクリック演出 ここまで ▲▲▲
+// ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+// ▼▼▼ トーンアーム(ガラス製) ▼▼▼
+// ══════════════════════════════════════════════════════════════
+// ★ 2026-09-17 追加(ご指示反映): universe-glass-preview.html(トーンアーム
+//   configuratorで作り込んだ最終形)の形状生成コード・ガラスマテリアルをそのまま
+//   移植した。
+//   ★ 2026-09-18 追加(ご指示反映): 「回転軸側(pivot)を固定して、針側が回転する
+//     ようにする。クリックで円盤の外側に針側を配置する」への対応。アーム自体の
+//     形(内部のS字カーブ)は固定のまま、アーム全体をpivot(付け根)を軸に
+//     ワールドYまわりで剛体回転させることで、針先を銀河の中心からの距離
+//     (=レコードの半径)を変えて追従させる。仕組みは以前あった針(needle)の
+//     setNeedleRadius(円と円の交点を求める古典的な幾何計算)と同じ考え方だが、
+//     今回は「直線の棒」ではなく「あらかじめ曲がったガラスのアーム」がまるごと
+//     回転する点が異なるため、計算をベクトルで一般化してある(下記
+//     computeTonearmPhiForRadius参照)。
+//   ★ 配置の向き(「右」「奥」)は、プレビュー側では固定のワールドX/Z軸を使っていたが、
+//     このプロジェクトの宇宙ページのカメラは(config.jsの)UNIVERSE_CAMERA_POS→
+//     UNIVERSE_CAMERA_TARGETという特定方向を向いているため、ワールド軸そのままでは
+//     「カメラから見て銀河の右側」になるとは限らない。そこで、カメラの視線方向から
+//     「カメラの右」「カメラの奥」を計算し、pivotの位置の基準にしている
+//     (=常にカメラから見て銀河の右奥の角に取り付いているように見える)。
+
+// ── ガラスの形状パラメータ ─────────────────────────────
+// プレビューはRECORD_RADIUS(=銀河の半径として仮定した値)=100を基準に全ての長さを
+// 決めていたので、実際のGALAXY_RADIUSとの比率(TONEARM_SCALE)で全長さをスケールし、
+// 同じ見た目の比率を保つ。
+const TONEARM_SCALE = GALAXY_RADIUS / 100;
+const TONEARM_PIVOT_GAP = 40 * TONEARM_SCALE;   // pivotを銀河の外周からどれだけ「右」に離すか(仮値)
+const TONEARM_MOUNT_HEIGHT = 15 * TONEARM_SCALE; // pivot(≒盤面)の高さ(仮値)
+const TONEARM_PARAMS = {
+  length: 200 * TONEARM_SCALE,
+  bendDeg: 30,          // 曲がる角度(度)。プレビューの最終値のまま
+  ratio: 0.70,          // アーム全長のうち、曲がり始める位置の比率。プレビューの最終値のまま
+  soft: 0.45,           // 曲がり始め〜曲がり終わりの範囲(比率)。プレビューの最終値のまま
+  width: 22.5 * TONEARM_SCALE,
+  height: 15 * TONEARM_SCALE,
+  cornerRadius: 4.5 * TONEARM_SCALE,
+  segments: 60,         // メッシュの分割数(見た目の滑らかさ。長さに依存しないのでスケールしない)
+};
+const TONEARM_COLOR = new THREE.Color(0xbfd4ff); // ガラスの減衰色(仮値。プレビューのattenuationColorと同じ)
+// アームの形を組み立てるときだけ使う、固定のローカル基準軸(「ローカル右」「ローカル奥」)。
+// 実際のワールド向き(カメラの右・奥)へは、あとでbaseQuaternion一つで丸ごと回転させる
+// (=局所+X軸を世界のrightDirへ合わせる回転。両方とも水平ベクトルなので、この回転は
+// ワールドYまわりの単純な向き変えになる)。
+const TONEARM_LOCAL_RIGHT = new THREE.Vector3(1, 0, 0);
+const TONEARM_LOCAL_BACK = new THREE.Vector3(0, 0, -1);
+// ── 針先(rest/placed)の半径(=銀河中心からの距離) ─────────────
+const TONEARM_REST_RADIUS = GALAXY_RADIUS * 1.15;  // 休符位置。「レコードの外側」の少し外(仮値)
+// ★ 2026-09-18 修正(ご指摘反映): 「アームの回転角度をもう少し上げて、より盤面側へ
+//   持っていってほしい」への対応。以前はGALAXY_RADIUS(=円盤の外周ぎりぎり)だったが、
+//   もう少し内側(盤面の上)へ針が乗るよう半径を小さくした。半径を小さくするほど
+//   pivotから見た振れ角(phi)は大きくなる(=より深く振り込む)ので、結果として
+//   「回転角度が上がる」という見え方になる。
+//   ★ ここが調整箇所です: この係数(1.0が外周)を小さくするほど、針はより盤面の
+//   内側(中心寄り)に置かれます。
+const TONEARM_PLACE_RADIUS = GALAXY_RADIUS * 0.85;  // クリックで置く位置。円盤の外周よりすこし内側(盤面側)
+const TONEARM_PLACE_DURATION = 1.6; // 休符位置→外周まで、pivotを軸に振り下ろす秒数(仮値)
+const TONEARM_SPIN_BOOST = 1.5; // 「置いたら銀河の回転を少し上げる」の反映(仮値。倍率)
+// ★ 2026-09-19 追加(ご指摘反映): 「アームの軸回転は、実際の挙動のように少し上に持ち
+//   上げて、針を上げながら回転、最後に下す動きにしてほしい。上げるのはわずかでよい」
+//   への対応。pivotグループ(group)自体のYを、この量だけ一時的に持ち上げる。
+//   ★ ここが調整箇所です: 大きくするほど高く持ち上がります。
+const TONEARM_LIFT_HEIGHT = 3.5 * TONEARM_SCALE; // 持ち上げ量(仮値。「わずか」を意図した小さめの値)
+const TONEARM_LIFT_RISE_FRACTION = 0.22; // 全体の動作時間のうち、上げ/下げにかける割合(仮値)
+
+// 断面(profile)を作る。width×heightの角丸長方形(底面2隅は角丸なしの鋭角、
+// それ以外はcornerRadiusで丸める)。プレビューのbuildProfileそのまま。
+function buildTonearmProfile(width, height, radius, arcSeg) {
+  const hw = width / 2, hh = height / 2;
+  const r = Math.max(0, Math.min(radius, Math.min(hw, hh) - 0.001));
+  const pts = [];
+  pts.push([-hw, -hh]); pts.push([hw, -hh]);
+  const cRx = hw - r, cRy = hh - r;
+  for (let i = 0; i <= arcSeg; i++) { const a = (Math.PI / 2) * (i / arcSeg); pts.push([cRx + r * Math.cos(a), cRy + r * Math.sin(a)]); }
+  const cLx = -hw + r, cLy = hh - r;
+  for (let j = 0; j <= arcSeg; j++) { const b = (Math.PI / 2) + (Math.PI / 2) * (j / arcSeg); pts.push([cLx + r * Math.cos(b), cLy + r * Math.sin(b)]); }
+  return pts;
+}
+function tonearmSmoothstep01(x) { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); }
+// ★ 2026-09-19 追加(ご指摘反映): 「アームの動きを実際のプレーヤーのように、少し持ち
+//   上げながら回転し、最後に下ろす」への対応。t(0〜1、動作全体の進行度)を渡すと、
+//   0→risePortionで0→1へ立ち上がり、risePortion〜(1-risePortion)の間は1のまま
+//   (=持ち上げたまま横に振る)、(1-risePortion)→1で1→0へ下ろす、という台形カーブを返す。
+function tonearmLiftHumpAt(t, risePortion) {
+  const rise = Math.max(0.0001, Math.min(0.49, risePortion));
+  if (t <= rise) return tonearmSmoothstep01(t / rise);
+  if (t >= 1 - rise) return tonearmSmoothstep01((1 - t) / rise);
+  return 1;
+}
+// t(0〜1、アーム基端〜先端の進行度)に対する曲げ角度。ratio付近(幅soft)でゆっくり
+// bendRadまで曲がり、それ以降は真っ直ぐ(曲げ角度一定)。プレビューのangleAtそのまま。
+function tonearmAngleAt(t, ratio, soft, bendRad) {
+  const half = soft / 2, lo = ratio - half, hi = ratio + half;
+  if (t <= lo) return 0;
+  if (t >= hi) return bendRad;
+  return bendRad * tonearmSmoothstep01((t - lo) / (hi - lo));
+}
+// 角度aに対する接線方向(単位ベクトル)。rightDir/backDirは直交する水平単位ベクトル
+// (組み立て時はローカル軸、実際の設置後は回転で丸ごとワールドへ移される)。a=0では
+// -backDir(pivotから手前側へ向かう)、aが増えるほど-rightDir側(=中心側)へ曲がる。
+function tonearmTangentAt(a, rightDir, backDir) {
+  return rightDir.clone().multiplyScalar(-Math.sin(a)).add(backDir.clone().multiplyScalar(-Math.cos(a)));
+}
+// アームの中心線(centerline)を、pivot(origin)から接線方向へ小刻みに積分して作る。
+// プレビューのbuildCenterlineと同じロジック。
+function buildTonearmCenterline(length, ratio, soft, bendDeg, segments, origin, rightDir, backDir) {
+  const bendRad = THREE.MathUtils.degToRad(bendDeg);
+  const ds = length / segments;
+  const points = [origin.clone()];
+  let pos = origin.clone();
+  for (let i = 1; i <= segments; i++) {
+    const tMid = (i - 0.5) / segments;
+    const a = tonearmAngleAt(tMid, ratio, soft, bendRad);
+    pos = pos.clone().addScaledVector(tonearmTangentAt(a, rightDir, backDir), ds);
+    points.push(pos.clone());
+  }
+  const tangents = [];
+  for (let k = 0; k <= segments; k++) {
+    const tk = k / segments;
+    tangents.push(tonearmTangentAt(tonearmAngleAt(tk, ratio, soft, bendRad), rightDir, backDir));
+  }
+  return { points, tangents };
+}
+// 断面(profile)の各点(底面2隅を除く)を、局所中心へ向けてinsetAmtぶん寄せる
+// (先端・pivot端の面取り用)。プレビューのinsetProfileそのまま。
+function insetTonearmProfile(baseProfile, insetAmt) {
+  return baseProfile.map((pt, idx) => {
+    if (idx === 0 || idx === 1) return pt;
+    const z = pt[0], y = pt[1];
+    const len = Math.hypot(z, y) || 1;
+    const newLen = Math.max(0, len - insetAmt);
+    return [z / len * newLen, y / len * newLen];
+  });
+}
+// 中心線に沿って断面をスイープし、先端・pivot端に面取りを追加してBufferGeometryを作る。
+// プレビューのbuildArmGeometryそのまま。
+function buildTonearmGeometry(p, origin, rightDir, backDir) {
+  const profile = buildTonearmProfile(p.width, p.height, p.cornerRadius, 8);
+  const line = buildTonearmCenterline(p.length, p.ratio, p.soft, p.bendDeg, p.segments, origin, rightDir, backDir);
+  const pts = line.points, tans = line.tangents;
+
+  // 先端(針側)の面取り: 上面・側面を軽く面取りし、底面は鋭角のまま残す(プレビューと同じ)。
+  const bevelSteps = 4;
+  const bevelDepth = Math.min(p.height, p.width) * 0.45;
+  const bevelInset = Math.min(p.width, p.height) * 0.22;
+  const lastPt = pts[pts.length - 1], lastTan = tans[tans.length - 1].clone();
+  const ringProfiles = pts.map(() => profile);
+  for (let bi = 1; bi <= bevelSteps; bi++) {
+    const frac = bi / bevelSteps;
+    pts.push(lastPt.clone().addScaledVector(lastTan, bevelDepth * frac));
+    tans.push(lastTan.clone());
+    ringProfiles.push(insetTonearmProfile(profile, bevelInset * frac));
+  }
+  // pivot側の面取り(側面と上下面の継ぎ目の角を落とす。プレビューと同じ)。
+  const firstTan = tans[0].clone();
+  const prependPts = [], prependTans = [], prependProfiles = [];
+  for (let bi = bevelSteps; bi >= 1; bi--) {
+    const frac = bi / bevelSteps;
+    prependPts.push(origin.clone().addScaledVector(firstTan, -bevelDepth * frac));
+    prependTans.push(firstTan.clone());
+    prependProfiles.push(insetTonearmProfile(profile, bevelInset * frac));
+  }
+  pts.unshift(...prependPts);
+  tans.unshift(...prependTans);
+  ringProfiles.unshift(...prependProfiles);
+
+  const worldUp = new THREE.Vector3(0, 1, 0);
+  const ringCount = pts.length, profCount = profile.length;
+  const positions = [], rings = [];
+  for (let i = 0; i < ringCount; i++) {
+    const T = tans[i];
+    const R = new THREE.Vector3().crossVectors(worldUp, T).normalize();
+    const U = new THREE.Vector3().crossVectors(T, R).normalize();
+    const C = pts[i], ring = [], prof = ringProfiles[i];
+    for (let j = 0; j < profCount; j++) {
+      const z = prof[j][0], y = prof[j][1];
+      ring.push(new THREE.Vector3().copy(C).addScaledVector(R, z).addScaledVector(U, y));
+    }
+    rings.push(ring);
+  }
+  const indices = [];
+  function pushVert(v) { positions.push(v.x, v.y, v.z); }
+  for (let ri = 0; ri < ringCount; ri++) for (let pj = 0; pj < profCount; pj++) pushVert(rings[ri][pj]);
+  for (let ri2 = 0; ri2 < ringCount - 1; ri2++) {
+    for (let pj2 = 0; pj2 < profCount; pj2++) {
+      const a0 = ri2 * profCount + pj2, a1 = ri2 * profCount + ((pj2 + 1) % profCount);
+      const b0 = (ri2 + 1) * profCount + pj2, b1 = (ri2 + 1) * profCount + ((pj2 + 1) % profCount);
+      indices.push(a0, a1, b0); indices.push(a1, b1, b0);
+    }
+  }
+  let vertOffset = ringCount * profCount;
+  const startCenterIdx = vertOffset; pushVert(pts[0]); vertOffset++;
+  const startBase = vertOffset;
+  for (let s = 0; s < profCount; s++) pushVert(rings[0][s]);
+  for (let s2 = 0; s2 < profCount; s2++) { const n0 = startBase + s2, n1 = startBase + ((s2 + 1) % profCount); indices.push(startCenterIdx, n1, n0); }
+  vertOffset += profCount;
+  const endCenterIdx = vertOffset; pushVert(pts[ringCount - 1]); vertOffset++;
+  const endBase = vertOffset;
+  const lastRing = rings[ringCount - 1];
+  for (let s3 = 0; s3 < profCount; s3++) pushVert(lastRing[s3]);
+  for (let s4 = 0; s4 < profCount; s4++) { const m0 = endBase + s4, m1 = endBase + ((s4 + 1) % profCount); indices.push(endCenterIdx, m0, m1); }
+  const geo = new THREE.BufferGeometry();
+  geo.setIndex(indices);
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// カメラ(UNIVERSE_CAMERA_POS→UNIVERSE_CAMERA_TARGET)から見た「右」「奥」の水平単位
+// ベクトルを求める。cameraの実際のquaternionではなく、宇宙ページの基準視点(config.js
+// の定数)から計算するため、宇宙ページに入る前でも(=makeTonearm呼び出し時点でも)
+// 正しい値が求まる。
+function computeTonearmCameraAxes() {
+  const forward = new THREE.Vector3().subVectors(UNIVERSE_CAMERA_TARGET, UNIVERSE_CAMERA_POS);
+  forward.y = 0; // 水平成分だけを使う(仰角があっても、アームは常に銀河の円盤と同じ水平面に置く)
+  forward.normalize();
+  const worldUp = new THREE.Vector3(0, 1, 0);
+  const rightDir = new THREE.Vector3().crossVectors(forward, worldUp).normalize(); // カメラの右
+  const backDir = forward; // カメラから見て奥(=画面の奥、遠ざかる方向)
+  return { rightDir, backDir };
+}
+
+// ワールドYまわりの回転で水平ベクトルvを角度theta(ラジアン)だけ回したときの角度を
+// 足し込める「角度」の物差し。atan2(-z,x)という定義にしておくと、
+// v.applyAxisAngle(worldUp, theta)されたベクトルの角度は、常に元の角度+thetaになる
+// (three.jsのapplyAxisAngleの回転方向と整合するように符号を選んでいる)。
+function tonearmWorldAngle(v) { return Math.atan2(-v.z, v.x); }
+
+// 針先を「銀河中心からの距離targetRadius」に置くために必要な、pivot軸まわりの
+// 追加回転角phiを求める。
+//   P = pivotのワールド座標 - galaxyCenter(固定ベクトル。長さd)
+//   T0 = 追加回転なし(phi=0)のときの、針先のpivotからの相対ワールド位置(長さL)
+//   針先の絶対位置 = pivot + Rot_Y(phi)(T0)  なので、
+//   |P + Rot_Y(phi)(T0)|² = d² + L² + 2dL・cos(ang(P) - ang(T0) - phi) = targetRadius²
+//   という関係から逆算する(円と円の交点を求める古典的な式を、直線の棒ではなく
+//   「あらかじめ曲がった剛体」に一般化したもの)。解は2つ出るので、pivotから見た
+//   針先の「元の角度」からの回転量が小さい方(=見た目上、動きが少なく自然な方)を選ぶ。
+function computeTonearmPhiForRadius(data, targetRadius) {
+  const { P, d, L, T0 } = data;
+  const delta = tonearmWorldAngle(P) - tonearmWorldAngle(T0);
+  const K = THREE.MathUtils.clamp((targetRadius * targetRadius - d * d - L * L) / (2 * d * L), -1, 1);
+  const acosK = Math.acos(K);
+  const phiA = delta - acosK;
+  const phiB = delta + acosK;
+  return Math.abs(phiA) <= Math.abs(phiB) ? phiA : phiB;
+}
+
+// tonearmGroup(pivotに置かれたGroup)の向きを、baseQuaternion(固定)にphiだけ
+// 追加回転させた状態にする。setNeedleRadius(旧針実装)と同じ「baseQuaternionへ戻して
+// からrotateY」パターン。
+function applyTonearmPhi(tonearmGroup, phi) {
+  tonearmGroup.quaternion.copy(tonearmGroup.userData.baseQuaternion);
+  tonearmGroup.rotateY(phi);
+  tonearmGroup.userData.currentPhi = phi;
+}
+
+// scene/renderer: main.jsと同じもの。galaxyCenter: 銀河の中心(record.galaxyCenterと同じもの)。
+// pivot(付け根。回転軸)は「銀河の中心から見て、カメラの右+奥」の固定オフセットに
+// 置き、以後ここは絶対に動かさない(位置もbaseQuaternionも固定)。アーム本体
+// (glassMesh)はこのGroupの子として、追加のY回転(phi)だけで振り角を変える。
+function makeTonearm(scene, renderer, galaxyCenter) {
+  const { rightDir, backDir } = computeTonearmCameraAxes();
+  const pivot = galaxyCenter.clone()
+    .addScaledVector(rightDir, GALAXY_RADIUS + TONEARM_PIVOT_GAP)
+    .addScaledVector(backDir, GALAXY_RADIUS);
+  pivot.y = galaxyCenter.y + TONEARM_MOUNT_HEIGHT;
+  // 局所+X軸(TONEARM_LOCAL_RIGHT)をワールドのrightDirへ合わせる回転。両方とも水平
+  // ベクトルなので、これは必ずワールドYまわりの単純な向き変えになる
+  // (=pivotのY軸そのものは常に真上を向いたまま。「回転軸を固定」を満たす)。
+  const baseQuaternion = new THREE.Quaternion().setFromUnitVectors(TONEARM_LOCAL_RIGHT, rightDir);
+
+  // アーム本体はローカル軸(TONEARM_LOCAL_RIGHT/BACK, 原点(0,0,0))で組み立てる。
+  // 実際のワールド向き・位置は、この関数が返すGroup(position=pivot, quaternion=
+  // baseQuaternion)側で丸ごと表現する。
+  const geometry = buildTonearmGeometry(TONEARM_PARAMS, new THREE.Vector3(0, 0, 0), TONEARM_LOCAL_RIGHT, TONEARM_LOCAL_BACK);
+  // ★ 2026-09-18 修正(ご指摘反映): 「ガラスに環境マップは不要、代わりに星が透過するように
+  //   してほしい」への対応。以前はtransmissionの鏡面・屈折の映り込み元として簡易的な
+  //   環境(RoomEnvironment)をPMREMで生成し、scene.environmentへ設定していた。しかし
+  //   RoomEnvironmentは「窓から光が差し込む簡易的な部屋」を模したテクスチャなので、
+  //   これがそのままIBL(image-based lighting)としてガラスに映り込み、「不自然な方向
+  //   からの光が当たっている」ように見える原因になっていた(このシーン自体にはTHREE.Light
+  //   は一つも置いていない。唯一の光源相当がこのRoomEnvironmentだった)。
+  //   scene.environmentの設定自体をやめることで、その不自然な映り込みを止める。
+  //   transmission(透過)自体はscene.environmentの有無に関係なく、レンダラーが
+  //   「このメッシュの背後に実際に描かれているもの」を毎フレーム別テクスチャに描画して
+  //   参照する仕組みなので、環境マップをやめても背後の星(銀河の粒子)はそのまま透けて見える。
+  const material = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff,
+    metalness: 0,
+    roughness: 0.06,
+    transmission: 1.0,
+    thickness: 6 * TONEARM_SCALE,
+    ior: 1.5,
+    clearcoat: 0.4,
+    clearcoatRoughness: 0.15,
+    attenuationColor: TONEARM_COLOR,
+    attenuationDistance: 60 * TONEARM_SCALE,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+
+  const group = new THREE.Group();
+  group.position.copy(pivot);
+  group.add(mesh);
+  group.visible = false; // main.js側がrevealGalaxy(galaxy)と同時にtrueにする
+  scene.add(group);
+
+  // 針先(=アーム先端。面取り前の中心線の終点)の、pivotから見た「回転なし(phi=0)」
+  // 時点でのローカル相対位置を求めておく(L=その長さ=pivot〜針先の実効的な腕の長さ)。
+  const localLine = buildTonearmCenterline(
+    TONEARM_PARAMS.length, TONEARM_PARAMS.ratio, TONEARM_PARAMS.soft, TONEARM_PARAMS.bendDeg,
+    TONEARM_PARAMS.segments, new THREE.Vector3(0, 0, 0), TONEARM_LOCAL_RIGHT, TONEARM_LOCAL_BACK,
   );
+  const tipLocal = localLine.points[localLine.points.length - 1].clone();
+  const T0 = tipLocal.clone().applyQuaternion(baseQuaternion); // ワールド向きに直した、phi=0時点の針先相対位置
+  const P = pivot.clone().sub(galaxyCenter); P.y = 0;           // pivot→galaxyCenterの水平ベクトル
+  const d = P.length();
+  const L = T0.length();
 
-  // 2枚とも同じワールド位置に重ねて置き、クリック時はopacityのクロスフェードだけで切り替える。
-  // ★ axesGroupの子にすることで、liftTripod(tripodの浮上)に数式も一緒についてくる。
-  //   位置は原点(頂点)からの相対座標のままなので、tripodの自転そのものには影響を受けない
-  //   (回転軸=world Yの直上にあるため、回転させても見た目の位置は変わらない)。
-  const sprites = EQUATION_IMAGES.map(() => makeEquationSprite());
-  for (const sprite of sprites) axesGroup.add(sprite);
-
-  // テクスチャは起動時に一度だけ非同期ロードしておく(クリックのたびに読み直さない)。
-  const texturesReady = EQUATION_IMAGES.map((asset, i) =>
-    loadInkTexture(asset.url).then(({ texture, aspect }) => {
-      const sprite = sprites[i];
-      sprite.material.map = texture;
-      sprite.material.needsUpdate = true;
-      sprite.scale.set(EQUATION_WORLD_WIDTH, EQUATION_WORLD_WIDTH / aspect, 1);
-      return { texture, aspect };
-    }).catch((err) => {
-      console.error(`createUniverse: 方程式画像(${asset.key})の読み込みに失敗`, err);
-      return null;
-    })
-  );
-
-  return {
-    axesGroup,
-    tripodAnchor,       // ← tripod/ring対応スワップ演出用。axesGroup全体の親(通常は原点のまま)
-    axisLines,
-    axisLabels,        // ← 追加: X/Y/Z終端のラベルsprite群(頂点とともに三脚を構成)
-    goldenRing,         // ← tripodクリックで出現する金のリング(地面に固定、tripodと一緒には上がらない)
-    tripodHitMesh,      // ← tripodクリック判定用(main.js側でraycastする)
-    tripodRingRevealed: false, // ← 出現済みフラグ(二重フェードイン防止)
-    tripodLifted: false,       // ← tripod浮上、二重発火防止
-    roofParticles,             // ← tripodが残す粒子の軌跡(ワールド固定、scene直下)
-    roofPulseActive: false,    // ← 生成ループが開始済みかどうか
-    roofWriteIndex: 0,         // ← リングバッファの次の書き込み位置
-    roofSpawnElapsed: new Float32Array(ROOF_RING_CAPACITY).fill(-1), // ← 各slotの生成からの経過秒数。-1=未生成
-    roofLegSpawnAngle: [0, 0, 0], // ← 各脚ごとの「前回生成からの累積回転角」
-    roofColorAngle: 0,             // ← 色帯切り替え用の累積回転角(2πで折り返す)
-    ihSprite,           // ← tripodクリックで出現するih
-    ihRevealed: false,  // ← 出現済みフラグ(二重フェードイン防止)
-    // ★ 2026-09-12 追加: 「左右同時ドラッグ(疑似正射影⇄透視図の切り替え)を
-    //   完了するまでは、ihを出現させたくない」とのご指示。tripodRingSwap.js側は
-    //   リングの高さだけを見てsetIhFadeを毎フレーム呼び続けるので、その呼び出し自体を
-    //   条件分岐で止めるのではなく、setIhFade側でこのフラグを見て「ロック中は常に
-    //   非表示のまま」に強制する(=呼び出し元は変更不要)。unlockIh()でロック解除する。
-    ihUnlocked: false,
-    ihElapsed: 0,       // ← 出現してからの経過秒数(周回・バウンスの位相計算に使う)
-    // ★ ihの「素の」不透明度(出現時のフェードインだけを反映した値。0〜1)。
-    //   tripodRingSwap.js側が「tripodが動き始めたらすぐ消える」ための倍率(0〜1)を
-    //   これに掛け合わせて最終的なopacityを決める(=どちらのフェードも独立に共存できる)。
-    ihBaseOpacity: 0,
-    sprites,           // [standard, carousel] の順
-    texturesReady,     // Promise配列。enterUniverse側でPromise.allしてから表示する
-    equationIndex: 0,  // 現在表示中の画像インデックス
-    isActive: false,   // まだ「宇宙ページ」に入っていない(=Phase3までのシーンにいる)状態かどうか
+  group.userData = {
+    baseQuaternion, P, d, L, T0,
+    currentPhi: 0,
+    basePivotY: pivot.y, // ← 針を上げ下げする際の基準高さ(placeTonearmOnRecordが使う)
+    placed: false, // クリックで一度だけ「置く」演出。二重発火防止
   };
+  applyTonearmPhi(group, computeTonearmPhiForRadius(group.userData, TONEARM_REST_RADIUS)); // 初期姿勢=休符位置
+
+  return group;
 }
 
-// ── tripodクリックで呼ぶ: 「tripodのリングが解禁された」フラグを立てる ──────
-// ★ 2026-09-17 バグ修正(ご指摘反映): 「tripodクリックでリングが上下二つ発生する」
-//   原因はここだった。この関数がuniverse.goldenRing(carousel完了後専用の据え置き
-//   リング。TRIPOD_GROUND_Yに固定)を可視化・フェードインさせる一方で、
-//   tripodRingSwap.js側もtripodRingRevealedフラグを見てrecord.crossfadeRing
-//   (RING_DOWN_Y=TRIPOD_GROUND_Yより10下、に置かれる「引き継ぎ用」リング)を
-//   同時に可視化していたため、10ユニット離れた2つのリングが同時に見えていた。
-//   crossfadeRingが「tripodクリック後〜戴冠演出完了まで」の見た目を一手に引き受ける
-//   設計にしたので、この関数ではもうgoldenRingに触れず、フラグを立てるだけにした。
-//   universe.goldenRingは、tripodRingSwap.js側のfinishTripodRingSwapが戴冠演出完了の
-//   タイミングで初めて可視化する(=crossfadeRingからgoldenRingへの引き継ぎ)。
-export function revealTripodRing(universe, { onComplete } = {}) {
-  if (universe.tripodRingRevealed) return;
-  universe.tripodRingRevealed = true;
-  if (onComplete) onComplete();
-}
-
-// ★ 2026-09-17 移設(ご指摘反映): 「carouselのリング(universe.goldenRing)まで一緒に
-//   消える」「ihの高さもおかしくなる」バグの原因が、このgoldenRingを戴冠演出用にも
-//   直接書き換えていたことだったため、戴冠演出の「拡大→消滅」はrecord.js側の
-//   crossfadeRing(バナナと同じ高さにあるリング自身)が担うことにし、ここからは
-//   削除した。universe.goldenRingは「拡大も消滅もしない、carousel本来のリング」
-//   としての役割に専念する。
-// ★ 2026-09-17 追加修正(ご指摘反映): 「tripodクリックでリングが上下二つ発生する」
-//   バグの修正に伴い、revealTripodRingからもgoldenRingへの参照を外した。
-//   universe.goldenRingは以後、tripodRingSwap.js側のfinishTripodRingSwap(戴冠演出
-//   完了時に初めて可視化)とmain.js側の俯瞰時の表示切り替え以外では一切触られない。
-
-// ── tripodクリックで呼ぶ: tripod自体を持ち上げる ────────────────────
-const TRIPOD_LIFT_HEIGHT = APEX_HEIGHT * 0.9; // 浮上後の高さ(仮値)
-const TRIPOD_LIFT_DURATION = 2.4;             // 浮上にかける秒数(仮値)
-
-export function liftTripod(universe, { duration = TRIPOD_LIFT_DURATION, onComplete } = {}) {
-  if (universe.tripodLifted) return;
-  universe.tripodLifted = true;
-  gsap.to(universe.axesGroup.position, {
-    y: TRIPOD_LIFT_HEIGHT,
-    duration,
+// クリック時に呼ぶ: pivotを固定したまま、針先を休符位置から円盤の外周
+// (TONEARM_PLACE_RADIUS)まで振り下ろし、置き終わったら銀河の回転を少し上げる。
+// 「太陽系での動き」「その後のクリックでの動き」は今回は実装しない(ご指示より)。
+// ★ 2026-09-19 修正(ご指摘反映): 水平方向の振り(phi)だけでなく、動作の前半で
+//   わずかに持ち上げ、後半で下ろす縦方向の動きを追加した(tonearmLiftHumpAt参照)。
+function placeTonearmOnRecord(record) {
+  const tonearmGroup = record.tonearm;
+  if (!tonearmGroup || tonearmGroup.userData.placed) return; // 二重発火防止
+  tonearmGroup.userData.placed = true;
+  const startPhi = tonearmGroup.userData.currentPhi;
+  const targetPhi = computeTonearmPhiForRadius(tonearmGroup.userData, TONEARM_PLACE_RADIUS);
+  const basePivotY = tonearmGroup.userData.basePivotY;
+  const state = { t: 0 };
+  gsap.to(state, {
+    t: 1,
+    duration: TONEARM_PLACE_DURATION,
     ease: 'power2.inOut',
+    onUpdate: () => {
+      applyTonearmPhi(tonearmGroup, THREE.MathUtils.lerp(startPhi, targetPhi, state.t));
+      tonearmGroup.position.y = basePivotY + TONEARM_LIFT_HEIGHT * tonearmLiftHumpAt(state.t, TONEARM_LIFT_RISE_FRACTION);
+    },
+    onComplete: () => {
+      tonearmGroup.position.y = basePivotY; // 誤差の蓄積を防ぐため、最後に基準高さへ厳密に戻す
+      // 「置いたら銀河の回転を少し上げる」の反映。太陽系・carouselはここでは触らない。
+      setGalaxySpinBoost(record.galaxy, TONEARM_SPIN_BOOST);
+      // ★ 追加: 銀河俯瞰中は「中心に近いほど角速度が速い」差動回転にしていたが、
+      //   アームを置いたのでここで通常の剛体回転(現状の仕様)へ戻す。
+      setGalaxyDifferentialRotation(record.galaxy, false);
+    },
+  });
+}
+// ══════════════════════════════════════════════════════════════
+// ▲▲▲ トーンアーム(ガラス製) ここまで ▲▲▲
+// ══════════════════════════════════════════════════════════════
+
+// ── スクロールによる画面切り替え(carousel⇄鏡) ─────────────
+const SCROLL_SWITCH = 600;         // ここまでスクロールすると鏡側を向き切る(仮値。「切り替え方は適当でよい」ため単純な線形)
+// 「最後になったら、下スクロールでカメラを引いてレコード全体が見えるように」の反映:
+// phase==='done'到達後、さらにこのぶんスクロールするとカメラが引き切る(仮値)。
+// phase==='done'は、バナナクリック演出の最後(revealSolarSystem呼び出し時)に到達する。
+const SCROLL_PULLBACK_RANGE = 900;
+export const SCROLL_MAX = SCROLL_SWITCH + SCROLL_PULLBACK_RANGE; // main.js側でスクロール量をこの範囲にクランプする
+const VIEW_MIX_SMOOTHING = 4.0;    // カメラの向き変更(controls.target)を軽くスムージングする係数(仮値)
+
+// ★ 銀河の「掴んでいた」演出パラメータ(GALAXY_READY_T等)は、銀河の動きそのものを
+//   このファイルから削除したため不要になり撤去した。
+
+const RECORD_PULLBACK_DISTANCE = 1; // 「レコード全体が見えるように」引く距離(仮値。カメラFOV次第で要調整。GALAXY_RADIUS依存の計算は撤去したため単純な定数に変更)
+const PULLBACK_SMOOTHING = 3.0;    // カメラの引きをスムージングする係数(仮値)
+
+// ── レコード(鏡三角錐)の自転速度 ─────────────────────────
+const MIRROR_SPIN_SMOOTHING = 1.5;        // 倍率切り替えをスムージングする係数(仮値。カクツキ防止)
+// ★ 以前は演出フェーズごとに速度を切り替える案があったが、今は常に等倍にしている。
+
+// carouselのtripod(HOME_CAMERA_TARGET付近)とカメラの距離をそのまま流用し、カメラを挟んで
+// 反対側に鏡三角錐を置く(ご指示「位置を共有させる」の反映: カメラからの距離を共有する)。
+function computeMirrorGroupPosition() {
+  const camToTripod = new THREE.Vector3().subVectors(HOME_CAMERA_TARGET, HOME_CAMERA_POS);
+  const base = HOME_CAMERA_POS.clone().sub(camToTripod);
+  base.y -= MIRROR_APEX_HEIGHT * 0.5; // 頂点がだいたいカメラの目の高さに来るよう少し下げる(仮値)
+  return base;
+}
+
+// 「頂点だけ反映した三角錐、底面は正三角形」── ConeGeometryはradialSegments=3にすると
+// そのまま正三角形を底面とする三角錐になる(底面の外接円半径=MIRROR_TRIPOD_RADIUS、
+// 頂点の高さ=MIRROR_APEX_HEIGHTは、既存tripodの頂点位置と同じ式を流用している)。
+function makeMirrorPyramid(material) {
+  const geo = new THREE.ConeGeometry(MIRROR_TRIPOD_RADIUS, MIRROR_APEX_HEIGHT, 3);
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.position.y = MIRROR_APEX_HEIGHT / 2;
+  return mesh;
+}
+
+// 「本格的な鏡」: WebGLCubeRenderTarget + CubeCameraで周囲を毎フレーム撮影し、
+// それをenvMapとして使う実際の鏡面反射(metalness=1, roughness最小)。
+function createMirrorMaterial() {
+  const renderTarget = new THREE.WebGLCubeRenderTarget(MIRROR_ENV_RESOLUTION, {
+    generateMipmaps: true,
+    minFilter: THREE.LinearMipmapLinearFilter,
+  });
+  const cubeCamera = new THREE.CubeCamera(0.1, 2000, renderTarget);
+  // ★ 2026-09-19 修正(ご指摘反映):「roughnessを上げたら球もtripodも逆に見えなくなった」
+  //   への対応。銀河は「ほとんど真っ黒な背景に、まばらで小さい輝点(星)が散らばる」
+  //   絵柄なので、roughnessを上げてぼかすと、その小さく明るい点が周囲の広い黒に薄まって
+  //   埋もれてしまい、逆に見えなくなる(roughnessを上げる方向は完全に誤りだった)。
+  //   低いまま(=鋭い鏡面)に戻す。
+  const MIRROR_ROUGHNESS = 0.05; // 元の値に戻した
+  const material = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    metalness: 1,
+    roughness: MIRROR_ROUGHNESS,
+    envMap: renderTarget.texture,
+    transparent: true, // tripod/ringスワップ演出(tripodRingSwap.js)でopacityをクロスフェードするため
+  });
+  return { material, cubeCamera };
+}
+
+// ══════════════════════════════════════════════════════════════
+// ★ 2026-09-17 訂正(ご指摘反映): 前回、戴冠演出の「拡大→消滅」の役割を、バナナと
+//   同じ高さのリング(crossfadeRing)から切り離し、下側に新設した別リング
+//   (orbitRing)へ移していたが、これはご指示の意図と逆だった。正しくは:
+//     - 拡大→消滅するのは、もともと上(バナナと同じ高さ)にあるリング=crossfadeRing
+//       自身。新しいリングを追加で下に発生させて拡大するのではない。
+//     - 拡大したcrossfadeRingは、太陽がリングに到達したら「消滅」する
+//       (=拡大したリングそのものが消える。従来通りの見た目のまま)。
+//     - 消滅後、carousel側と同じ「下側」に新たに現れるのはuniverse.goldenRing
+//       (carousel本来のリング)。こちらは拡大させず通常サイズのまま、鏡tripodと
+//       同じ鏡面のリアルな金の質感にする(universe.js側でマテリアルを用意し、
+//       ここでenvMapだけ渡す。新たにCubeCameraを増やすと重くなるため、鏡と
+//       同じ1つを使い回している)。
+//   orbitRing(専用の別メッシュ)は不要になったため削除した。
+// ══════════════════════════════════════════════════════════════
+const CROSSFADE_RING_TUBE_RADIUS = AXIS_LENGTH * 0.018; // universe.js側のRING_TUBE_RADIUSと同じ値(仮値)
+const CROSSFADE_RING_COLOR = 0xffcc33; // universe.js側のRING_COLORと同じ値(仮値)。従来通りの非金属な単色
+
+// RING_DOWN_Y⇔バナナの高さを上下する「引き継ぎ」用のリング(従来通りの見た目)。
+// 戴冠演出中はこのリング自身が拡大→消滅する(下記growCrossfadeRing/hideCrossfadeRing)。
+function makeCrossfadeRing() {
+  const geometry = new THREE.TorusGeometry(MIRROR_TRIPOD_RADIUS, CROSSFADE_RING_TUBE_RADIUS, 16, 128);
+  const material = new THREE.MeshBasicMaterial({ color: CROSSFADE_RING_COLOR, transparent: true, opacity: 0 });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.rotation.x = Math.PI / 2; // universe.js側のgoldenRingと同じく水平(XZ平面)へ寝かせる
+  // ★ 2026-09-17 追加(バグ修正): revealCrossfadeRingDrawing()がring.rotation.yで
+  //   「描き始めの向き」をカメラ方向へ振り向かせているが、既定のEuler順序'XYZ'では
+  //   X回転(この行の90°の寝かせ)が先に適用されるため、その後のY回転は「もう縦軸
+  //   ではなくなったローカルY軸」を中心に回ることになり、リングが傾いて見える不具合
+  //   があった。順序を'YXZ'(先にYで世界の縦軸まわりに振り向かせ、その後にXで
+  //   寝かせる)にすることで、常に水平を保ったまま向きだけを変えられるようにした。
+  mesh.rotation.order = 'YXZ';
+  mesh.visible = false; // tripodRingSwap.js側がtripodRingRevealed成立時に初めて可視化する
+  mesh.userData.radius = MIRROR_TRIPOD_RADIUS; // 現在の「径」(太さは常にCROSSFADE_RING_TUBE_RADIUSのまま)
+  return mesh;
+}
+
+// ★ 2026-09-17 修正(ご指摘反映): 「リングの拡大が膨張して謎の物体になっている。
+//   太さは変えず、径だけ変えてほしい」への対応。以前はmesh.scaleを均一倍率で
+//   tweenしていたが、TorusGeometryを丸ごと均一スケールすると、径(main radius)だけ
+//   でなく太さ(tube radius)まで一緒に太ってしまい、大きくなるほど「膨張した謎の
+//   物体」に見えていた。scaleでは径と太さを別々に扱えないため、径が変わるたびに
+//   ジオメトリ自体を(太さ=CROSSFADE_RING_TUBE_RADIUS固定のまま)作り直す方式にした。
+function setCrossfadeRingRadius(ring, radius) {
+  const old = ring.geometry;
+  ring.geometry = new THREE.TorusGeometry(radius, CROSSFADE_RING_TUBE_RADIUS, 16, 128);
+  old.dispose();
+  ring.userData.radius = radius;
+}
+
+// ★ 2026-09-17 追加(ご指示反映): 「tripodクリック時のリング出現を、一周描きながら
+//   出現するようにしてほしい。開始点は円でカメラに一番近い点、回転方向はcarouselと
+//   同じ、スピードは速くてよい」への対応。
+//   TorusGeometryのarc引数(掃引角。マイナス値も三角関数的に正しく解釈されるため、
+//   逆回転の指定に使える)を0→2πへtweenし、ring.rotation.yで「描き始め(u=0)」の
+//   向きをカメラ方向に固定した上で、径と同じくジオメトリを毎フレーム作り直すことで
+//   「輪が一周描かれながら現れる」演出にした。
+const RING_REVEAL_DURATION = 0.5; // 仮値。「スピードは速くてよい」の反映
+// carousel(universe.js側のtripod自転。rotateOnWorldAxisにrotationDelta=-ANGULAR_SPEEDを
+// 渡している=world Y軸まわりの負方向)と同じ向きに掃引するための符号(仮。逆に見えたら反転)。
+const RING_REVEAL_SWEEP_SIGN = -1;
+
+function setCrossfadeRingArc(ring, arcFraction) {
+  const old = ring.geometry;
+  const safeFraction = Math.max(arcFraction, 0.001); // arc=0だと退化するので下限を設ける
+  const arc = RING_REVEAL_SWEEP_SIGN * safeFraction * Math.PI * 2;
+  ring.geometry = new THREE.TorusGeometry(ring.userData.radius, CROSSFADE_RING_TUBE_RADIUS, 16, 128, arc);
+  old.dispose();
+}
+
+// tripodクリック時、1回だけ呼ぶ。tripodRingSwap.js側から呼ばれる想定でexportしてある。
+export function revealCrossfadeRingDrawing(ring, camera, { duration = RING_REVEAL_DURATION, onComplete } = {}) {
+  // 「開始点は円でカメラに一番近い点」: 中心(リング自身のXZ座標)からカメラへ向かう
+  // 方向がそのまま「円上の最近点」の方向になる。この角度をTorusのu=0(=描き始め)に
+  // 向くようring.rotation.yへ設定する。
+  const dx = camera.position.x - ring.position.x;
+  const dz = camera.position.z - ring.position.z;
+  ring.rotation.y = Math.atan2(dz, dx);
+
+  ring.visible = true;
+  ring.material.opacity = 1;
+
+  const state = { t: 0 };
+  gsap.to(state, {
+    t: 1,
+    duration,
+    ease: 'power1.out',
+    onUpdate: () => setCrossfadeRingArc(ring, state.t),
+    onComplete: () => {
+      setCrossfadeRingRadius(ring, ring.userData.radius); // 仕上げに厳密な全周ジオメトリへ確定させる
+      if (onComplete) onComplete();
+    },
+  });
+}
+
+// ── 戴冠演出専用: crossfadeRingを「太陽系のらせん軌道」サイズまで拡大する ──────
+// 径(ring.userData.radius)そのものをtweenし、更新のたびにsetCrossfadeRingRadiusで
+// ジオメトリを作り直す(太さは常にCROSSFADE_RING_TUBE_RADIUSのまま変えない)。
+function growCrossfadeRing(ring, { targetRadius, duration, ease = 'power2.inOut', onComplete } = {}) {
+  const state = { radius: ring.userData.radius };
+  if (ring.userData.radiusTween) ring.userData.radiusTween.kill();
+  ring.userData.radiusTween = gsap.to(state, {
+    radius: targetRadius,
+    duration,
+    ease,
+    onUpdate: () => setCrossfadeRingRadius(ring, state.radius),
     onComplete: () => { if (onComplete) onComplete(); },
   });
 }
 
-// ── tripodクリックで呼ぶ: 粒子の生成ループを開始する(以後、永久に続く) ─────
-// 実際の生成・フェードイン・色帯の計算はupdateUniverse側で毎フレーム行う。ここでは
-// 「開始する」フラグを立てて、粒子群を表示状態にするだけ。
-export function startTripodRoofPulse(universe) {
-  if (universe.roofPulseActive) return;
-  universe.roofPulseActive = true;
-  universe.roofParticles.visible = true;
-}
-
-// ── ihの出現/消滅 ─────────────────────────────────────
-// ★ 2026-09-12 再変更(ご指示反映):「単純にゴールドリングが下限にあるときだけihが
-//   存在するようにしてほしい。中間位置のリングでもihが見えているのが気になる(屋根の
-//   粒子と視覚的にぶつかる)」への対応。
-//   前回実装(revealIh/hideIhをgsapで独立にタイマー駆動する方式)は、hide側の
-//   フェードアウトに一定の秒数(IH_FADE_OUT_DURATION)をかけていたため、その間に
-//   リング自体はどんどん下限から離れて中間位置まで進んでしまい、「ihがまだ薄っすら
-//   残ったまま中間位置に居座って見える」原因になっていた。
-//   そこで、時間で駆動する独立のフェードtweenはやめ、「リングが今どれだけ下限に
-//   近いか(swapT)」だけを毎フレーム直接不透明度に反映する方式に変更した
-//   (=tripodRingSwap.js側のsetIhFade呼び出し。下限からごく近い狭い範囲でだけ
-//   フェードし、それ以外の範囲(中間位置を含む)ではopacity=0・非表示になる)。
-//   record.viewMixCurrent自体が既にスクロールを指数スムージングしているため、
-//   別途フェード用のtweenを持たなくても見た目は滑らかになる。
-
-// tripodRingSwap.js側から毎フレーム呼ぶ: fade(0〜1、下限にどれだけ近いか)をそのまま
-// ihの不透明度として反映する。fade<=0ならその場で非表示にする(存在しない扱い)。
-export function setIhFade(universe, fade) {
-  // ★ 2026-09-12 追加: 左右同時ドラッグ(疑似正射影⇄透視図の切り替え)が完了するまでは、
-  // fadeの値に関わらず常に非表示にする。
-  if (!universe.ihUnlocked) {
-    universe.ihRevealed = false;
-    universe.ihBaseOpacity = 0;
-    universe.ihSprite.visible = false;
-    return;
-  }
-  const wasRevealed = universe.ihRevealed;
-  universe.ihRevealed = fade > 0;
-  universe.ihBaseOpacity = fade;
-  if (universe.ihRevealed && !wasRevealed) {
-    // 非表示→表示に切り替わった瞬間: 1フレーム目に古い位置(原点など)へ一瞬映るのを
-    // 防ぐため、表示状態にする前に現在のリング位置基準で向き・座標を合わせておく。
-    updateIhOrbitPosition(universe);
-  }
-  universe.ihSprite.visible = universe.ihRevealed;
-}
-
-// 左右同時ドラッグ完了(main.js側、record.perspectiveActiveがtrueになった瞬間)に呼ぶ。
-// 以後はsetIhFadeの通常ロジック(リングの高さに応じたフェード)が有効になる。
-export function unlockIh(universe) {
-  universe.ihUnlocked = true;
-}
-
-// ── 毎フレーム呼ぶ: 3本の軸線(+ラベル)を「高さ軸(world Y)」まわりに、カルーセルのように
-//    ぐるっと回転させる(座標変換のみ。線やジオメトリは増やしていない) ──
-// 頂点(ORIGIN)はこの軸の直上にあるため、回転させても頂点自体はワールド座標上で動かない。
-// 固定のワールド軸なので、カメラの向きに依存しない。そのためcameraは不要。
-// ★ 2026-09-19 修正(ご指摘反映): 「carousel回転も、太陽系の銀河公転速度に合わせて」
-//   への対応。以前は独自の固定値(0.18 rad/秒)だったが、universe.jsはsolarSystem.js/
-//   galaxy.js(TRIPOD_RADIUS・RECORD_ANCHORの参照元であり、両ファイルから見て
-//   「土台」となる基礎モジュール)なので、ここから直接solarSystem.jsのSUN_ORBIT_PERIODを
-//   importすると循環importになってしまう。そのため定数のままにはせず、`let`にして
-//   main.js側(galaxy.js・solarSystem.jsの両方を読み込んだ後)からsetTripodAngularSpeed()
-//   で一度だけ書き換えてもらう方式にした(export const TRIPOD_ANGULAR_SPEEDは
-//   record.jsが直接importして使っているが、ESモジュールのimportは「生きた参照」なので、
-//   ここで再代入すればrecord.js側からも常に最新の値が見える)。
-//   ★ ここが調整箇所です: 呼び出し元(main.js)を変えない場合の既定値は0.18のまま。
-export let TRIPOD_ANGULAR_SPEED = 0.18; // ラジアン/秒。仮値、見ながら調整してください
-export function setTripodAngularSpeed(value) {
-  TRIPOD_ANGULAR_SPEED = value;
-}
-
-const _roofWorldOrigin = new THREE.Vector3();
-const _roofWorldTip = new THREE.Vector3();
-const ROOF_LEG_TIPS = [AXIS_TIPS.X, AXIS_TIPS.Y, AXIS_TIPS.Z];
-
-export function updateUniverse(universe, deltaSeconds, camera) {
-  if (!universe.isActive) return;
-  const rotationDelta = -TRIPOD_ANGULAR_SPEED * deltaSeconds;
-  universe.axesGroup.rotateOnWorldAxis(ROTATION_AXIS_DIR, rotationDelta);
-
-  if (universe.roofPulseActive) {
-    // rotateOnWorldAxisの直後、localToWorldで最新のワールド座標を取るためには
-    // matrixWorldを明示的に更新しておく必要がある(render()まで待つと1フレーム遅れるため)。
-    universe.axesGroup.updateMatrixWorld(true);
-
-    const rotationStep = Math.abs(rotationDelta);
-
-    // 色帯(1/6周=60°ごとに黄緑⇔オレンジを切り替え)。生成される新しい粒子の色を決めるだけで、
-    // 過去に生成済みの粒子の色は変わらない(=円周上に交互の帯として固定される)。
-    universe.roofColorAngle = (universe.roofColorAngle + rotationStep) % (Math.PI * 2);
-    const bandIndex = Math.floor(universe.roofColorAngle / ROOF_SIXTH) % 2;
-    const spawnColor = bandIndex === 0 ? ROOF_COLOR_GREEN : ROOF_COLOR_ORANGE;
-
-    // 3本の脚それぞれについて、「前回の生成からどれだけ回転したか」を個別に積算し、
-    // ROOF_SPAWN_ANGLE_STEPを超えるたびにワールド座標を取って1粒子生成する
-    // (1フレームでの回転量がステップ幅を超えるほど速い場合に備え、whileで複数回に分けて処理する)。
-    universe.axesGroup.localToWorld(_roofWorldOrigin.copy(ORIGIN));
-    ROOF_LEG_TIPS.forEach((tip, legIndex) => {
-      universe.roofLegSpawnAngle[legIndex] += rotationStep;
-      while (universe.roofLegSpawnAngle[legIndex] >= ROOF_SPAWN_ANGLE_STEP) {
-        universe.roofLegSpawnAngle[legIndex] -= ROOF_SPAWN_ANGLE_STEP;
-        universe.axesGroup.localToWorld(_roofWorldTip.copy(tip));
-        spawnRoofParticle(universe, _roofWorldOrigin, _roofWorldTip, spawnColor);
-      }
-    });
-
-    // 全slotのフェードイン(生成からの経過秒数→alpha)を毎フレーム更新する。
-    // ROOF_RING_CAPACITYは「薄くてよい」程度の個数なので、全走査してもコストは小さい。
-    const alphaAttr = universe.roofParticles.geometry.attributes.aAlpha;
-    for (let i = 0; i < ROOF_RING_CAPACITY; i++) {
-      if (universe.roofSpawnElapsed[i] < 0) continue; // 未生成のslotはずっと透明のまま
-      universe.roofSpawnElapsed[i] += deltaSeconds;
-      const progress = Math.min(universe.roofSpawnElapsed[i] / ROOF_FADE_DURATION, 1);
-      alphaAttr.array[i] = progress * ROOF_MAX_ALPHA;
-    }
-    alphaAttr.needsUpdate = true;
-  }
-
-  // ih(押し出しメッシュ)の周回・上下バウンス+フェードのopacity反映(表示中の間、続ける)。
-  // ★ 2026-09-12 変更(ご指示反映): tripodRingSwap.js側のsetIhFadeが毎フレーム更新する
-  //   universe.ihBaseOpacity(=リング下限からの近さ)をそのままここで書き込む。
-  if (universe.ihRevealed) {
-    universe.ihElapsed += deltaSeconds;
-    updateIhOrbitPosition(universe);
-    if (universe.ihSprite.userData.material) {
-      universe.ihSprite.userData.material.opacity = universe.ihBaseOpacity;
-    }
-  }
-
-  // 平衡感覚の防御的な保険: 万一どこか別の処理がcamera.upを書き換えても、
-  // 宇宙ページにいる間は毎フレーム(0,1,0)に戻し、水平線が傾いたままにならないようにする。
-  if (camera) camera.up.set(0, 1, 0);
-}
-
-// ── Phase3以降、最初の画面クリックで呼ぶ: 宇宙ページへ入る ──────────────
-// axes / axisLabels / equationAssembly側の要素(既存の三軸・数式・カルーセル)を
-// 隠す処理は、呼び出し側(main.js)がこの関数を呼ぶ前後で行ってください
-// (どのオブジェクトを隠すべきかはmain.js側の現在の状態管理に依存するため、
-//  このモジュール単体では判断できません)。
-export function enterUniverse(universe, { camera, controls, duration = 1.6, onComplete } = {}) {
-  if (universe.isActive) return;
-  universe.isActive = true;
-
-  // 視点は宇宙ページ専用のカメラ位置(UNIVERSE_CAMERA_POS/TARGET)へ合わせる。
-  // ★ 以前はHOME_CAMERA_POS/TARGETをそのまま使っていたが、HOME_CAMERA_DIRを
-  //   宇宙ページ用に下げた際、同じ定数を参照しているmain.js(イントロ)・record.js
-  //   (鏡演出)側にも影響が出てしまったため、宇宙ページ専用の定数に切り替えた。
-  // ★ 2026-09-12 変更: 「左ドラッグでの視点変更が銀河同期回転の演出を妨げる」との
-  //   ご指示により、以後カメラはcontrols経由では動かさない(下のcontrolsブロックで
-  //   controls.enabled=falseにする)。カメラの動きはmain.js側の専用コード
-  //   (位置固定/銀河同期の自動回転/右ドラッグでの引き)がすべて担当する。
-  if (camera) {
-    // ズーム量はconfig.js側のUNIVERSE_CAMERA_DISTANCEで決まる(DIR×DISTANCEで
-    // 組み立て済みのUNIVERSE_CAMERA_POSをそのまま使うだけでよい)。fovは疑似正射影用に
-    // 固定で狭める。距離を詰めて拡大したいときは、ここではなくconfig.jsの
-    // UNIVERSE_CAMERA_DISTANCEを小さくすること(欠けるのは想定内)。
-    camera.position.copy(UNIVERSE_CAMERA_POS);
-    camera.up.set(0, 1, 0);
-    camera.fov = UNIVERSE_PSEUDO_ORTHO_FOV_DEG;
-
-    // ★ 2026-09-12 追加: sceneSetup.jsのmakeProjectionMixerがcamera.farを底上げ
-    //   しているのは「ホーム画面用のHOME_CAMERA_DISTANCE(=34)を疑似正射影に変換した
-    //   distance(≈908)」ベースの値(≈1042)で、宇宙ページのUNIVERSE_CAMERA_DISTANCEは
-    //   考慮されていない。宇宙ページ側のdistanceがこれを超えると、カメラ自身がfar平面
-    //   より遠くに位置することになり、tripodなど注視点付近が描画されなくなる
-    //   (真っ暗/一部だけ欠けるなど)。ここでUNIVERSE_CAMERA_DISTANCE分を踏まえて
-    //   明示的に底上げしておく(奥行きの余裕として+200)。
-    const requiredFar = UNIVERSE_CAMERA_TARGET.distanceTo(UNIVERSE_CAMERA_POS) + 200;
-    if (camera.far < requiredFar) {
-      camera.far = requiredFar;
-    }
-
-    camera.updateProjectionMatrix();
-    camera.lookAt(UNIVERSE_CAMERA_TARGET);
-  }
-  if (controls) {
-    controls.target.copy(UNIVERSE_CAMERA_TARGET);
-    // ★ 2026-09-12 変更: 「左ドラッグで角度を変えられる仕様が、銀河を背景として
-    //   固定して見せる演出(カメラの銀河同期回転)を妨げる」とのご指示のため、
-    //   宇宙ページではcontrols自体を無効化する(以前はrotateだけ有効なまま残って
-    //   いた。pan/zoomはmain.js側で個別にfalseにしていたが、そもそも全部まとめて
-    //   ここで止めてしまう方が確実)。カメラの動き(位置固定/銀河同期回転/右ドラッグ
-    //   での引き)は全てmain.js側の専用コードで制御する。
-    controls.enabled = false;
-    controls.update();
-  }
-
-  // テクスチャがまだロード中の可能性があるので、揃うまで待ってからフェードインする。
-  Promise.all(universe.texturesReady).then(() => {
-    const firstSprite = universe.sprites[universe.equationIndex];
-    firstSprite.visible = true;
-
-    const fadeTargets = [
-      ...universe.axisLines.map((l) => l.material),
-      ...universe.axisLabels.map((s) => s.material),
-      firstSprite.material,
-    ];
-    gsap.to(fadeTargets, {
-      opacity: 1,
-      duration,
-      ease: 'power1.out',
-      onComplete: () => { if (onComplete) onComplete(); },
-    });
-  });
-}
-
-// ── 宇宙ページ内でのクリック: もう一方の方程式画像へクロスフェードする ──────
-export function toggleUniverseEquation(universe) {
-  if (!universe.isActive) return;
-  const fromIndex = universe.equationIndex;
-  const toIndex = (fromIndex + 1) % universe.sprites.length;
-  const fromSprite = universe.sprites[fromIndex];
-  const toSprite = universe.sprites[toIndex];
-
-  toSprite.visible = true;
-  toSprite.material.opacity = 0;
-  toSprite.material.color.copy(EQUATION_COLOR_DEFAULT); // 前回のホバー色を引き継がない
-  gsap.to(toSprite.material, { opacity: 1, duration: EQUATION_CROSSFADE_DURATION, ease: 'power1.inOut' });
-  gsap.to(fromSprite.material, {
+// ── 戴冠演出専用: 太陽がリングに到達したら、拡大しておいたcrossfadeRingを消す ──
+function hideCrossfadeRing(ring, { duration = 0.8, onComplete } = {}) {
+  if (ring.userData.radiusTween) ring.userData.radiusTween.kill();
+  gsap.to(ring.material, {
     opacity: 0,
-    duration: EQUATION_CROSSFADE_DURATION,
-    ease: 'power1.inOut',
-    onComplete: () => { fromSprite.visible = false; },
+    duration,
+    ease: 'power1.in',
+    onComplete: () => {
+      ring.visible = false;
+      if (onComplete) onComplete();
+    },
+  });
+}
+
+function makeHitAreaMesh(radius) {
+  return new THREE.Mesh(
+    new THREE.SphereGeometry(radius, 12, 12),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.001, depthWrite: false, depthTest: false })
+  );
+}
+
+// ★ 2026-09-12 変更: banana.glb(./data/banana.glb)を読み込んで見た目に使う。
+//   GLBの読み込みは非同期なので、当たり判定(hitエリア)と親グループは即座に作って返し、
+//   見た目(GLBの中身)は読み込み完了後に子として追加する(=クリック判定は最初から効くが、
+//   見た目は一瞬遅れて出てくる。プリロードしておきたい場合は呼び出し側で対応してください)。
+// ★ 2026-09-14: GLB読み込みが安定して動くことを確認できたため、読み込み失敗時の
+//   procedural(TorusGeometry)フォールバックは撤去した。読み込みに失敗した場合は
+//   何も表示されず、コンソールにエラーが出力されるだけになる。
+function makeBananaMesh() {
+  const group = new THREE.Group();
+  group.rotation.set(0.3, 0.5, 0);
+  group.add(makeHitAreaMesh(BANANA_HIT_RADIUS));
+
+  loadGLTFScene(BANANA_GLB_PATH).then((glbScene) => {
+    group.add(glbScene);
+  }).catch((err) => {
+    console.error('banana.glbの読み込みに失敗しました。', err);
   });
 
-  universe.equationIndex = toIndex;
+  return group;
+}
+
+// scene/renderer: main.jsと同じもの。
+// deps: { camera, galaxy, solarSystem } ── いずれもmain.js側で既に作成済みの「既存インスタンス」を渡す。
+// solarSystemはrevealSolarSystem()内で太陽系(8惑星)を召喚する際に使う。
+export function createRecordDisplay(scene, renderer, { camera, galaxy, solarSystem, universe, excludeFromBloom }) {
+  const { material: mirrorMaterial, cubeCamera } = createMirrorMaterial();
+
+  // universe.goldenRing(carouselの飾りリング)とは別の、この演出専用のリング。
+  // 位置(ringDownY↔バナナの高さの上下)はtripodRingSwap.js側が毎フレーム動かす。
+  const crossfadeRing = makeCrossfadeRing();
+  scene.add(crossfadeRing);
+
+
+  // ★ ご指摘反映: 「リアルな金のリング」はcarousel本来のリング(universe.goldenRing)
+  //   自身のこと(=下側に新しい専用リングを追加するのではない)。universe.js側で
+  //   マテリアルの種類(MeshStandardMaterial・metalness・roughness)は用意済みなので、
+  //   ここでは鏡と同じCubeCamera環境マップ(mirrorMaterial.envMap)を渡すだけでよい
+  //   (新たにCubeCameraを増やすと重くなるため、既存の1つを使い回している)。
+  universe.goldenRing.material.envMap = mirrorMaterial.envMap;
+
+  const apex = new THREE.Vector3(0, MIRROR_APEX_HEIGHT, 0);
+
+  // ★ ご指示「二つのtripod・二つの円環を対応させ、スクロールで位置を移動させながら
+  //   クロスフェードする」の反映のため、鏡のピラミッド(pyramidMesh)はmirrorGroupの
+  //   子ではなく、別の独立したグループ(mirrorVisualAnchor)に入れてある。
+  const mirrorGroup = new THREE.Group();
+
+  const mirrorVisualAnchor = new THREE.Group();
+  const pyramidMesh = makeMirrorPyramid(mirrorMaterial);
+  mirrorVisualAnchor.add(pyramidMesh);
+
+  const bananaMesh = makeBananaMesh();
+  bananaMesh.position.copy(apex).add(new THREE.Vector3(0, BANANA_HEIGHT_ABOVE_APEX, 0));
+  mirrorVisualAnchor.add(bananaMesh);
+
+  // ① 戴冠用の王冠(crown.glb)。バナナと同じ場所に降ってくるので、mirrorVisualAnchorの子にする。
+  const crownGroup = new THREE.Group();
+  crownGroup.visible = false;
+  mirrorVisualAnchor.add(crownGroup);
+  loadGLTFScene(CROWN_GLB_PATH).then((glbScene) => {
+    glbScene.scale.setScalar(CROWN_SCALE);
+    crownGroup.add(glbScene);
+  }).catch((err) => {
+    console.error('crown.glbの読み込みに失敗しました。', err);
+  });
+
+  // ② バルジ(プレースホルダー)。ご指示反映: 銀河本体(galaxy.starsGroup)の子として
+  //   銀河中心(ローカル原点)に配置する。以前はmirrorVisualAnchor(バナナの位置)の
+  //   子だったため、戴冠演出後にmirrorVisualAnchorごと恒久的に非表示になっていたが、
+  //   今後は「銀河本体の一部としてずっと表示され続ける」ものにするため、独立した
+  //   親(galaxy.starsGroup)に変更した。galaxy.starsGroupは銀河の自転そのものの
+  //   グループなので、バルジも銀河と一緒に回転し、「バルジから腕が生えている」
+  //   見た目に自然に馴染む。
+  const bulge = makeBulgePlaceholder();
+  // 位置は銀河中心(galaxy.starsGroupのローカル原点)でよい、とのご指示のため0のまま。
+  // ★ ご指摘の「コアのある複雑な形に見えない」件の原因はこれ。バー・コアの粒はどちらも
+  //   AdditiveBlendingで、除外しない限りmain.js側のBloomがそのままフルの強さで乗ってしまう
+  //   ため、粒同士の光がにじんで混ざり合い、バー+コアという構造が潰れて見えていた。
+  //   ここでBloomを完全にオフにはせず、BULGE_BLOOM_INTENSITYまで弱める(0にすると
+  //   Bloom完全オフ=最もくっきり見えるが、光っている感じは失われる。仮値、要調整)。
+  if (excludeFromBloom) {
+    bulge.children.forEach((child) => excludeFromBloom(child, BULGE_BLOOM_INTENSITY));
+  }
+  galaxy.starsGroup.add(bulge);
+
+  mirrorVisualAnchor.position.copy(computeMirrorGroupPosition());
+  mirrorVisualAnchor.visible = false; // 表示はtripodRingSwap.js側が一元管理する(swapT>=1で表示に切り替わる)
+  scene.add(mirrorVisualAnchor);
+
+  // mirrorGroup自体はpyramidMesh・bananaMeshどちらも子に持たなくなり、現在は見た目を
+  // 持たない「物理的な鏡の位置」(=cubeCamera・mirrorLookTargetの基準点)としてのみ使う。
+  mirrorGroup.position.copy(computeMirrorGroupPosition());
+  mirrorGroup.visible = false; // startRecordDisplayまで隠しておく
+  scene.add(mirrorGroup);
+
+  // カメラが鏡側を向くときの注視点(=鏡tripod=mirrorVisualAnchorの頂点のワールド座標)。
+  // ここでの値はあくまで初期値で、updateRecordDisplay側で毎フレーム
+  // mirrorVisualAnchor.positionに追従するよう更新し直す(下記参照)。
+  const mirrorLookTarget = new THREE.Vector3(0, mirrorVisualAnchor.position.y + MIRROR_APEX_HEIGHT, 0);
+
+  // 最終段階('done')でカメラを引く方向(=鏡/レコード側から見て、カメラが下がっていく向き)。
+  const pullbackDir = HOME_CAMERA_POS.clone().sub(mirrorLookTarget).normalize();
+
+  // ★ バグ修正: 以前はここでmirrorGroup.positionを基準に一度だけcubeCameraの位置を決めて
+  //   そのまま放置していた。しかしmirrorGroup自体は「物理的な鏡の位置」の記録用に生成時の
+  //   位置(computeMirrorGroupPosition())のまま動かない一方、実際に見えているピラミッド
+  //   (mirrorVisualAnchor)はtripodRingSwap.js側で毎フレーム位置(特にy)を動かされる
+  //   (tripodの降下に合わせてgroundYまで下りてくる)ため、両者の位置がどんどんズレていき、
+  //   「本来ピラミッドがある場所とは全く違う高さ・位置から撮影した環境」がenvMapとして
+  //   反射に使われてしまっていた。これが「反射面が裏返って見える/おかしい」ように見えていた
+  //   実体だった可能性が高い。以後はupdateRecordDisplay側で毎フレーム
+  //   mirrorVisualAnchor.positionに追従させ直す(ここでの初期値はその1フレーム目用)。
+  cubeCamera.position.copy(mirrorVisualAnchor.position).add(new THREE.Vector3(0, CUBE_CAMERA_Y_OFFSET, 0));
+  scene.add(cubeCamera);
+
+  // ★ 2026-09-17 追加(ご指示反映): トーンアーム(ガラス製)。銀河の中心
+  // (galaxy.starsGroup.position。下のgalaxyCenterと同じ点)を基準に、カメラから見て
+  // 右奥の角に固定位置で配置する(位置のみ。太陽系での動き・クリックでの動きは未実装)。
+  const tonearm = makeTonearm(scene, renderer, galaxy.starsGroup.position);
+
+  return {
+    scene, renderer, camera, galaxy, solarSystem, universe,
+    mirrorGroup, mirrorVisualAnchor, mirrorVisualHome: mirrorVisualAnchor.position.clone(),
+    crossfadeRing,
+    pyramidMesh, bananaMesh, crownGroup, bulge, tonearm,
+    galaxyCenter: galaxy.starsGroup.position.clone(), // ← 太陽系召喚時の中心(銀河の中心。生成時点で固定)
+    coronationStarted: false, // ← バナナクリック演出の二重発火防止
+    // ★ 2026-09-16 追加(バグ修正): 「バルジが出現していない」への対応。戴冠演出中、
+    //   スクロールが(何らかの理由で)後方向に動くと、tripodRingSwap.js側の
+    //   updateTripodRingSwapがrecord.viewMixCurrentを見てmirrorVisualAnchor.visibleを
+    //   falseに戻してしまい、その子であるbulge/バナナ/王冠ごと非表示になってしまう
+    //   可能性があった。演出中(coronationStarted〜finishTripodRingSwapまで)は
+    //   このフラグをtrueにして、tripodRingSwap.js側にmirrorVisualAnchorを強制的に
+    //   表示させ続けてもらう。
+    coronationLockVisible: false,
+    cubeCamera, mirrorLookTarget,
+    viewMixTarget: 0,  // 0=carousel側を向く / 1=鏡側を向く。applyScrollが更新する
+    viewMixCurrent: 0, // 実際にcontrols.targetへ適用する、軽くスムージングした値
+    mirrorSpinMultiplier: 1, // 鏡(レコード)の自転速度倍率。updateRecordDisplayが目標値へ滑らかに近づける
+    pullbackDir,        // ← 最終段階でカメラを引く方向(固定ベクトル)
+    pullbackTarget: 0,  // 0〜1。applyScrollが'done'到達後のスクロール量から算出する
+    pullbackCurrent: 0, // 実際にカメラへ適用する、軽くスムージングした値
+    pullbackApplied: 0, // 直前フレームでcamera.positionへ実際に足した量(次フレームで打ち消すために保持)
+    // 'inactive' → 'mirror' → 'done'(revealSolarSystemが呼ばれた時点)
+    phase: 'inactive',
+    // ★ 2026-09-15 追加: バナナクリック後の演出(戴冠→リング拡大→リング消滅)が完了した
+    //   瞬間(onRingContact)に呼ばれるフック。createRecordDisplay時点ではまだ
+    //   tripodRingSwap.jsのインスタンスが存在しない(main.js側の生成順序がrecord→
+    //   tripodRingSwapのため)ので、ここではnullのまま返し、main.js側で
+    //   record.onSequenceComplete = () => finishTripodRingSwap(tripodRingSwap) のように
+    //   後から差し込んでもらう想定。未設定なら何もしない(呼び出し側はnullチェック不要)。
+    onSequenceComplete: null,
+  };
+}
+
+// enterUniverse完了時に呼ぶ: 鏡三角錐(+バナナ)を表示する。
+export function startRecordDisplay(record) {
+  if (!record || record.phase !== 'inactive') return;
+  record.mirrorGroup.visible = true;
+  record.phase = 'mirror';
+}
+
+// ホイールイベントのたびに呼ぶ: scrollYは0〜SCROLL_MAXにクランプ済みの累積スクロール量
+// (呼び出し側=main.jsが管理する)。画面の向き(viewMixTarget)を更新する。
+// ★ 以前ここにあった「銀河のscrub量(galaxyRevealT)をスクロール量から計算し、
+//   setGalaxyRevealAmountで銀河を出し入れする」処理は削除した。銀河は既にmain.js側の
+//   revealGalaxy()でフルサイズ表示済みであり、ここで手を加えるとその状態を壊してしまう
+//   (=今回報告のあった「右ドラッグ後に銀河が消える/発生し直す」不具合の原因だった)。
+export function applyScroll(record, scrollY) {
+  if (!record || record.phase === 'inactive') return;
+  record.viewMixTarget = THREE.MathUtils.clamp(scrollY / SCROLL_SWITCH, 0, 1);
+  // 「最後になったら」の下スクロールぶん(=SCROLL_SWITCHを使い切った後の残り)を0〜1に正規化。
+  // 実際にカメラへ反映するかどうかはupdateRecordDisplay側でphase==='done'を見て判定する。
+  const pullbackRangeStart = SCROLL_SWITCH;
+  record.pullbackTarget = THREE.MathUtils.clamp((scrollY - pullbackRangeStart) / SCROLL_PULLBACK_RANGE, 0, 1);
+}
+
+// クリック時に呼ぶ: 鏡にヒットしていれば処理してtrueを返す。
+// raycasterは呼び出し側で既にsetFromCamera済みのものを渡す。
+// onNavigate(url): 省略時はrecord.js側でwindow.location.hrefを直接書き換える。
+// ★ 以前あった「バナナクリック→galaxy-scrub開始」「銀河クリック→針の演出開始」の
+//   2つの分岐は、銀河の動き・針の演出をこのファイルから外したのに合わせて削除した。
+export function tryRecordClick(record, raycaster, { onNavigate } = {}) {
+  if (!record || record.phase === 'inactive') return false;
+
+  // トーンアーム: mirrorVisualAnchor(鏡側)の子ではなく常にsceneに直接置いているため、
+  // 下のmirrorVisualAnchor.visibleガードより前に判定する(carousel側に戻っていても
+  // クリックできるようにするため)。表示中(revealGalaxy済み)かつまだ「置く前」の
+  // ときだけ有効。
+  if (record.tonearm && record.tonearm.visible && !record.tonearm.userData.placed) {
+    const tonearmHit = raycaster.intersectObject(record.tonearm, true)[0];
+    if (tonearmHit) {
+      placeTonearmOnRecord(record);
+      return true;
+    }
+  }
+
+  // 鏡: three.jsのRaycasterはvisible=falseでも判定してしまう(明示的にチェックしないと
+  // 素通りする)ため、mirrorVisualAnchor.visible(=tripodRingSwap.js側で鏡tripodが実際に
+  // 表示に切り替わっているか)を明示的に見て、「出現しているときだけクリック可能」にする。
+  if (!record.mirrorVisualAnchor.visible) return false;
+
+  const mirrorHit = raycaster.intersectObject(record.pyramidMesh, true)[0];
+  if (mirrorHit) {
+    if (onNavigate) onNavigate(MIRROR_TARGET_PAGE);
+    else window.location.href = MIRROR_TARGET_PAGE;
+    return true;
+  }
+
+  // バナナ: ①戴冠 → ②バルジ出現 → ③太陽系召喚、の一連の演出を開始する。
+  // 一度きりの演出なので、coronationStartedで二重発火を防いでいる(演出中の再クリックは無視)。
+  if (!record.coronationStarted) {
+    const bananaHit = raycaster.intersectObject(record.bananaMesh, true)[0];
+    if (bananaHit) {
+      playCoronationSequence(record);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// レンダーループから、メインのrenderer.render(...)より前に毎フレーム呼ぶ想定。
+// controls: main.js側のOrbitControls(渡すと、スクロールに応じて向きを補間する)。
+export function updateRecordDisplay(record, deltaSeconds, controls) {
+  if (!record) return;
+
+  // 鏡三角錐(レコード)の自転速度: 現状は常に等倍。
+  const spinMultiplierTarget = 1;
+  const spinSmoothing = 1 - Math.exp(-MIRROR_SPIN_SMOOTHING * deltaSeconds);
+  record.mirrorSpinMultiplier = THREE.MathUtils.lerp(record.mirrorSpinMultiplier, spinMultiplierTarget, spinSmoothing);
+
+  if (record.mirrorVisualAnchor.visible) {
+    record.mirrorVisualAnchor.rotateOnWorldAxis(WORLD_UP, -TRIPOD_ANGULAR_SPEED * record.mirrorSpinMultiplier * deltaSeconds);
+  }
+
+  // ★ 2026-09-11 修正(ご指示反映): 「カメラは常に固定(controls.target/positionを一切
+  //   動かさない)」方針に変更した。以前はここでcontrols.targetをUNIVERSE_CAMERA_TARGET⇔
+  //   mirrorLookTargetの間で補間していたが、それが「入れ替え完了後もカメラが動き続ける
+  //   (=画面奥の銀河まで一緒に動いてしまう)」バグの原因だった。
+  //   tripod/リングの入れ替え演出(見え方の変化)は、カメラ側ではなくtripodRingSwap.js側で
+  //   tripod・リング・鏡tripod自体の位置を動かすことで表現する(このファイルではcontrols.target
+  //   にはもう触れない)。mirrorLookTargetは現在カメラ制御には使っていないが、pullback(休眠中。
+  //   phase==='done'到達時のみ有効)の向き計算に使う初期値としてこのまま残してある。
+  // ★ controls.update()自体は、record.phase!=='inactive'の間もユーザーのドラッグ操作
+  //   (OrbitControlsの自由回転)を反映させるために毎フレーム呼び続ける必要があるため、
+  //   このifブロックごと削除はしないこと(削除すると宇宙ページでカメラが一切回せなくなる)。
+  if (controls && record.phase !== 'inactive') {
+    // mirrorVisualAnchorはtripodRingSwap.js側で位置(y)が決まるため、mirrorLookTargetも
+    // 毎フレーム追従させ直す(現状はpullbackDirの初期値計算にしか使っていない休眠中の値)。
+    record.mirrorLookTarget.set(0, record.mirrorVisualAnchor.position.y + MIRROR_APEX_HEIGHT, 0);
+
+    const smoothing = 1 - Math.exp(-VIEW_MIX_SMOOTHING * deltaSeconds);
+    record.viewMixCurrent = THREE.MathUtils.lerp(record.viewMixCurrent, record.viewMixTarget, smoothing);
+
+    // 直前フレームで足した「カメラを引く」ぶんをいったん取り消してから、controls.update()に
+    // 通常のOrbitControls計算(ユーザーのドラッグ回転などの反映。targetは動かしていないので
+    // 実質的にはノーオペレーション)をさせる。
+    record.camera.position.addScaledVector(record.pullbackDir, -record.pullbackApplied);
+    controls.update();
+
+    // 「最後になったら、下スクロールでカメラを引いてレコード全体が見えるように」の反映。
+    // phase==='done'は、バナナクリック演出の最後(revealSolarSystem)で到達する。
+    const pullbackTargetNow = record.phase === 'done' ? record.pullbackTarget : 0;
+    const pullbackSmoothing = 1 - Math.exp(-PULLBACK_SMOOTHING * deltaSeconds);
+    record.pullbackCurrent = THREE.MathUtils.lerp(record.pullbackCurrent, pullbackTargetNow, pullbackSmoothing);
+    record.pullbackApplied = record.pullbackCurrent * RECORD_PULLBACK_DISTANCE;
+    record.camera.position.addScaledVector(record.pullbackDir, record.pullbackApplied);
+  }
+
+  // 鏡に映るシーンを毎フレーム撮影する(自分自身が映り込まないよう撮影中だけ非表示にする)。
+  // ★ バグ修正: ここは「鏡tripodが実際に画面に見えているか」で判定する必要があるが、
+  //   mirrorGroupは見た目を持たないただの位置基準グループで、その.visibleはmain.js側が
+  //   スクロール方向判定用に書き換えている無関係なフラグだった。実際の見た目を制御して
+  //   いるのはmirrorVisualAnchor.visible(tripodRingSwap.js側がswapT>=1で切り替える)なので、
+  //   撮影のスキップ判定もこちらを見るようにする。
+  if (!record.mirrorVisualAnchor.visible) return;
+  // ★ バグ修正: 撮影(=cubeCamera.update)の直前に、実際に見えているピラミッド
+  //   (mirrorVisualAnchor。tripodRingSwap.js側が毎フレーム位置を書き換えている)へ
+  //   cubeCameraの位置を追従させ直す。これを怠ると、tripod降下中〜鏡tripod表示中は
+  //   撮影位置がピラミッドの実位置から乖離したままになり、反射が実際の見た目と
+  //   食い違って見えてしまう(詳細はcreateRecordDisplay側のコメント参照)。
+  record.cubeCamera.position.copy(record.mirrorVisualAnchor.position).add(_cubeCameraOffset);
+  record.mirrorGroup.visible = false;
+  const wasVisualVisible = record.mirrorVisualAnchor.visible;
+  record.mirrorVisualAnchor.visible = false;
+  // ★ バグ修正: record.tonearm(MeshPhysicalMaterial({transmission:1.0})のガラス製アーム)が
+  //   撮影対象のシーンに写ったままだと、three.js側がtransmissionオブジェクト描画のたびに
+  //   挟む「背景を一時レンダーターゲットへ撮り直す」処理が、CubeCameraの現在の面
+  //   (activeCubeFace)を正しく復元しないため、6面の撮影がズレて envMap がほぼ黒に
+  //   壊れてしまう。撮影の間だけ非表示にして、この干渉を避ける。
+  const wasTonearmVisible = record.tonearm ? record.tonearm.visible : false;
+  if (record.tonearm) record.tonearm.visible = false;
+  record.cubeCamera.update(record.renderer, record.scene);
+  if (record.tonearm) record.tonearm.visible = wasTonearmVisible;
+  record.mirrorGroup.visible = true;
+  record.mirrorVisualAnchor.visible = wasVisualVisible;
 }
 
 // TODO:
-//   - AXIS_LABEL_OFFSET / AXIS_LABEL_WORLD_SIZE(ラベルの位置・サイズ)も仮値です。
-//   - EQUATION_WORLD_WIDTH / EQUATION_HEIGHT_ABOVE_APEX / ANGULAR_SPEED は仮値。実際に見て調整してください。
-//   - EQUATION_COLOR_HOVER / EQUATION_HOVER_RADIUS_PX(マウス接近での色変化)も仮値。
-//     色味や反応距離はお好みで調整してください。
-//   - RING_COLOR / RING_TUBE_RADIUS / RING_FADE_DURATION(金のリング)も仮値。
-//   - TRIPOD_HIT_RADIUS(tripodクリック判定用の球の大きさ・位置)も仮値。実際にクリックしてみて、
-//     狙いにくい/広すぎる場合は半径や中心のy座標を調整してください。
-//   - TRIPOD_LIFT_HEIGHT / TRIPOD_LIFT_DURATION(tripodの浮上)も仮値。
-//   - ROOF_SPAWN_ANGLE_STEP(何度おきに1粒生成するか、密度)/ ROOF_PARTICLE_JITTER(太さ)/
-//     ROOF_PARTICLE_SIZE(ROOF_REFERENCE_DISTANCE・ROOF_VISIBILITY_BOOST経由でUNIVERSE_CAMERA_
-//     DISTANCEに連動して自動調整) / ROOF_FADE_DURATION(フェードインの速さ)/
-//     ROOF_MAX_ALPHA(最大不透明度)/ ROOF_COLOR_GREEN / ROOF_COLOR_ORANGE(色帯の2色)も仮値。
-//     生成間隔・色帯の周期(1/6周)はANGULAR_SPEEDと連動しているので、ANGULAR_SPEEDを
-//     変えると自動的に一緒に変わる。
-//   - IH_WORLD_HEIGHT / IH_ORBIT_RADIUS / IH_ABOVE_RING_MARGIN / IH_ORBIT_SPEED /
-//     IH_BOB_AMPLITUDE / IH_BOB_SPEED(ih)も仮値。IH_ORBIT_RADIUSは
-//     「リングより少し内側」、IH_ABOVE_RING_MARGINは「リング(現在の高さ)からどれだけ
-//     上に浮かせるか」のつもりでそれぞれ仮の値にしてあります(IH_BOB_AMPLITUDEより
-//     大きい値にしておかないと、バウンスの下振れでリングを下回ってしまうので注意)。
-//   - main.js側の統合ポイント(5箇所):
-//       1) createUniverse(scene) を起動時に1回呼ぶ。
-//       2) Phase3完了後の画面クリックで、既存シーン要素を隠してから enterUniverse(...) を呼ぶ。
-//          (2回目以降のクリックは isActive を見て toggleUniverseEquation(universe) を呼ぶ)
-//       3) レンダーループ内で updateUniverse(universe, deltaSeconds) を毎フレーム呼ぶ(cameraは渡さなくてよい)。
-//       4) pointermoveハンドラ内で updateEquationHoverByPointer(universe, camera, e.clientX, e.clientY) を呼ぶ。
-//       5) クリック処理内で universe.tripodHitMesh をraycast判定し、ヒットしたら
-//          revealTripodRing / liftTripod / startTripodRoofPulse をまとめて呼ぶ
-//          (リング形成・浮上・粒子の明滅開始は同時。ihはtripodRingSwap.js側が
-//          リングの位置を見て自動的に出し入れするので、ここでは呼ばなくてよい)。
+//   - SCROLL_SWITCH / SCROLL_PULLBACK_RANGE / VIEW_MIX_SMOOTHING / MIRROR_ENV_RESOLUTION /
+//     BANANA_HEIGHT_ABOVE_APEX / RECORD_PULLBACK_DISTANCE / PULLBACK_SMOOTHING は仮値です。
+//   - MIRROR_TARGET_PAGE('prism2.html'): 実際の配置パスに合わせて調整してください。
+//   - トーンアーム(旧・針)は2026-09-17に全削除し、今後新しく作り直す予定です。
+//     再実装する際は、盤面に接触したタイミングでrevealSolarSystem(record)を呼ぶ形に
+//     すればよいはずです(戴冠演出側のsetTimeoutでの即時呼び出しを、その呼び出しに
+//     差し替えてください)。
+//   - 銀河を「右ドラッグで俯瞰後、スクロールで縮小させる」新しい演出は、このファイルの
+//     責務から外れたため未実装のままです(別途main.js側などでの実装を想定)。
+//   - RECORD_PULLBACK_DISTANCEは、以前GALAXY_RADIUS基準で計算していたが銀河への依存を
+//     切り離したため単純な定数(仮値1)に変更した。実際の見た目に合わせて調整してください。
+//   - 鏡は本格的なリアルタイム反射(CubeCamera)なので、解像度(MIRROR_ENV_RESOLUTION)や
+//     毎フレームの再撮影が負荷になる場合、フレーム間引き(数フレームに1回だけ更新)などの
+//     最適化が今後必要になるかもしれません。
