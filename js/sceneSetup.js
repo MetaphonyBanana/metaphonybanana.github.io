@@ -7,6 +7,7 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { TUNE, HOME_CAMERA_POS, HOME_CAMERA_TARGET } from './config.js';
+import { RippleRefractionPass } from './waveSurfacePass.js';
 
 // ── 最終合成シェーダー: 通常レンダリング結果(baseTexture)に
 //    Bloom専用パスの結果(bloomTexture)を加算するだけのシンプルなシェーダー ──
@@ -31,6 +32,75 @@ const mixShader = {
     }
   `,
 };
+
+// ── ★ 追加: 丸いBloom(円形ガウシアン方式)専用のシェーダー ────────────
+// UnrealBloomPassは低解像度のミップピラミッドを使うため、数pxしかない星のような
+// 小さく明るい点だと、光暈の外側が四角く/ブロック状になってしまう(実際に確認済み)。
+// stars.jsの星のように「常に丸いまま、かつ実際の明るさに動的に反応する発光」が
+// 欲しいオブジェクトは、UnrealBloomPass(bloomComposer)からは除外しつつ、
+// こちらの専用パイプライン(閾値抽出→十分な解像度の分離ガウシアン→強度で加算)に
+// 含める(includeInRoundBloom参照)。ガウシアンを複数スケール・複数回重ねることで、
+// 解像度を落としすぎることによる等高線化を避けながら、広く・薄く発光を伸ばしている。
+const ROUND_QUAD_VERTEX = `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+const ROUND_BRIGHT_FRAGMENT = `
+  uniform sampler2D tDiffuse;
+  uniform float uThreshold;
+  uniform float uSmoothWidth;
+  varying vec2 vUv;
+  void main() {
+    vec4 c = texture2D(tDiffuse, vUv);
+    float luma = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+    float factor = smoothstep(uThreshold - uSmoothWidth, uThreshold + uSmoothWidth, luma);
+    gl_FragColor = vec4(c.rgb * factor, 1.0);
+  }
+`;
+const ROUND_GAUSSIAN_FRAGMENT = (dx, dy) => `
+  uniform sampler2D tDiffuse;
+  uniform vec2 uTexel;
+  varying vec2 vUv;
+  void main() {
+    vec2 dir = vec2(${dx}, ${dy});
+    float w[5];
+    w[0]=0.227027; w[1]=0.1945946; w[2]=0.1216216; w[3]=0.054054; w[4]=0.016216;
+    vec3 result = texture2D(tDiffuse, vUv).rgb * w[0];
+    for (int i = 1; i < 5; i++) {
+      vec2 o = dir * uTexel * float(i) * 1.6;
+      result += texture2D(tDiffuse, vUv + o).rgb * w[i];
+      result += texture2D(tDiffuse, vUv - o).rgb * w[i];
+    }
+    gl_FragColor = vec4(result, 1.0);
+  }
+`;
+const ROUND_SCALE_WEIGHT_FRAGMENT = `
+  uniform sampler2D tDiffuse;
+  uniform float uWeight;
+  varying vec2 vUv;
+  void main() { gl_FragColor = texture2D(tDiffuse, vUv) * uWeight; }
+`;
+const ROUND_ADD_WEIGHTED_FRAGMENT = `
+  uniform sampler2D tBase;
+  uniform sampler2D tAdd;
+  uniform float uWeight;
+  varying vec2 vUv;
+  void main() { gl_FragColor = texture2D(tBase, vUv) + texture2D(tAdd, vUv) * uWeight; }
+`;
+const ROUND_FINAL_ADD_FRAGMENT = `
+  uniform sampler2D baseTexture;
+  uniform sampler2D roundBloomTexture;
+  uniform float uStrength;
+  varying vec2 vUv;
+  void main() {
+    gl_FragColor = texture2D(baseTexture, vUv) + texture2D(roundBloomTexture, vUv) * uStrength;
+  }
+`;
+// 画面解像度に対する各スケールの比率と、合成時の重み・ぼかし反復回数(仮値。
+// hotspotsでの検証プレビューで決めた値をそのまま使っている)。
+// [0]=やや締まった近い光暈、[1]=解像度を下げすぎない範囲で複数回ぼかして広く薄く伸ばす光暈。
+const ROUND_BLOOM_SCALES = [0.3, 0.14];
+const ROUND_BLOOM_WEIGHTS = [1.0, 0.4];
+const ROUND_BLOOM_ITERATIONS = [1, 3];
+const ROUND_BLOOM_STRENGTH = 1.0; // 仮値。config.js未対応のためここに直接置いている。強すぎ/弱すぎれば調整してください。
+const ROUND_BLOOM_LAYER = 1; // カメラのlayersでこの層だけを見る/見ないを切り替えて、対象オブジェクトだけを撮影する
 
 // ── 疑似的な正射影(pseudo-orthographic) ────────────────────
 // ご指示「宇宙ページではあらかじめ正射影にしておき、右ドラッグで透視図モードに切り替える」の
@@ -176,9 +246,109 @@ export function createSceneSetup() {
   }), 'baseTexture');
   mixPass.needsSwap = true;
 
+  // ── ★ 追加: 丸いBloom(円形ガウシアン方式)パイプライン ─────────────
+  // includeInRoundBloom(object)で登録したオブジェクトだけを、camera.layersを使って
+  // 選択的に撮影する(three.js公式のSelective Bloom例と同じ考え方。ただし
+  // visibleのトグルではなくlayersを使うので、シーン全体を毎フレーム走査する必要がない)。
+  function includeInRoundBloom(object) {
+    object.layers.enable(ROUND_BLOOM_LAYER);
+  }
+
+  const roundQuadScene = new THREE.Scene();
+  const roundQuadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const roundQuadMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial());
+  roundQuadScene.add(roundQuadMesh);
+  function runRoundQuadPass(material, target) {
+    roundQuadMesh.material = material;
+    renderer.setRenderTarget(target);
+    renderer.render(roundQuadScene, roundQuadCamera);
+  }
+  function makeRoundQuadMaterial(fragment, uniforms) {
+    return new THREE.ShaderMaterial({ vertexShader: ROUND_QUAD_VERTEX, fragmentShader: fragment, uniforms, depthTest: false, depthWrite: false });
+  }
+  const roundBrightMaterial = makeRoundQuadMaterial(ROUND_BRIGHT_FRAGMENT, { tDiffuse: { value: null }, uThreshold: { value: TUNE.bloomThreshold }, uSmoothWidth: { value: 0.1 } });
+  const roundGaussianHMaterial = makeRoundQuadMaterial(ROUND_GAUSSIAN_FRAGMENT('1.0', '0.0'), { tDiffuse: { value: null }, uTexel: { value: new THREE.Vector2() } });
+  const roundGaussianVMaterial = makeRoundQuadMaterial(ROUND_GAUSSIAN_FRAGMENT('0.0', '1.0'), { tDiffuse: { value: null }, uTexel: { value: new THREE.Vector2() } });
+  const roundScaleWeightMaterial = makeRoundQuadMaterial(ROUND_SCALE_WEIGHT_FRAGMENT, { tDiffuse: { value: null }, uWeight: { value: 1 } });
+  const roundAddWeightedMaterial = makeRoundQuadMaterial(ROUND_ADD_WEIGHTED_FRAGMENT, { tBase: { value: null }, tAdd: { value: null }, uWeight: { value: 1 } });
+
+  let roundSceneRT, roundCombineRT, roundCombineRT2;
+  let roundScaleRTs = [], roundScaleScratch = [];
+  function rebuildRoundBloomTargets() {
+    const w = innerWidth, h = innerHeight;
+    [roundSceneRT, roundCombineRT, roundCombineRT2, ...roundScaleRTs, ...roundScaleScratch].forEach((rt) => rt && rt.dispose());
+    roundSceneRT = new THREE.WebGLRenderTarget(w, h, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    roundCombineRT = new THREE.WebGLRenderTarget(w, h, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    roundCombineRT2 = new THREE.WebGLRenderTarget(w, h, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    roundScaleRTs = []; roundScaleScratch = [];
+    ROUND_BLOOM_SCALES.forEach((scale) => {
+      const rw = Math.max(24, Math.round(w * scale)), rh = Math.max(24, Math.round(h * scale));
+      roundScaleRTs.push(new THREE.WebGLRenderTarget(rw, rh, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter }));
+      roundScaleScratch.push(new THREE.WebGLRenderTarget(rw, rh, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter }));
+    });
+  }
+  rebuildRoundBloomTargets();
+
+  function renderRoundBloom() {
+    // camera.layersをROUND_BLOOM_LAYERだけに絞って撮影(includeInRoundBloomしていない
+    // オブジェクトは、layer0にしか居ないため映らない)。撮り終えたら必ず元(layer0)へ戻す。
+    camera.layers.set(ROUND_BLOOM_LAYER);
+    renderer.setRenderTarget(roundSceneRT);
+    renderer.setClearColor(0x000000, 1);
+    renderer.clear();
+    renderer.render(scene, camera);
+    camera.layers.set(0);
+
+    roundScaleRTs.forEach((rt, i) => {
+      roundBrightMaterial.uniforms.tDiffuse.value = roundSceneRT.texture;
+      roundBrightMaterial.uniforms.uThreshold.value = bloomPass.threshold;
+      roundBrightMaterial.uniforms.uSmoothWidth.value = bloomPass.highPassUniforms.smoothWidth.value;
+      runRoundQuadPass(roundBrightMaterial, rt);
+
+      const iterations = ROUND_BLOOM_ITERATIONS[i] || 1;
+      for (let pass = 0; pass < iterations; pass++) {
+        roundGaussianHMaterial.uniforms.tDiffuse.value = rt.texture;
+        roundGaussianHMaterial.uniforms.uTexel.value.set(1 / rt.width, 1 / rt.height);
+        runRoundQuadPass(roundGaussianHMaterial, roundScaleScratch[i]);
+        roundGaussianVMaterial.uniforms.tDiffuse.value = roundScaleScratch[i].texture;
+        roundGaussianVMaterial.uniforms.uTexel.value.set(1 / rt.width, 1 / rt.height);
+        runRoundQuadPass(roundGaussianVMaterial, rt);
+      }
+    });
+
+    roundScaleWeightMaterial.uniforms.tDiffuse.value = roundScaleRTs[0].texture;
+    roundScaleWeightMaterial.uniforms.uWeight.value = ROUND_BLOOM_WEIGHTS[0];
+    runRoundQuadPass(roundScaleWeightMaterial, roundCombineRT);
+    roundAddWeightedMaterial.uniforms.tBase.value = roundCombineRT.texture;
+    roundAddWeightedMaterial.uniforms.tAdd.value = roundScaleRTs[1].texture;
+    roundAddWeightedMaterial.uniforms.uWeight.value = ROUND_BLOOM_WEIGHTS[1];
+    runRoundQuadPass(roundAddWeightedMaterial, roundCombineRT2);
+
+    return roundCombineRT2.texture;
+  }
+
+  // mixPass(UnrealBloomPass分の合成)の後段で、丸いBloomの結果をさらに加算するパス。
+  const roundBloomAddPass = new ShaderPass(new THREE.ShaderMaterial({
+    uniforms: { baseTexture: { value: null }, roundBloomTexture: { value: null }, uStrength: { value: ROUND_BLOOM_STRENGTH } },
+    vertexShader: mixShader.vertexShader,
+    fragmentShader: ROUND_FINAL_ADD_FRAGMENT,
+  }), 'baseTexture');
+  roundBloomAddPass.needsSwap = true;
+
+  // ── 波面加工(雨紋+屈折のみ)。mixPass(Bloom合成済み画像)を受け取って
+  //    さらに歪めるだけなので、Bloomの仕組み・phase3.js側には一切影響しない。
+  //    OutputPass(トーンマッピング・色空間変換)の直前に置くことで、
+  //    「歪めた結果」に対して最後に正しく色空間変換がかかるようにしている。
+  const wavePass = new RippleRefractionPass();
+  wavePass.enabled = false;
+  // ★ ご指示反映: 波面加工はphase3(②③④展開)の間だけ適用する。既定は無効にしておき、
+  //   main.js側でPhase3開始/終了のタイミングでenabled切り替え+reset()を行う。
+
   const composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
   composer.addPass(mixPass);
+  composer.addPass(roundBloomAddPass); // ← 追加: 丸いBloom(stars.js等)をここで加算
+  composer.addPass(wavePass);
   composer.addPass(new OutputPass());
 
   // ★ 修正: UnrealBloomPassはコンストラクタに渡したVector2の解像度で内部の
@@ -195,11 +365,16 @@ export function createSceneSetup() {
   composer.setSize(innerWidth, innerHeight);
 
   // main.js の animate() 内、これまでの composer.render() の代わりに呼ぶ関数。
-  // ①除外オブジェクトを隠す→②Bloom専用パスを描く→③元に戻す→④通常合成、の順。
+  // ①除外オブジェクトを隠す→②Bloom専用パスを描く→③元に戻す→④丸いBloomを撮る→⑤通常合成、の順。
   function render() {
     dimNoBloomObjects();
     bloomComposer.render();
     restoreNoBloomObjects();
+
+    const roundBloomTexture = renderRoundBloom();
+    roundBloomAddPass.material.uniforms.roundBloomTexture.value = roundBloomTexture;
+    roundBloomAddPass.material.uniforms.uStrength.value = ROUND_BLOOM_STRENGTH;
+
     composer.render();
   }
 
@@ -223,7 +398,8 @@ export function createSceneSetup() {
     renderer.setSize(innerWidth, innerHeight);
     composer.setSize(innerWidth, innerHeight);
     bloomComposer.setSize(innerWidth, innerHeight); // ← Bloom専用コンポーザーも一緒にリサイズする
+    rebuildRoundBloomTargets(); // ← 丸いBloom用のレンダーターゲットも解像度に合わせて作り直す
   });
 
-  return { scene, camera, renderer, controls, composer, lookTarget, excludeFromBloom, render, setProjectionMix };
+  return { scene, camera, renderer, controls, composer, lookTarget, excludeFromBloom, includeInRoundBloom, render, setProjectionMix, wavePass };
 }
